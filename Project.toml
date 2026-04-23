@@ -1,0 +1,10 @@
+name = "DiscoGMPI"
+uuid = "7f9d0f6e-6f5e-4f83-9f8a-2d6d9b6d4c31"
+version = "0.1.0"
+
+[deps]
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+
+[compat]
+julia = "1.9"
+MPI = "0.20"

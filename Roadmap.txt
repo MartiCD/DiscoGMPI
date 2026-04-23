@@ -1,0 +1,27 @@
+Step A 
+-------
+Make one RHS routine work in MPI for the simplest problem:
+- Maxwell 3D
+- No PML
+- No periodic BC first, unless already easy
+- one RK stage or full RK if already modular
+
+Step B
+-------
+Verify against serial on:
+- 2 ranks
+- simple 3D mesh 
+- smooth manufactured solution or plane wave 
+- same final-time error and energy trend 
+
+Step C 
+-------
+Add the remaining boundary conditions and features:
+- periodic boundaries 
+- sources 
+- PML
+- material jumps 
+
+Step D
+-------
+Only after correctness is solid, move to Stage 3 optimization 
