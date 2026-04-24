@@ -10,8 +10,10 @@ export ElementOwnership,
        MPICommunicationTable,
        DistributedMesh,
        build_distributed_mesh,
+       build_distributed_mesh_from_metis,
        tet_face_local_vertices,
-       TRI_PERMUTATIONS
+       TRI_PERMUTATIONS,
+       read_metis_epart
 
 
 # ============================================================
@@ -19,6 +21,30 @@ export ElementOwnership,
 # ============================================================
 
 @enum ElementOwnership OWNED GHOST
+
+
+
+# ============================================================
+# METIS Input
+# ============================================================
+# METIS -epart.N usually use 0-based ranks, which matches MPI ranks, so base = 0 by default. 
+# If your METIS output uses 1-based ranks, set base = 1 to convert to 0-based internally.
+function read_metis_epart(
+    path::AbstractString;
+    one_based_parts::Bool = false,
+)
+    parts = Int[]
+
+    open(path, "r") do io
+        for line in eachline(io)
+            s = strip(split(line, "#"; limit=2)[1])
+            isempty(s) && continue
+            push!(parts, parse(Int, s))
+        end
+    end
+
+    return one_based_parts ? parts .- 1 : parts
+end
 
 # ============================================================
 # Tetrahedron face convention
@@ -560,6 +586,29 @@ function build_mpi_interface_table(
     return MPICommunicationTable(neighbors, comms)
 end
 
+# build_mpi_interface_table creates send_faces and placeholder recv_faces
+# added deterministic sorting before returning
+function sort_neighbor_comms!(mpi::MPICommunicationTable, elements::LocalElementTopology)
+    for nrank in mpi.neighbors
+        comm = mpi.comms[nrank]
+
+        sort!(comm.send_faces, by = f -> (
+            elements.global_ids[f.local_elem],
+            f.local_face,
+            f.neighbor_global_elem,
+            f.neighbor_face,
+        ))
+
+        sort!(comm.recv_faces, by = f -> (
+            f.neighbor_global_elem,
+            f.neighbor_face,
+            elements.global_ids[f.local_elem],
+            f.local_face,
+        ))
+    end
+    return mpi
+end
+
 function attach_global_face_nodes!(
     mpi::MPICommunicationTable,
     nodes::LocalNodeGeometry,
@@ -758,6 +807,7 @@ function build_distributed_mesh(
     # ---------------------------
     mpi = build_mpi_interface_table(elements, myrank)
     attach_global_face_nodes!(mpi, nodes)
+    sort_neighbor_comms!(mpi, elements)
 
     # ---------------------------
     # Phase 6: geometry
@@ -773,6 +823,35 @@ function build_distributed_mesh(
         volumes,
         barycenters,
         mpi,
+    )
+end
+
+
+
+function build_distributed_mesh_from_metis(
+    global_node_coords::AbstractMatrix{T},
+    global_elem_vertices::AbstractMatrix{Int},
+    epart_path::AbstractString,
+    myrank::Int;
+    one_based_parts::Bool = false,
+    kwargs...,
+) where {T<:Real}
+
+    elem_to_rank = read_metis_epart(
+        epart_path;
+        one_based_parts=one_based_parts,
+    )
+
+    @assert length(elem_to_rank) == size(global_elem_vertices, 2) """
+    METIS epart length does not match number of mesh elements.
+    """
+
+    return build_distributed_mesh(
+        global_node_coords,
+        global_elem_vertices,
+        elem_to_rank,
+        myrank;
+        kwargs...,
     )
 end
 
