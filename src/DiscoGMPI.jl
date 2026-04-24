@@ -3,11 +3,24 @@ module DiscoGMPI
 
 using MPI
 
-include("DistributedMesh3D.jl")
-include("TraceMaps.jl")
+include("MetisIO.jl")
+using .MetisIO
+export read_mesh_file_tet_vtk
 
+include("DistributedMesh3D.jl")
 using .DistributedMesh3D
+
+export read_metis_epart
+
+include("TraceMaps.jl")
 using .TraceMaps
+
+include("PartitionVTK.jl")
+using .PartitionVTK
+
+export write_partition_piece_vtks, write_partition_vtk
+
+
 
 println("Hello from DiscoGMPI!")
 

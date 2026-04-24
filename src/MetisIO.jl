@@ -1,5 +1,10 @@
+module MetisIO
+
+export write_metis_mesh_from_vtk,
+        read_mesh_file_tet_vtk
+
 function write_metis_mesh_from_vtk(vtk_path::AbstractString, metis_path::AbstractString)
-    coords, elems = read_mesh_file_3D_vtk(vtk_path)
+    coords, elems = read_mesh_file_tet_vtk(vtk_path)
 
     if size(elems, 2) == 4
         elems = permutedims(elems)   # Ne × 4 -> 4 × Ne
@@ -19,7 +24,7 @@ function write_metis_mesh_from_vtk(vtk_path::AbstractString, metis_path::Abstrac
     return metis_path
 end
 
-function read_mesh_file_3D_vtk(file_path::Union{String,SubString{String}})
+function read_mesh_file_tet_vtk(file_path::Union{String,SubString{String}})
     lines = readlines(file_path)
 
     ndofs = 0
@@ -141,5 +146,4 @@ function read_mesh_file_3D_vtk(file_path::Union{String,SubString{String}})
 end
 
 
-# filename = "mesh_periodic_box"
-# write_metis_mesh_from_vtk("examples/meshes/$filename.vtk", "examples/meshes/$filename.mesh")
+end # module MetisIO

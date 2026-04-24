@@ -8,7 +8,7 @@ include("../src/MetisIO.jl")
     vtk_path = joinpath(@__DIR__,"../","examples", "meshes", "tet_mesh.vtk")
     epart_path = joinpath(@__DIR__,"../","examples", "meshes", "tet_mesh.mesh.epart.2")
 
-    coords, elems = read_mesh_file_3D_vtk(vtk_path)
+    coords, elems = read_mesh_file_tet_vtk(vtk_path)
 
     if size(elems, 1) != 4 && size(elems, 2) == 4
         elems = permutedims(elems)
