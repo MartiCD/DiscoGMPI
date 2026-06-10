@@ -570,39 +570,4 @@ function build_mpi_face_permutation_maps(
     return MPIFacePermutationMap(lut)
 end
 
-function get_face_traces(
-    mesh::DistributedMesh,
-    trace::Array{T,4},
-    ghost_traces::Dict{Int, Array{T,3}},
-    face_lookup::MPIRemoteFaceLookup,
-    perm_maps::MPIFacePermutationMap,
-    e::Int,
-    f::Int,
-) where {T}
-
-    uM = @view trace[:, f, e, :]
-    fi = mesh.elements.faceinfo[f, e]
-
-    if fi.neighbor_local_elem == 0
-        return uM, nothing, :boundary
-    end
-
-    ne = fi.neighbor_local_elem
-    nrank = mesh.elements.owner_rank[ne]
-
-    if nrank == mesh.elements.owner_rank[e]
-        uP = @view trace[:, fi.neighbor_local_face, ne, :]
-        return uM, uP, :local
-    else
-        uP = get_mpi_plus_trace_permuted(
-            ghost_traces,
-            face_lookup,
-            perm_maps,
-            e,
-            f,
-        )
-        return uM, uP, :mpi
-    end
-end
-
 end # module TraceMaps

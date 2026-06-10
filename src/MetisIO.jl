@@ -6,8 +6,8 @@ export write_metis_mesh_from_vtk,
 function write_metis_mesh_from_vtk(vtk_path::AbstractString, metis_path::AbstractString)
     coords, elems = read_mesh_file_tet_vtk(vtk_path)
 
-    if size(elems, 2) == 4
-        elems = permutedims(elems)   # Ne × 4 -> 4 × Ne
+    if size(elems, 1) != 4 && size(elems, 2) == 4
+        elems = permutedims(elems)
     end
 
     @assert size(elems, 1) == 4 "Only tetrahedral meshes supported"
@@ -114,7 +114,7 @@ function read_mesh_file_tet_vtk(file_path::Union{String,SubString{String}})
         i += 1
     end
 
-    coords = permutedims(reshape(coords_flat, 3, ndofs), (2, 1))
+    coords = reshape(coords_flat, 3, ndofs)
 
     tri_cells = Int[]
     tri_tags  = Int[]
@@ -135,11 +135,11 @@ function read_mesh_file_tet_vtk(file_path::Union{String,SubString{String}})
         end
     end
 
-    bfaces = isempty(tri_cells) ? zeros(Int, 0, 3) :
-        permutedims(reshape(tri_cells, 3, :), (2,1))
+    bfaces = isempty(tri_cells) ? zeros(Int, 3, 0) :
+        reshape(tri_cells, 3, :)
 
-    EToN = isempty(tet_cells) ? zeros(Int, 0, 4) :
-        permutedims(reshape(tet_cells, 4, :), (2,1))
+    EToN = isempty(tet_cells) ? zeros(Int, 4, 0) :
+        reshape(tet_cells, 4, :)
 
     # return ndofs, coords, size(EToN,1), EToN, tet_tags, bfaces, tri_tags
     return coords, EToN

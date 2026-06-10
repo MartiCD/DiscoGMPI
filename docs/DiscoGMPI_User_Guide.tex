@@ -1,0 +1,1593 @@
+\documentclass[11pt,oneside]{book}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=25mm]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!65!black,
+  citecolor=blue!55!black,
+  pdftitle={DiscoGMPI User Guide},
+  pdfauthor={DiscoGMPI project}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{DiscoGMPI User Guide}
+\fancyhead[R]{\leftmark}
+\fancyfoot[C]{\thepage}
+\setlength{\headheight}{14pt}
+
+\definecolor{codebg}{RGB}{247,247,247}
+\definecolor{codeframe}{RGB}{210,210,210}
+\definecolor{codegreen}{RGB}{25,115,45}
+\definecolor{codeblue}{RGB}{15,70,145}
+\definecolor{codepurple}{RGB}{120,45,135}
+
+\lstdefinelanguage{Julia}{
+  morekeywords={
+    abstract,break,catch,const,continue,do,else,elseif,end,export,false,
+    finally,for,function,global,if,import,in,let,local,macro,module,mutable,
+    primitive,quote,return,struct,true,try,using,where,while
+  },
+  sensitive=true,
+  morecomment=[l]\#,
+  morestring=[b]",
+  morestring=[b]'
+}
+
+\lstset{
+  language=Julia,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codeblue}\bfseries,
+  commentstyle=\color{codegreen},
+  stringstyle=\color{codepurple},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  tabsize=4,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  xleftmargin=2em,
+  framexleftmargin=1.5em,
+  aboveskip=0.8em,
+  belowskip=0.8em,
+  literate=
+    {ε}{{$\varepsilon$}}1
+    {μ}{{$\mu$}}1
+    {Δ}{{$\Delta$}}1
+    {π}{{$\pi$}}1
+}
+
+\newcommand{\pkg}{\texttt{DiscoGMPI}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\api}[1]{\path{#1}}
+\newcommand{\vect}[1]{\boldsymbol{#1}}
+\newcommand{\jump}[1]{\left[\!\left[#1\right]\!\right]}
+\newcommand{\dd}{\,\mathrm{d}}
+\setlength{\emergencystretch}{2em}
+
+\title{\Huge DiscoGMPI\\[0.5em]\Large User Guide and Technical Reference}
+\author{DiscoGMPI project}
+\date{Version 0.1.0\\June 2026}
+
+\begin{document}
+
+\frontmatter
+\hypersetup{pageanchor=false}
+\maketitle
+\hypersetup{pageanchor=true}
+\setcounter{page}{1}
+
+\chapter*{About this guide}
+\addcontentsline{toc}{chapter}{About this guide}
+
+This manual describes the \pkg{} software as implemented in the repository at
+the time of writing. It covers the mathematical model, discontinuous Galerkin
+(DG) discretization, Maxwell formulations, MPI decomposition, installation,
+mesh preparation, public workflows, examples, tests, benchmarks, diagnostics,
+and known limitations.
+
+\pkg{} is the distributed-memory development line derived from DiscoG3D. It is
+a separate Julia package and repository. Work performed in \pkg{} does not
+overwrite the original DiscoG3D source tree.
+
+\paragraph{Scope.}
+The principal production path documented here is the source-free,
+three-dimensional Maxwell system on affine tetrahedral meshes, with
+perfect-electric-conductor (PEC) boundaries and explicit time integration.
+The serial and threaded solver also contains periodic-boundary infrastructure.
+The MPI Maxwell driver currently exchanges inter-rank face traces and supports
+PEC boundaries, but distributed periodic boundaries, sources, perfectly
+matched layers (PML), and heterogeneous material jumps remain future work.
+
+\paragraph{Notation.}
+Superscripts $-$ and $+$ denote the local and neighboring traces at a face.
+The unit normal $\vect n$ points out of the minus element. The polynomial
+degree is denoted by $N$, the number of volume nodes per tetrahedron by
+$N_p$, and the number of nodes per triangular face by $N_{fp}$.
+
+\tableofcontents
+\listoftables
+
+\mainmatter
+
+\chapter{Overview}
+
+\section{Purpose}
+
+\pkg{} provides:
+
+\begin{itemize}[leftmargin=*]
+  \item nodal DG operators for affine tetrahedral meshes;
+  \item source-free Maxwell volume and surface operators;
+  \item Hesthaven--Warburton strong-form and Poisson-bracket formulations;
+  \item central and upwind Maxwell fluxes where mathematically supported;
+  \item serial and Julia-threaded local execution backends;
+  \item explicit Runge--Kutta methods of orders one through five;
+  \item explicit partitioned symplectic Runge--Kutta (ESPRK) schemes of
+        orders one through six;
+  \item METIS element partition input;
+  \item owned-element and one-layer face-halo mesh construction;
+  \item MPI face orientation and nodal permutation handling;
+  \item nonblocking exchange of the six Maxwell traces;
+  \item distributed energy reductions and distributed time integration;
+  \item partition visualization, regression tests, convergence cases, and
+        backend benchmarks.
+\end{itemize}
+
+\section{Repository layout}
+
+\begin{longtable}{p{0.39\textwidth}p{0.53\textwidth}}
+\toprule
+Path & Purpose \\
+\midrule
+\endhead
+\api{src/DiscoGMPI.jl} & Package module, includes, and exported API. \\
+\api{src/solver/} & Serial and threaded DG/Maxwell data structures and kernels. \\
+\api{src/DistributedMesh3D.jl} & Ownership, ghost elements, local/global maps,
+face adjacency, and neighbor communication tables. \\
+\api{src/DistributedDG.jl} & Rank-local DG construction, root-only mesh
+distribution, Maxwell trace exchange, distributed right-hand side, energy,
+and time integration. \\
+\api{src/TraceMaps.jl} & General MPI trace maps and face-node permutation support. \\
+\api{src/MetisIO.jl} & Legacy VTK tetrahedral reader and METIS mesh writer. \\
+\api{src/PartitionVTK.jl} & Legacy VTK partition visualization writers. \\
+\api{examples/solver/} & Serial and threaded Maxwell examples and convergence
+drivers inherited from DiscoG3D. \\
+\api{examples/distributed_maxwell.jl} & End-to-end MPI Maxwell demonstration. \\
+\api{examples/meshes/} & Small sample mesh and METIS partition files. \\
+\api{benchmark/solver/} & Serial-versus-threaded right-hand-side benchmarks and
+plotting scripts. \\
+\api{test/} & Package tests and explicitly launched MPI tests. \\
+\bottomrule
+\end{longtable}
+
+\section{Supported execution modes}
+
+\begin{description}[style=nextline]
+  \item[Serial]
+  One Julia process using \code{SerialBackend()}.
+
+  \item[Threaded]
+  One Julia process using \code{ThreadedBackend()} and a Julia thread count
+  selected with \code{--threads=N} or \code{JULIA\_NUM\_THREADS=N}.
+
+  \item[Distributed memory]
+  Multiple Julia processes launched with \code{mpiexec}. Every rank owns a
+  subset of tetrahedra and stores a one-face halo.
+
+  \item[Hybrid MPI plus threads]
+  The distributed constructor accepts a backend, so a threaded local backend
+  can be selected per rank. This path should be validated on the target
+  machine before production use; the primary MPI regression tests use the
+  serial local backend.
+\end{description}
+
+\chapter{Mathematical Model}
+
+\section{Source-free Maxwell equations}
+
+For scalar, positive, spatially uniform permittivity $\varepsilon$ and
+permeability $\mu$, \pkg{} advances
+\begin{align}
+  \varepsilon \frac{\partial \vect E}{\partial t}
+    &= \nabla \times \vect H, \label{eq:maxwell-e}\\
+  \mu \frac{\partial \vect H}{\partial t}
+    &= -\nabla \times \vect E. \label{eq:maxwell-h}
+\end{align}
+The wave speed, impedance, and admittance are
+\begin{equation}
+  c = \frac{1}{\sqrt{\varepsilon\mu}},
+  \qquad
+  Z = \sqrt{\frac{\mu}{\varepsilon}},
+  \qquad
+  Y = \frac{1}{Z}.
+\end{equation}
+
+The divergence constraints
+\begin{equation}
+  \nabla\cdot(\varepsilon\vect E)=0,
+  \qquad
+  \nabla\cdot(\mu\vect H)=0
+\end{equation}
+are not solved as separate equations. Their preservation depends on the
+initial condition, mesh, spatial discretization, flux, and time integrator.
+
+\section{Electromagnetic energy}
+
+The continuous energy is
+\begin{equation}
+  \mathcal E(t)
+  =
+  \frac{1}{2}\int_\Omega
+  \left(
+    \varepsilon |\vect E|^2 + \mu |\vect H|^2
+  \right)\dd \vect x.
+\end{equation}
+The code evaluates its DG approximation element by element using the reference
+mass matrix and affine Jacobian determinant:
+\begin{equation}
+  \mathcal E_h
+  =
+  \frac{1}{2}
+  \sum_{K}
+  |J_K|
+  \left[
+    \varepsilon\sum_{\alpha\in\{x,y,z\}}
+      \vect E_{\alpha,K}^{T}M\vect E_{\alpha,K}
+    +
+    \mu\sum_{\alpha\in\{x,y,z\}}
+      \vect H_{\alpha,K}^{T}M\vect H_{\alpha,K}
+  \right].
+\end{equation}
+In MPI runs only owned elements contribute locally, followed by an
+\code{MPI.Allreduce} sum. Ghost elements are therefore not double counted.
+
+\section{PEC boundary condition}
+
+The perfect-electric-conductor condition is
+\begin{equation}
+  \vect n\times\vect E = \vect 0
+  \qquad\text{on }\partial\Omega_{\mathrm{PEC}}.
+\end{equation}
+\pkg{} imposes it through a reflected exterior trace:
+\begin{align}
+  \vect E^+ &= -\vect E^- + 2(\vect n\cdot\vect E^-)\vect n,\\
+  \vect H^+ &= \vect H^-.
+\end{align}
+This reverses the tangential electric field while retaining its normal
+component. Boundary-condition selection is tag based. A typical registry is:
+
+\begin{lstlisting}
+registry = MaxwellBoundaryRegistry(
+    Dict(10 => DiscoGMPI.MaxwellBC_PEC),
+)
+\end{lstlisting}
+
+An unregistered boundary tag maps to \code{MaxwellBC\_None}; it does not
+silently become PEC.
+
+\chapter{Tetrahedral DG Discretization}
+
+\section{Mesh and approximation space}
+
+The physical domain is partitioned into affine tetrahedra $K$. On each element,
+every scalar field component is represented in
+\begin{equation}
+  \mathbb P^N(K)
+  =
+  \{p(x,y,z): \deg p\leq N\},
+\end{equation}
+with
+\begin{equation}
+  N_p = \frac{(N+1)(N+2)(N+3)}{6}
+\end{equation}
+volume nodes. A triangular face contains
+\begin{equation}
+  N_{fp} = \frac{(N+1)(N+2)}{2}
+\end{equation}
+nodes.
+
+The reference tetrahedron has vertices
+\[
+(-1,-1,-1),\quad
+(1,-1,-1),\quad
+(-1,1,-1),\quad
+(-1,-1,1).
+\]
+The implementation builds equispaced nodal points, an orthonormal polynomial
+basis, a Vandermonde matrix, nodal derivative matrices, an exact polynomial
+mass matrix, and face mass/lifting operators.
+
+\section{Affine mapping and physical derivatives}
+
+For an affine map $\vect x=\vect x_K(r,s,t)$, let $J_K$ denote its Jacobian.
+Reference gradients are transformed by
+\begin{equation}
+  \nabla_{\vect x} u
+  =
+  J_K^{-T}\nabla_{(r,s,t)}u.
+\end{equation}
+The physical derivative matrices $D_x,D_y,D_z$ and weak derivative matrices
+\begin{equation}
+  S_x = M D_x,\qquad S_y=M D_y,\qquad S_z=M D_z
+\end{equation}
+are precomputed for each tetrahedron. The Poisson-bracket formulation also
+uses $S_x^T,S_y^T,S_z^T$.
+
+\section{Topology, traces, and lifting}
+
+Faces are identified by sorted triples of global vertex IDs. A face appearing
+once is a boundary face; a face appearing twice is an interior face. More than
+two adjacent tetrahedra is treated as a non-manifold error.
+
+For every interior face, the DG trace map stores:
+\begin{itemize}[leftmargin=*]
+  \item minus and plus element IDs;
+  \item local face IDs;
+  \item face-node indices;
+  \item the plus-to-minus nodal permutation;
+  \item the outward minus-side normal and face area.
+\end{itemize}
+
+Surface residuals are projected through the face mass matrix and lifted into
+the element volume. Conceptually, a face correction $\vect f$ contributes
+\begin{equation}
+  M_K^{-1}M_{f,K}\vect f
+\end{equation}
+to the nodal right-hand side, with the physical face area and element Jacobian
+included by the implementation.
+
+\section{Hesthaven--Warburton formulation}
+
+The strong-form volume terms directly approximate
+\begin{align}
+  \dot{\vect E}_K &= \frac{1}{\varepsilon}
+    (\nabla_h\times\vect H)_K + \text{surface correction},\\
+  \dot{\vect H}_K &= -\frac{1}{\mu}
+    (\nabla_h\times\vect E)_K + \text{surface correction}.
+\end{align}
+
+Let $\jump{\vect E}=\vect E^+-\vect E^-$ and
+$\jump{\vect H}=\vect H^+-\vect H^-$. The central correction used by the
+code is
+\begin{align}
+  \vect f_E^{\mathrm c}
+    &= \frac{1}{2}\vect n\times\jump{\vect H},\\
+  \vect f_H^{\mathrm c}
+    &= -\frac{1}{2}\vect n\times\jump{\vect E}.
+\end{align}
+The upwind flux adds tangential penalties:
+\begin{align}
+  \vect f_E^{\mathrm up}
+    &= \vect f_E^{\mathrm c}
+       -\frac{Y}{2}\vect n\times
+        \left(\vect n\times\jump{\vect E}\right),\\
+  \vect f_H^{\mathrm up}
+    &= \vect f_H^{\mathrm c}
+       -\frac{Z}{2}\vect n\times
+        \left(\vect n\times\jump{\vect H}\right).
+\end{align}
+
+Select the formulation with:
+
+\begin{lstlisting}
+central = HesthavenWarburtonFormulation(MaxwellFlux_Central)
+upwind  = HesthavenWarburtonFormulation(MaxwellFlux_Upwind)
+\end{lstlisting}
+
+The central flux is nondissipative in the ideal compatible setting. The
+upwind flux introduces numerical dissipation and is normally preferred when
+robust damping of unresolved jumps is more important than exact semidiscrete
+energy conservation.
+
+\section{Poisson-bracket formulation}
+
+The Poisson-bracket implementation is a partitioned weak-operator
+discretization. The electric update uses weak derivative matrices
+$S_x,S_y,S_z$, while the magnetic update uses their transposes. This pairing
+constructs a discrete skew structure and supports energy-compatible
+partitioned time stepping.
+
+For an interior face, the implemented corrections can be summarized as
+\begin{align}
+  \vect f_E^{\mathrm{PB}}
+    &= -\frac{1}{2\varepsilon}
+       \vect n\times(\vect H^- - \vect H^+),\\
+  \vect f_H^{\mathrm{PB}}
+    &= -\frac{1}{2\mu}
+       \vect n\times(\vect E^- + \vect E^+).
+\end{align}
+
+Only the central flux is supported:
+
+\begin{lstlisting}
+formulation = PoissonBracketFormulation()
+\end{lstlisting}
+
+Attempting to combine the Poisson-bracket formulation with the upwind flux
+raises an error because the upwind penalty is dissipative and does not define
+the implemented partitioned Poisson operator.
+
+\chapter{Time Integration}
+
+\section{Explicit Runge--Kutta methods}
+
+For a semidiscrete system $\dot U=R(U)$, an explicit Runge--Kutta method uses
+\begin{align}
+  U^{(i)} &= U^n + \Delta t\sum_{j<i}a_{ij}K_j,\\
+  K_i &= R(U^{(i)}),\\
+  U^{n+1} &= U^n + \Delta t\sum_i b_iK_i.
+\end{align}
+
+\begin{table}[htbp]
+\centering
+\caption{Explicit Runge--Kutta schemes available through
+\code{explicit\_rk\_scheme(order)}.}
+\begin{tabular}{clc}
+\toprule
+Order & Scheme & Stages \\
+\midrule
+1 & Forward Euler & 1 \\
+2 & Explicit midpoint & 2 \\
+3 & Classical third order & 3 \\
+4 & Classical fourth order & 4 \\
+5 & Dormand--Prince fifth-order update & 7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Dormand--Prince implementation uses the fifth-order update only. Adaptive
+step-size control and the embedded fourth-order estimator are not exposed.
+
+\section{Explicit partitioned symplectic methods}
+
+The Maxwell state is divided into electric and magnetic partitions. At every
+ESPRK stage, one partition is updated using its weight, the right-hand side is
+recomputed, and the complementary partition is updated using its own weight.
+Orders one through six are available:
+
+\begin{lstlisting}
+scheme = explicit_partitioned_symplectic_rk_scheme(
+    4;
+    first_partition = :H,
+)
+\end{lstlisting}
+
+For \code{PoissonBracketFormulation}, the magnetic partition must be advanced
+first:
+
+\begin{lstlisting}
+formulation = PoissonBracketFormulation()
+
+run_maxwell_partitioned_symplectic_time_steps!(
+    U,
+    dg,
+    registry,
+    formulation;
+    psrk_order = 4,
+    first_partition = :H,
+    dt = dt,
+    nsteps = nsteps,
+)
+\end{lstlisting}
+
+Using the conventional explicit Runge--Kutta driver with the Poisson-bracket
+formulation is rejected by the high-level API.
+
+\section{CFL estimate}
+
+The code defines the element characteristic length
+\begin{equation}
+  h_K = \frac{3V_K}{A_K},
+\end{equation}
+where $V_K$ is the tetrahedron volume and $A_K$ its total surface area. The
+recommended estimate is
+\begin{equation}
+  \Delta t
+  =
+  \mathrm{CFL}
+  \frac{\min_K h_K}{(2N+1)c}.
+\end{equation}
+It is obtained with:
+
+\begin{lstlisting}
+dt, sizes = estimate_maxwell_dt(
+    mesh,
+    dg.geometry,
+    dg.ref;
+    CFL = 0.10,
+)
+\end{lstlisting}
+
+This expression is an estimate, not a proof of stability for every mesh,
+formulation, flux, and RK scheme. Production studies should include a
+step-size sensitivity check.
+
+\chapter{Distributed-Memory Design}
+
+\section{Element ownership and face halos}
+
+An element partition vector assigns every global tetrahedron to a zero-based
+MPI rank:
+\begin{equation}
+  p_e\in\{0,\ldots,P-1\}.
+\end{equation}
+For rank $r$, \pkg{} stores:
+
+\begin{itemize}[leftmargin=*]
+  \item every element for which $p_e=r$ as \emph{owned};
+  \item every off-rank tetrahedron sharing a complete face with an owned
+        element as a \emph{ghost};
+  \item the nodes required by those owned and ghost elements;
+  \item global-to-local and local-to-global maps;
+  \item ownership, material IDs, face neighbors, volumes, and barycenters;
+  \item one communication record per neighboring rank.
+\end{itemize}
+
+Only a one-face halo is needed because the Maxwell DG surface operator couples
+elements only through face traces.
+
+\section{Face orientation}
+
+A triangular face admits six vertex permutations. For each inter-rank face,
+the distributed mesh records the orientation code that maps the neighbor
+ordering to the local ordering. The trace layer converts face nodes to
+barycentric coordinates and precomputes one nodal permutation for each of the
+six orientations. Received plus traces are therefore presented in the same
+physical point ordering as the local minus trace.
+
+This permutation step is essential for polynomial order $N>1$: matching only
+the three vertices is insufficient because edge and interior face nodes must
+also be reordered.
+
+\section{Maxwell communication}
+
+At each right-hand-side evaluation:
+
+\begin{enumerate}[leftmargin=*]
+  \item The six owned face traces
+        $(E_x,E_y,E_z,H_x,H_y,H_z)$ are packed for every neighbor.
+  \item All nonblocking receives are posted.
+  \item All nonblocking sends are posted.
+  \item \code{MPI.Waitall} completes the exchange.
+  \item Received values are unpacked into the corresponding ghost face nodes.
+  \item The local DG right-hand side is evaluated.
+  \item Every ghost-element right-hand-side column is set to zero, ensuring
+        that time integration updates owned elements only.
+\end{enumerate}
+
+For a neighbor with $F_{rn}$ interface faces, the message contains
+\begin{equation}
+  6N_{fp}F_{rn}
+\end{equation}
+double-precision values per right-hand-side evaluation.
+
+\paragraph{Current computation model.}
+The local DG kernel currently evaluates owned and stored ghost elements before
+zeroing ghost residuals. Communication volume is already trace-only, but a
+future optimization can avoid unnecessary ghost volume work and overlap
+communication with owned volume calculations.
+
+\section{Root-only mesh distribution}
+
+The scalable constructor keeps the global mesh and partition vector only on a
+designated root rank. Root builds each rank's owned-plus-halo package and sends
+that serialized package to the destination. Non-root ranks never construct or
+retain the complete global mesh.
+
+\begin{lstlisting}
+using MPI
+using DiscoGMPI
+
+MPI.Init()
+comm = MPI.COMM_WORLD
+rank = MPI.Comm_rank(comm)
+nranks = MPI.Comm_size(comm)
+
+root_mesh = rank == 0 ? read_vtu_mesh("mesh.vtu") : nothing
+root_partition = if rank == 0
+    read_metis_epart("mesh.mesh.epart.$nranks")
+else
+    nothing
+end
+
+ddg = build_distributed_dg_from_root(
+    root_mesh,
+    root_partition,
+    2;
+    comm = comm,
+    root = 0,
+)
+
+MPI.Barrier(comm)
+MPI.Finalize()
+\end{lstlisting}
+
+The file-based overload performs both reads only on root:
+
+\begin{lstlisting}
+ddg = build_distributed_dg_from_root(
+    "mesh.vtu",
+    "mesh.mesh.epart.4",
+    2;
+    comm = MPI.COMM_WORLD,
+)
+\end{lstlisting}
+
+All ranks must call the constructor collectively. Root validation errors are
+broadcast so that malformed input fails collectively rather than leaving
+worker ranks blocked.
+
+\section{Replicated constructor}
+
+When a global \code{RawVTUMesh} and partition vector already exist on every
+rank, the compatibility constructor remains available:
+
+\begin{lstlisting}
+ddg = build_distributed_dg(
+    global_mesh,
+    elem_to_rank,
+    order;
+    comm = MPI.COMM_WORLD,
+)
+\end{lstlisting}
+
+The root-only constructor is preferable for memory scaling on non-root ranks.
+Root still holds the complete input mesh during distribution.
+
+\chapter{Installation and Environment}
+
+\section{Prerequisites}
+
+\begin{itemize}[leftmargin=*]
+  \item Julia 1.9 or later.
+  \item An MPI implementation compatible with the MPI library selected by
+        MPI.jl.
+  \item An \code{mpiexec} command for multi-process runs.
+  \item METIS and its \code{mpmetis} executable when generating new
+        partitions.
+  \item ParaView or another VTK viewer for visualization.
+  \item Optional: Python 3 and Matplotlib for benchmark plots.
+  \item Optional: a LaTeX installation to build this manual.
+\end{itemize}
+
+\section{Instantiate the Julia environment}
+
+Run all commands from the repository root:
+
+\begin{lstlisting}[language=bash]
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+julia --project=. -e 'using DiscoGMPI; println("DiscoGMPI loaded")'
+\end{lstlisting}
+
+The package dependencies are recorded in \code{Project.toml} and
+\code{Manifest.toml}. Important dependencies include MPI.jl, ReadVTK.jl,
+VTKBase.jl, WriteVTK.jl, BenchmarkTools.jl, and Julia's LinearAlgebra standard
+library.
+
+\section{Check MPI}
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. -e '
+using MPI
+MPI.Init()
+println("rank ", MPI.Comm_rank(MPI.COMM_WORLD),
+        " of ", MPI.Comm_size(MPI.COMM_WORLD))
+MPI.Barrier(MPI.COMM_WORLD)
+MPI.Finalize()
+'
+\end{lstlisting}
+
+If this command fails before \pkg{} is loaded, fix the MPI.jl/runtime
+configuration first. In particular, do not mix an arbitrary system
+\code{mpiexec} with a different MPI library selected by MPI.jl.
+
+\section{Thread configuration}
+
+Thread counts are selected when Julia starts:
+
+\begin{lstlisting}[language=bash]
+julia --project=. --threads=8 my_case.jl
+JULIA_NUM_THREADS=8 julia --project=. my_case.jl
+\end{lstlisting}
+
+Inside Julia, verify the setting with:
+
+\begin{lstlisting}
+println(Threads.nthreads())
+\end{lstlisting}
+
+\chapter{Mesh Preparation}
+
+\section{RawVTUMesh format}
+
+The primary solver mesh container is:
+
+\begin{lstlisting}
+RawVTUMesh(
+    points,        # 3 x number_of_points, Float64
+    tets,          # 4 x number_of_tetrahedra, Int
+    tris,          # 3 x number_of_boundary_triangles, Int
+    tet_cell_ids,
+    tri_cell_ids,
+    cell_data,
+)
+\end{lstlisting}
+
+Connectivity uses Julia's one-based indexing. The XML VTU reader accepts
+tetrahedral volume cells and triangular surface cells and ignores unsupported
+cell types.
+
+\section{Boundary and material tags}
+
+By default, \code{DGDiscretization} looks for cell data named
+\code{boundary\_id}. The array is indexed by the original VTK cell IDs;
+\code{tri\_data(mesh, "boundary\_id")} extracts its surface-triangle values.
+
+The distributed constructors also accept:
+
+\begin{lstlisting}
+boundary_tag_name = "boundary_id"
+material_tag_name = "region_id"
+\end{lstlisting}
+
+Material IDs are preserved in the distributed topology. The current Maxwell
+operator nevertheless uses scalar run-wide values of $\varepsilon$ and $\mu$;
+element-dependent material jumps are not yet implemented.
+
+\section{Inspect a VTU mesh}
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/solver/read_vtu_mesh.jl path/to/mesh.vtu
+\end{lstlisting}
+
+The inspection example prints mesh dimensions, connectivity, tags, topology,
+geometry, mappings, basis diagnostics, face operators, trace checks, flux-face
+checks, and several local operator tests. It is intentionally verbose and is a
+useful first check for a new mesh.
+
+\section{Generate a METIS mesh}
+
+The sample workflow begins with a legacy ASCII VTK tetrahedral mesh:
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/write_metis.jl
+\end{lstlisting}
+
+This calls:
+
+\begin{lstlisting}
+write_metis_mesh_from_vtk(
+    "examples/meshes/tet_mesh.vtk",
+    "examples/meshes/tet_mesh.mesh",
+)
+\end{lstlisting}
+
+The generated METIS mesh contains one tetrahedron per line. Create $P$
+partitions with:
+
+\begin{lstlisting}[language=bash]
+mpmetis examples/meshes/tet_mesh.mesh 4
+\end{lstlisting}
+
+METIS normally writes:
+
+\begin{itemize}[leftmargin=*]
+  \item \code{tet\_mesh.mesh.epart.4}: one element partition ID per line;
+  \item \code{tet\_mesh.mesh.npart.4}: one node partition ID per line.
+\end{itemize}
+
+\pkg{} reads the element partition file. Partition IDs are expected to be
+zero based. For one-based files use:
+
+\begin{lstlisting}
+parts = read_metis_epart(path; one_based_parts = true)
+\end{lstlisting}
+
+\section{Visualize a partition}
+
+Edit \code{NPROCS} in \code{examples/write\_partition\_vtk.jl} if required,
+then run:
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/write_partition_vtk.jl
+\end{lstlisting}
+
+The script writes:
+
+\begin{itemize}[leftmargin=*]
+  \item one global legacy VTK file with \code{partition\_id} cell data;
+  \item one owned-element VTK file per partition.
+\end{itemize}
+
+The principal visualization file is
+\begin{center}
+\api{examples/visualization/partitioned_mesh.vtk}.
+\end{center}
+Open it in ParaView, color by \code{partition\_id}, and select
+``Surface With Edges''.
+
+\section{Mesh-quality requirements}
+
+\begin{itemize}[leftmargin=*]
+  \item Tetrahedra must have four valid, distinct nodes.
+  \item Every interior face must be shared by exactly two tetrahedra.
+  \item Boundary triangles must match tetrahedral exterior faces.
+  \item Volumes and face areas must be positive.
+  \item The partition vector length must equal the tetrahedron count.
+  \item Every partition ID must lie in \code{0:nranks-1}.
+  \item Every MPI rank should normally own at least one element.
+\end{itemize}
+
+\chapter{Programming with DiscoGMPI}
+
+\section{Construct a serial DG discretization}
+
+\begin{lstlisting}
+using DiscoGMPI
+
+mesh = read_vtu_mesh("mesh.vtu")
+dg = DGDiscretization(
+    mesh,
+    3;
+    boundary_tag_name = "boundary_id",
+    trace_tol = 1e-10,
+    backend = SerialBackend(),
+)
+\end{lstlisting}
+
+The resulting \code{DGDiscretization} contains the raw mesh, topology,
+geometry, affine mappings, reference element, face operators, physical
+operators, trace maps, flux faces, and backend.
+
+\section{Select the threaded backend}
+
+\begin{lstlisting}
+dg = DGDiscretization(
+    mesh,
+    3;
+    backend = ThreadedBackend(),
+)
+\end{lstlisting}
+
+The threaded kernels use face coloring so concurrently processed faces do not
+write to the same element residual.
+
+\section{Create an initial Maxwell field}
+
+\begin{lstlisting}
+Efun = (x, y, z) -> (
+    sin(pi * x),
+    0.0,
+    sin(pi * z),
+)
+
+Hfun = (x, y, z) -> (
+    0.0,
+    cos(pi * y),
+    0.0,
+)
+
+U = interpolate_maxwell_field(mesh, dg.ref, Efun, Hfun)
+\end{lstlisting}
+
+Each component is stored as an \code{Np x Ne} matrix. Columns are elements and
+rows are element-local DG nodes.
+
+\section{Run a serial Hesthaven--Warburton case}
+
+\begin{lstlisting}
+registry = MaxwellBoundaryRegistry(
+    Dict(10 => DiscoGMPI.MaxwellBC_PEC),
+)
+formulation = HesthavenWarburtonFormulation(MaxwellFlux_Upwind)
+
+dt, _ = estimate_maxwell_dt(
+    mesh,
+    dg.geometry,
+    dg.ref;
+    CFL = 0.10,
+)
+
+run_maxwell_time_steps!(
+    U,
+    dg,
+    registry,
+    formulation;
+    rk_order = 4,
+    dt = dt,
+    nsteps = 100,
+    energy_every = 10,
+)
+\end{lstlisting}
+
+\section{Run a Poisson-bracket case}
+
+\begin{lstlisting}
+formulation = PoissonBracketFormulation()
+
+run_maxwell_partitioned_symplectic_time_steps!(
+    U,
+    dg,
+    registry,
+    formulation;
+    psrk_order = 4,
+    first_partition = :H,
+    dt = dt,
+    nsteps = 100,
+    energy_every = 10,
+)
+\end{lstlisting}
+
+\section{Build and run an MPI case}
+
+\begin{lstlisting}
+using MPI
+using DiscoGMPI
+
+MPI.Init()
+comm = MPI.COMM_WORLD
+rank = MPI.Comm_rank(comm)
+nranks = MPI.Comm_size(comm)
+
+root_mesh = rank == 0 ? read_vtu_mesh("mesh.vtu") : nothing
+root_parts = rank == 0 ?
+    read_metis_epart("mesh.mesh.epart.$nranks") :
+    nothing
+
+ddg = build_distributed_dg_from_root(
+    root_mesh,
+    root_parts,
+    2;
+    comm = comm,
+)
+
+Efun = (x, y, z) -> (sin(pi*x), 0.0, sin(pi*z))
+Hfun = (x, y, z) -> (0.0, cos(pi*y), 0.0)
+U = interpolate_maxwell_field(ddg, Efun, Hfun)
+
+registry = MaxwellBoundaryRegistry(
+    Dict(10 => DiscoGMPI.MaxwellBC_PEC),
+)
+formulation = HesthavenWarburtonFormulation(MaxwellFlux_Upwind)
+
+run_distributed_maxwell_time_steps!(
+    U,
+    ddg,
+    registry,
+    formulation;
+    rk_order = 3,
+    dt = 1e-4,
+    nsteps = 100,
+    energy_every = 10,
+)
+
+MPI.Barrier(comm)
+MPI.Finalize()
+\end{lstlisting}
+
+Launch it with:
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 4 julia --project=. my_distributed_case.jl
+\end{lstlisting}
+
+\section{Distributed Poisson-bracket run}
+
+\begin{lstlisting}
+run_distributed_maxwell_partitioned_symplectic_time_steps!(
+    U,
+    ddg,
+    registry,
+    PoissonBracketFormulation();
+    psrk_order = 4,
+    first_partition = :H,
+    dt = 1e-4,
+    nsteps = 100,
+    energy_every = 10,
+)
+\end{lstlisting}
+
+\section{Energy diagnostics}
+
+\begin{lstlisting}
+serial_energy = maxwell_energy(
+    U,
+    dg.ref,
+    dg.mappings,
+)
+
+global_energy = distributed_maxwell_energy(
+    U,
+    ddg,
+)
+
+println(global_energy.electric)
+println(global_energy.magnetic)
+println(global_energy.total)
+\end{lstlisting}
+
+Distributed energy is collective: every rank must call it in the same order.
+
+\section{Global-to-local test initialization}
+
+\code{localize\_maxwell\_field} extracts owned and halo columns from a global
+field:
+
+\begin{lstlisting}
+local_U = localize_maxwell_field(global_U, ddg)
+\end{lstlisting}
+
+This function is primarily useful for verification against a serial reference.
+For scalable production initialization, use
+\code{interpolate\_maxwell\_field(ddg, Efun, Hfun)} so no global field is
+required on worker ranks.
+
+\chapter{Running Included Examples}
+
+\section{Distributed Maxwell demonstration}
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. examples/distributed_maxwell.jl
+\end{lstlisting}
+
+The script:
+\begin{itemize}[leftmargin=*]
+  \item builds a PEC cube only on rank zero;
+  \item partitions its tetrahedra round-robin;
+  \item distributes owned elements and face halos;
+  \item initializes a cavity field locally;
+  \item uses the Hesthaven--Warburton upwind formulation;
+  \item advances two RK3 steps;
+  \item reports ownership, neighbors, and global energy.
+\end{itemize}
+
+\section{Stationary PEC cube}
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/solver/stationary_pec_cube.jl \
+  --cells=3 --order=2 --nsteps=20 --rk=4 --cfl=0.05 \
+  --output=output/stationary_hw
+\end{lstlisting}
+
+The case uses the cube $[-1,1]^3$, PEC walls with boundary tag 10, and a
+cavity mode with $\omega=\sqrt{3}\pi$. It prints energy, right-hand-side, and
+tangential-electric-field diagnostics and writes final VTU data.
+
+Display its complete options with:
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/solver/stationary_pec_cube.jl --help
+\end{lstlisting}
+
+\section{Stationary central-flux ESPRK case}
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/solver/stationary_pec_cube_esprk.jl \
+  --cells=3 --order=2 --nsteps=20 --esprk=4 --first=H \
+  --cfl=0.05 --output=output/stationary_esprk
+\end{lstlisting}
+
+This case combines the Hesthaven--Warburton central flux with an explicit
+partitioned symplectic RK method. Both electric-first and magnetic-first stage
+orders are accepted.
+
+\section{Stationary Poisson-bracket ESPRK case}
+
+\begin{lstlisting}[language=bash]
+julia --project=. --threads=8 \
+  examples/solver/stationary_pec_cube_pb_esprk.jl \
+  --cells=3 --order=2 --nsteps=20 --esprk=4 \
+  --backend=threaded --cfl=0.05 \
+  --output=output/stationary_pb
+\end{lstlisting}
+
+The Poisson-bracket case requires \code{first=H}. It supports both the serial
+and threaded backend options.
+
+\section{Upwind convergence study}
+
+\begin{lstlisting}[language=bash]
+julia --project=. examples/solver/convergence_hw_upwind.jl \
+  --cells=2,3,4,5 \
+  --orders=1,2,4 \
+  --time=0.005 \
+  --cfl=0.1 \
+  --rk=5 \
+  --backend=serial \
+  --output=output/convergence_hw_upwind.csv
+\end{lstlisting}
+
+For a threaded run:
+
+\begin{lstlisting}[language=bash]
+julia --project=. --threads=8 \
+  examples/solver/convergence_hw_upwind.jl \
+  --cells=2,3,4,5 --orders=1,2,4 --backend=threaded
+\end{lstlisting}
+
+The driver requires exactly four mesh levels. It creates deterministic
+jittered tetrahedral cube meshes, computes continuous error norms, estimates
+convergence rates, and writes CSV output.
+
+\section{Central-flux partitioned convergence study}
+
+\begin{lstlisting}[language=bash]
+julia --project=. \
+  examples/solver/convergence_hw_central_psrk_hfirst.jl \
+  --cells=2,3,4,5 \
+  --orders=1,2,4 \
+  --psrk=2 \
+  --first=H \
+  --output=output/convergence_hw_central_psrk_hfirst.csv
+\end{lstlisting}
+
+\section{Poisson-bracket threaded convergence study}
+
+\begin{lstlisting}[language=bash]
+julia --project=. --threads=8 \
+  examples/solver/convergence_pb_esprk_threaded.jl \
+  --cells=3,4,5,6 \
+  --orders=1,2,3,4 \
+  --seconds=10 \
+  --backend=threaded \
+  --output=output/convergence_pb_esprk_threaded.csv
+\end{lstlisting}
+
+For this validation, the ESPRK order is fixed to spatial order plus one. A
+second CSV file with \code{\_3dec} inserted before the extension is also
+written.
+
+\chapter{Testing}
+
+\section{Package tests}
+
+Run the non-MPI test target with:
+
+\begin{lstlisting}[language=bash]
+julia --project=. -e 'using Pkg; Pkg.test()'
+\end{lstlisting}
+
+The package suite covers loading, physical weak derivatives, Maxwell volume
+and surface operators, formulations, backend dispatch, time integrators,
+energy diagnostics, and distributed-mesh consistency constructed without an
+MPI launcher.
+
+\section{MPI face permutation test}
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. test/test_mpi_face_permutation.jl
+\end{lstlisting}
+
+This test uses two tetrahedra whose shared face has different local vertex
+ordering. It verifies all face-node values after MPI exchange, including
+quadratic edge nodes.
+
+\section{MPI METIS partition tests}
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. test/test_mpi_metis_partition.jl
+mpiexec -n 4 julia --project=. test/test_mpi_metis_partition.jl
+\end{lstlisting}
+
+These tests check owned and ghost counts, symmetric neighbor tables,
+deterministic communication ordering, interface orientation, and generic trace
+exchange.
+
+\section{Distributed Maxwell equivalence tests}
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. test/test_mpi_distributed_maxwell.jl
+mpiexec -n 4 julia --project=. test/test_mpi_distributed_maxwell.jl
+\end{lstlisting}
+
+The two-rank test compares distributed and serial results for:
+
+\begin{itemize}[leftmargin=*]
+  \item Hesthaven--Warburton central flux;
+  \item Hesthaven--Warburton upwind flux;
+  \item Poisson-bracket formulation;
+  \item exchanged ghost traces;
+  \item zero ghost residuals;
+  \item global energy;
+  \item one explicit RK3 step;
+  \item one partitioned symplectic RK2 step.
+\end{itemize}
+
+The four-rank chain test exercises ranks with two neighbors and verifies
+upwind right-hand sides, traces, ghost residuals, and RK3 stepping. The file
+also verifies that root input errors propagate collectively without an MPI
+deadlock.
+
+\section{Recommended pre-commit sequence}
+
+\begin{lstlisting}[language=bash]
+julia --project=. -e 'using Pkg; Pkg.test()'
+mpiexec -n 2 julia --project=. test/test_mpi_face_permutation.jl
+mpiexec -n 2 julia --project=. test/test_mpi_metis_partition.jl
+mpiexec -n 4 julia --project=. test/test_mpi_metis_partition.jl
+mpiexec -n 2 julia --project=. test/test_mpi_distributed_maxwell.jl
+mpiexec -n 4 julia --project=. test/test_mpi_distributed_maxwell.jl
+mpiexec -n 2 julia --project=. examples/distributed_maxwell.jl
+\end{lstlisting}
+
+\chapter{Benchmarking}
+
+\section{Single benchmark}
+
+\begin{lstlisting}[language=bash]
+julia --project=. --threads=8 \
+  benchmark/solver/benchmark_backends.jl \
+  --formulation=hw-upwind \
+  --cells=6 \
+  --order=3 \
+  --seconds=3
+\end{lstlisting}
+
+Select the Poisson-bracket operator with
+\code{--formulation=pb}. The benchmark reports minimum, median, and mean
+times, allocations, memory, speedup, efficiency, and serial-versus-threaded
+right-hand-side error.
+
+\section{Thread scaling sweep}
+
+\begin{lstlisting}[language=bash]
+THREAD_COUNTS="1 2 4 8" \
+  bash benchmark/solver/run_thread_scaling.sh \
+  --formulation=hw-upwind --cells=6 --order=3
+\end{lstlisting}
+
+Outputs:
+
+\begin{itemize}[leftmargin=*]
+  \item \code{benchmark/solver/thread\_scaling\_raw.txt};
+  \item \code{benchmark/solver/thread\_scaling.csv}.
+\end{itemize}
+
+\section{Plot scaling data}
+
+\begin{lstlisting}[language=bash]
+python3 benchmark/solver/plot_thread_scaling.py
+\end{lstlisting}
+
+The script writes:
+
+\begin{itemize}[leftmargin=*]
+  \item \code{benchmark/solver/thread\_speedup.png};
+  \item \code{benchmark/solver/thread\_efficiency.png}.
+\end{itemize}
+
+Install Matplotlib separately if it is not available:
+
+\begin{lstlisting}[language=bash]
+python3 -m pip install matplotlib
+\end{lstlisting}
+
+\section{MPI performance measurements}
+
+The current repository does not contain a full MPI scaling harness. For
+meaningful measurements:
+
+\begin{enumerate}[leftmargin=*]
+  \item exclude Julia compilation and mesh distribution from the timed region;
+  \item warm up at least one right-hand-side evaluation;
+  \item place an \code{MPI.Barrier} immediately before timing;
+  \item reduce the maximum elapsed time across ranks;
+  \item report owned elements, interface faces, polynomial order, and
+        $N_{fp}$;
+  \item separate right-hand-side, trace exchange, energy reduction, and output
+        costs;
+  \item compare strong and weak scaling.
+\end{enumerate}
+
+\chapter{Output and Visualization}
+
+\section{Serial VTU field output}
+
+The stationary PEC examples contain helper functions that write either:
+
+\begin{itemize}[leftmargin=*]
+  \item cell-centered fields for order zero; or
+  \item discontinuous vertex fields for order one and above.
+\end{itemize}
+
+The discontinuous writer duplicates tetrahedron vertices per element. This is
+intentional: a DG solution may have two different traces at the same geometric
+vertex.
+
+\section{Partition output}
+
+\api{write_partition_vtk} writes the complete mesh with a partition cell
+array. \api{write_partition_piece_vtks} writes one owned-element mesh per
+partition. These are mesh visualization utilities; they do not write the
+distributed Maxwell solution.
+
+\section{Distributed solution output}
+
+A general MPI solution gather or parallel VTK writer is not yet part of the
+public API. A case-specific writer should:
+
+\begin{enumerate}[leftmargin=*]
+  \item write owned elements only;
+  \item preserve global element IDs;
+  \item avoid writing ghost elements as physical duplicates;
+  \item generate one file per rank or use a parallel VTK metadata file;
+  \item represent DG discontinuities explicitly, normally by duplicating
+        element-local points.
+\end{enumerate}
+
+\chapter{Diagnostics and Troubleshooting}
+
+\section{MPI run hangs}
+
+\begin{itemize}[leftmargin=*]
+  \item Confirm every rank enters the same collective constructor and time
+        integration sequence.
+  \item Confirm the launch rank count matches the partition file.
+  \item Confirm MPI.jl and \code{mpiexec} use compatible MPI libraries.
+  \item Do not let only rank zero call \code{distributed\_maxwell\_energy};
+        it contains an \code{Allreduce}.
+  \item Ensure all ranks use the same communication tag for a given exchange.
+\end{itemize}
+
+\section{Wrong interface flux or rank-dependent error}
+
+\begin{itemize}[leftmargin=*]
+  \item Run \code{test\_mpi\_face\_permutation.jl}.
+  \item Check tetrahedron connectivity and face orientation.
+  \item Check that face-node generation is identical on all ranks.
+  \item Tighten or relax \code{trace\_tol} only after inspecting mesh scale.
+  \item Verify that the partition includes complete face adjacency, not merely
+        node adjacency.
+\end{itemize}
+
+\section{Missing or incorrect boundary conditions}
+
+\begin{itemize}[leftmargin=*]
+  \item Confirm the VTU file contains triangular boundary cells.
+  \item Confirm their cell-data array is named \code{boundary\_id}, or pass a
+        different \code{boundary\_tag\_name}.
+  \item Print \code{unique(tri\_data(mesh, "boundary\_id"))}.
+  \item Register every physical PEC tag explicitly.
+  \item Remember that tag 10 is a convention in the examples, not a hard
+        requirement of the solver.
+\end{itemize}
+
+\section{Unstable time integration}
+
+\begin{itemize}[leftmargin=*]
+  \item Reduce the CFL factor.
+  \item Inspect the worst element reported by
+        \code{element\_size\_diagnostics}.
+  \item Check for degenerate or highly skewed tetrahedra.
+  \item Verify positive $\varepsilon$ and $\mu$.
+  \item Use the upwind Hesthaven--Warburton flux when damping unresolved jumps
+        is acceptable.
+  \item Confirm that the chosen RK or ESPRK order is supported.
+\end{itemize}
+
+\section{Poisson-bracket errors}
+
+\begin{itemize}[leftmargin=*]
+  \item Use \code{PoissonBracketFormulation()} with central flux only.
+  \item Use the partitioned symplectic driver.
+  \item Set \code{first\_partition = :H}.
+  \item Use ESPRK order one through six.
+\end{itemize}
+
+\section{Threaded run is slower}
+
+\begin{itemize}[leftmargin=*]
+  \item Increase the problem size; small meshes are overhead dominated.
+  \item Verify the actual Julia thread count.
+  \item Avoid oversubscribing cores in hybrid MPI/threaded runs.
+  \item Pin ranks and threads appropriately for the machine.
+  \item Use the benchmark harness and compare median times.
+\end{itemize}
+
+\section{Memory use is larger than expected}
+
+\begin{itemize}[leftmargin=*]
+  \item Use \code{build\_distributed\_dg\_from\_root}, not the replicated
+        constructor.
+  \item Remember that each rank stores owned elements plus one face halo.
+  \item Higher polynomial order increases storage in proportion to $N_p$.
+  \item Explicit RK methods store several complete right-hand sides.
+  \item Root temporarily retains the complete global mesh and partition during
+        distribution.
+\end{itemize}
+
+\chapter{Current Limitations and Roadmap}
+
+\section{Current limitations}
+
+\begin{itemize}[leftmargin=*]
+  \item Three-dimensional tetrahedral meshes only.
+  \item Affine straight-sided tetrahedral geometry.
+  \item Source-free Maxwell equations.
+  \item Scalar, run-wide $\varepsilon$ and $\mu$ in the Maxwell operator.
+  \item PEC is the implemented physical boundary condition for the MPI
+        Maxwell path.
+  \item Distributed periodic boundaries are not implemented.
+  \item No PML.
+  \item No material-interface Riemann solver for discontinuous impedance.
+  \item No adaptive mesh refinement.
+  \item No distributed mesh repartitioning during a run.
+  \item No general parallel field-output layer.
+  \item Root-only loading removes global mesh replication from workers but
+        root still reads and partitions the complete mesh.
+  \item Communication is nonblocking, but currently completed before local DG
+        evaluation; volume work is not yet overlapped with trace exchange.
+  \item Stored ghost elements currently pass through local volume evaluation
+        before ghost residuals are cleared.
+\end{itemize}
+
+\section{Recommended next development stages}
+
+\begin{enumerate}[leftmargin=*]
+  \item Add distributed periodic face pairing.
+  \item Add sources and spatially varying materials.
+  \item Add material-jump fluxes using side-dependent impedance and
+        admittance.
+  \item Add PML.
+  \item Split the right-hand side into owned volume work and interface surface
+        work, then overlap communication.
+  \item Skip ghost volume computation.
+  \item Add parallel solution output.
+  \item Add MPI strong- and weak-scaling benchmarks.
+  \item Replace root assembly with direct per-rank partition-file loading for
+        meshes too large for one rank.
+\end{enumerate}
+
+\appendix
+
+\chapter{API Quick Reference}
+
+\begin{longtable}{p{0.45\textwidth}p{0.47\textwidth}}
+\toprule
+API & Purpose \\
+\midrule
+\endhead
+\api{read_vtu_mesh(path)} & Read XML VTU tetrahedra, boundary triangles, and cell
+data into \code{RawVTUMesh}. \\
+\api{DGDiscretization(mesh,order;...)} & Build complete serial/threaded DG
+operators. \\
+\api{SerialBackend()} & Select scalar local kernels. \\
+\api{ThreadedBackend()} & Select Julia-threaded local Maxwell kernels. \\
+\api{HesthavenWarburtonFormulation(kind)} & Strong-form Maxwell DG with central or
+upwind flux. \\
+\api{PoissonBracketFormulation()} & Partitioned weak Maxwell operator with central
+flux. \\
+\api{MaxwellBoundaryRegistry(dict)} & Map integer boundary tags to boundary kinds. \\
+\api{interpolate_maxwell_field(...)} & Sample analytic electric and magnetic
+functions at DG nodes. \\
+\api{estimate_maxwell_dt(...)} & Compute the volume-to-surface CFL estimate. \\
+\api{maxwell_energy(...)} & Compute serial electromagnetic energy. \\
+\api{run_maxwell_time_steps!(...)} & Advance Hesthaven--Warburton with explicit
+RK. \\
+\api{run_maxwell_partitioned_symplectic_time_steps!(...)} & Advance a
+partitioned Maxwell system with ESPRK. \\
+\api{read_metis_epart(path)} & Read zero-based element partition IDs. \\
+\api{build_distributed_mesh(...)} & Build one rank's owned-plus-halo mesh from
+global arrays. \\
+\api{build_distributed_dg(...)} & Build distributed DG when the global mesh is
+replicated. \\
+\api{build_distributed_dg_from_root(...)} & Distribute rank-local DG meshes from
+a root-owned global mesh or root-read files. \\
+\api{exchange_maxwell_ghost_traces!(...)} & Exchange six Maxwell face traces. \\
+\api{distributed_maxwell_energy(...)} & Compute owned-only local energy followed
+by a global sum. \\
+\api{run_distributed_maxwell_time_steps!(...)} & Distributed explicit RK
+driver. \\
+\api{run_distributed_maxwell_partitioned_symplectic_time_steps!(...)} &
+Distributed Poisson-bracket ESPRK driver. \\
+\api{write_metis_mesh_from_vtk(...)} & Convert a supported legacy VTK tetra mesh
+to METIS format. \\
+\api{write_partition_vtk(...)} & Write a legacy VTK mesh colored by partition. \\
+\api{write_partition_piece_vtks(...)} & Write owned-element mesh pieces. \\
+\bottomrule
+\end{longtable}
+
+\chapter{Command Quick Reference}
+
+\begin{lstlisting}[language=bash]
+# Instantiate
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+# Package tests
+julia --project=. -e 'using Pkg; Pkg.test()'
+
+# Distributed Maxwell demo
+mpiexec -n 2 julia --project=. examples/distributed_maxwell.jl
+
+# MPI tests
+mpiexec -n 2 julia --project=. test/test_mpi_face_permutation.jl
+mpiexec -n 2 julia --project=. test/test_mpi_metis_partition.jl
+mpiexec -n 4 julia --project=. test/test_mpi_metis_partition.jl
+mpiexec -n 2 julia --project=. test/test_mpi_distributed_maxwell.jl
+mpiexec -n 4 julia --project=. test/test_mpi_distributed_maxwell.jl
+
+# Mesh inspection
+julia --project=. examples/solver/read_vtu_mesh.jl mesh.vtu
+
+# METIS preparation and partitioning
+julia --project=. examples/write_metis.jl
+mpmetis examples/meshes/tet_mesh.mesh 4
+
+# Partition visualization
+julia --project=. examples/write_partition_vtk.jl
+
+# Serial stationary case
+julia --project=. examples/solver/stationary_pec_cube.jl --help
+
+# Threaded Poisson-bracket case
+julia --project=. --threads=8 \
+  examples/solver/stationary_pec_cube_pb_esprk.jl --help
+
+# Backend benchmark
+julia --project=. --threads=8 \
+  benchmark/solver/benchmark_backends.jl --help
+
+# Thread scaling
+THREAD_COUNTS="1 2 4 8" \
+  bash benchmark/solver/run_thread_scaling.sh
+
+# Plot benchmark data
+python3 benchmark/solver/plot_thread_scaling.py
+
+# Build this guide
+pdflatex docs/DiscoGMPI_User_Guide.tex
+pdflatex docs/DiscoGMPI_User_Guide.tex
+\end{lstlisting}
+
+\chapter{Reproducibility Checklist}
+
+Record the following information with every reported result:
+
+\begin{itemize}[leftmargin=*]
+  \item \pkg{} commit hash and working-tree status;
+  \item Julia version and project/manifest state;
+  \item MPI implementation and version;
+  \item number of MPI ranks and Julia threads per rank;
+  \item CPU/node allocation and affinity settings;
+  \item mesh file, tetrahedron count, boundary tags, and partition file;
+  \item polynomial order $N$, $N_p$, and $N_{fp}$;
+  \item formulation and flux;
+  \item RK or ESPRK order and partition order;
+  \item $\varepsilon$, $\mu$, CFL, $\Delta t$, and number of steps;
+  \item initial condition and boundary registry;
+  \item initial/final energy and error norms;
+  \item output and benchmark methodology.
+\end{itemize}
+
+\backmatter
+
+\chapter*{License}
+\addcontentsline{toc}{chapter}{License}
+
+\pkg{} is distributed under the MIT License. See \code{LICENSE.md} in the
+repository for the complete license text.
+
+\end{document}

@@ -2,8 +2,6 @@ using Test
 using DiscoGMPI
 using DiscoGMPI.DistributedMesh3D
 
-include("../src/MetisIO.jl")
-
 @testset "METIS distributed mesh consistency" begin
     vtk_path = joinpath(@__DIR__,"../","examples", "meshes", "tet_mesh.vtk")
     epart_path = joinpath(@__DIR__,"../","examples", "meshes", "tet_mesh.mesh.epart.2")
@@ -25,7 +23,8 @@ include("../src/MetisIO.jl")
     @testset "owned elements" begin
         for rank in 0:nparts-1
             expected_owned = findall(==(rank), elem_to_rank)
-            @test sort(meshes[rank+1].partition.owned) == expected_owned
+            owned_global = meshes[rank+1].elements.global_ids[meshes[rank+1].partition.owned]
+            @test sort(owned_global) == expected_owned
         end
     end
 
@@ -49,7 +48,8 @@ include("../src/MetisIO.jl")
                 comm = mesh.mpi.comms[n]
 
                 for f in comm.send_faces
-                    @test elem_to_rank[f.global_elem] == r
+                    global_elem = mesh.elements.global_ids[f.local_elem]
+                    @test elem_to_rank[global_elem] == r
                     @test elem_to_rank[f.neighbor_global_elem] == n
                     @test f.orientation in 1:6
                 end
@@ -66,7 +66,7 @@ include("../src/MetisIO.jl")
 
                 faces_rn = [
                     (
-                        f.global_elem,
+                        mesh_r.elements.global_ids[f.local_elem],
                         f.local_face,
                         f.neighbor_global_elem,
                         f.neighbor_face,
@@ -78,7 +78,7 @@ include("../src/MetisIO.jl")
                     (
                         f.neighbor_global_elem,
                         f.neighbor_face,
-                        f.global_elem,
+                        mesh_n.elements.global_ids[f.local_elem],
                         f.local_face,
                     )
                     for f in mesh_n.mpi.comms[r].send_faces

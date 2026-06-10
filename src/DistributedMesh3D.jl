@@ -736,6 +736,10 @@ function build_distributed_mesh(
     myrank::Int;
     material_id_global::AbstractVector{Int}=ones(Int, size(global_elem_vertices, 2)),
     boundary_face_tags::Dict{NTuple{3, Int}, Int}=Dict{NTuple{3, Int}, Int}(),
+    face_to_elems_global::Union{
+        Nothing,
+        Dict{NTuple{3, Int}, Vector{Int}},
+    }=nothing,
 ) where {T<:Real}
 
     # ---------------------------
@@ -760,7 +764,11 @@ function build_distributed_mesh(
     owned_global = build_owned_global_elements(elem_to_rank, myrank)
     owned_global_set = Set(owned_global)
 
-    face_to_elems = build_face_to_global_elements(global_elem_vertices)
+    face_to_elems = if face_to_elems_global === nothing
+        build_face_to_global_elements(global_elem_vertices)
+    else
+        face_to_elems_global
+    end
 
     ghost_global = build_ghost_global_elements_face_halo(
         owned_global,
@@ -768,7 +776,10 @@ function build_distributed_mesh(
         face_to_elems,
     )
 
-    stored_global_elems = vcat(owned_global, ghost_global)
+    # Preserve global element order locally. Besides making rank-local layouts
+    # deterministic, this keeps DG minus/plus face orientation consistent with
+    # the serial mesh while ownership remains explicit in `partition`.
+    stored_global_elems = sort!(vcat(owned_global, ghost_global))
 
     # ---------------------------
     # Phase 2: local nodes

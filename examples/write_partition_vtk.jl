@@ -2,9 +2,9 @@
 #   julia --project=. examples/write_partition_vtk.jl
 #
 # Generates:
-#   examples/output/partitioned_mesh.vtk
-#   examples/output/partition_mesh_rank0.vtk
-#   examples/output/partition_mesh_rank1.vtk
+#   examples/visualization/partitioned_mesh.vtk
+#   examples/visualization/partition_mesh_rank0.vtk
+#   examples/visualization/partition_mesh_rank1.vtk
 
 using DiscoGMPI
 
@@ -13,12 +13,12 @@ mkpath(outdir)
 
 
 global_node_coords, global_elem_vertices = read_mesh_file_tet_vtk("examples/meshes/tet_mesh.vtk")
-global_node_coords, global_elem_vertices = global_node_coords', global_elem_vertices'
 
 @show size(global_node_coords, 1)
 @show size(global_node_coords, 2)
 
-elem_to_rank = read_metis_epart("examples/meshes/tet_mesh.mesh.epart.2")
+NPROCS = 4
+elem_to_rank = read_metis_epart("examples/meshes/tet_mesh.mesh.epart.$NPROCS")
 
 # ------------------------------------------------------------
 # 1. Full mesh with partition_id as CELL_DATA
