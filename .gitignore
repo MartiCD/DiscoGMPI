@@ -1,0 +1,5 @@
+output/
+
+benchmark/solver/*.csv
+benchmark/solver/*.txt
+benchmark/solver/*.png
