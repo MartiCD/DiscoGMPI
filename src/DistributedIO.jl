@@ -568,7 +568,8 @@ function partition_metadata_record(
         distributed_mesh.elements.global_ids[distributed_mesh.partition.owned]
     interface_faces = sum(
         length(distributed_dg.exchange.faces[neighbor])
-        for neighbor in distributed_dg.exchange.neighbors
+        for neighbor in distributed_dg.exchange.neighbors;
+        init = 0,
     )
 
     return (

@@ -203,6 +203,25 @@ pair is still checked against the strict aggregate targets `E=N+1` and `H=N`,
 but the component and leakage diagnostics should be inspected when the strict
 electric aggregate check fails.
 
+Run the distributed validation matrix to collect these checks across one rank
+and multiple ranks:
+
+```bash
+julia --project=. examples/validate_distributed_maxwell_matrix.jl \
+  --profile=standard \
+  --cases=cavity-pec,cavity-pmc,periodic \
+  --ranks=1,2
+```
+
+The validation matrix reuses the public convergence and production drivers.
+It writes `validation_matrix.csv` under `output/validation_matrix/`, compares
+rank-1 CSV diagnostics against each multi-rank run within configurable
+tolerances, and records explicit expected-rate checks. For cavity PEC/PMC
+cases the aggregate targets are `E=N+1` and `H=N`; for the periodic plane wave
+the matrix additionally checks the active components `Ez=N+1` and `Hy=N`.
+Use `--profile=smoke` for quick rank-equivalence checks and `--profile=strict`
+for more expensive certification runs.
+
 ## Materials and boundary conditions
 
 Spatially varying isotropic material properties are assigned per element from
