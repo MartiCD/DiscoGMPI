@@ -215,6 +215,24 @@ function local_owned_field_error(left, right, distributed_dg)
     return error
 end
 
+function local_owned_rhs_difference(left, right, distributed_dg)
+    error = 0.0
+    owned = distributed_dg.distributed_mesh.partition.owned
+    for (left_component, right_component) in
+        zip(rhs_components(left), rhs_components(right))
+        error = max(
+            error,
+            maximum(
+                abs.(
+                    left_component[:, owned] .-
+                    right_component[:, owned]
+                ),
+            ),
+        )
+    end
+    return error
+end
+
 function max_ghost_rhs(rhs, distributed_dg)
     value = 0.0
 
@@ -416,10 +434,74 @@ if NPROCS == 2
             root = 0,
         )
         @test metadata_exists
+        metadata_header_has_quality = MPI.bcast(
+            RANK == 0 &&
+            all(
+                field -> occursin(
+                    field,
+                    first(eachline(joinpath(metadata_dir, "partition_metadata.csv"))),
+                ),
+                (
+                    "local_elements",
+                    "ghost_nodes",
+                    "ghost_dofs",
+                    "interface_faces",
+                    "interface_faces_per_owned_element",
+                    "halo_elements_per_owned_element",
+                    "halo_dofs_per_owned_element",
+                    "send_values",
+                    "recv_values",
+                ),
+            ),
+            COMM;
+            root = 0,
+        )
+        @test metadata_header_has_quality
 
         MPI.Barrier(COMM)
         RANK == 0 && rm(io_root; recursive = true, force = true)
         MPI.Barrier(COMM)
+    end
+
+    @testset "Distributed Maxwell RHS profiling" begin
+        formulation = PoissonBracketFormulation()
+        profiled_U = localize_maxwell_field(global_U, distributed_dg)
+        reference_U = localize_maxwell_field(global_U, distributed_dg)
+        poison_ghosts!(profiled_U, distributed_dg)
+        poison_ghosts!(reference_U, distributed_dg)
+        profiled_rhs = DiscoGMPI.similar_maxwell_rhs(profiled_U)
+        reference_rhs = DiscoGMPI.similar_maxwell_rhs(reference_U)
+
+        timing = profile_distributed_maxwell_rhs!(
+            profiled_rhs,
+            profiled_U,
+            distributed_dg,
+            registry,
+            formulation;
+            tag = 25017,
+        )
+        maxwell_rhs!(
+            reference_rhs,
+            reference_U,
+            distributed_dg,
+            registry,
+            formulation,
+        )
+
+        rhs_difference = MPI.Allreduce(
+            local_owned_rhs_difference(
+                profiled_rhs,
+                reference_rhs,
+                distributed_dg,
+            ),
+            max,
+            COMM,
+        )
+        @test rhs_difference <= 1e-10
+        @test MPI.Allreduce(timing.halo_exchange_seconds, min, COMM) >= 0.0
+        @test MPI.Allreduce(timing.rhs_assembly_seconds, min, COMM) >= 0.0
+        @test MPI.Allreduce(timing.ghost_zero_seconds, min, COMM) >= 0.0
+        @test MPI.Allreduce(timing.total_seconds, max, COMM) > 0.0
     end
 
     @testset "Distributed Maxwell RHS matches serial" begin

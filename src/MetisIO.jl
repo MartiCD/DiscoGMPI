@@ -116,6 +116,22 @@ function read_mesh_file_tet_vtk(file_path::Union{String,SubString{String}})
 
     coords = reshape(coords_flat, 3, ndofs)
 
+    length(all_cells) == total_cells ||
+        error(
+            "VTK CELLS section declares $total_cells cells but contains " *
+            "$(length(all_cells)).",
+        )
+    length(cell_types) == total_cells ||
+        error(
+            "VTK CELL_TYPES section contains $(length(cell_types)) entries " *
+            "for $total_cells cells.",
+        )
+    isempty(cell_tags) || length(cell_tags) == total_cells ||
+        error(
+            "VTK CELL_DATA scalar array contains $(length(cell_tags)) entries " *
+            "for $total_cells cells.",
+        )
+
     tri_cells = Int[]
     tri_tags  = Int[]
     tet_cells = Int[]
@@ -124,7 +140,7 @@ function read_mesh_file_tet_vtk(file_path::Union{String,SubString{String}})
     for c in 1:total_cells
         ctype = cell_types[c]
         conn  = all_cells[c]
-        tag   = cell_tags[c]
+        tag   = isempty(cell_tags) ? 0 : cell_tags[c]
 
         if ctype == 5 && length(conn) == 3
             append!(tri_cells, conn)

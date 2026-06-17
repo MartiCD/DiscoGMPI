@@ -203,6 +203,89 @@ pair is still checked against the strict aggregate targets `E=N+1` and `H=N`,
 but the component and leakage diagnostics should be inspected when the strict
 electric aggregate check fails.
 
+### Strict periodic space-time isoresolution study
+
+The strict isoresolution driver uses the fixed periodic domain
+`[0,1] x [0,0.25] x [0,0.25]` and the existing `+x` plane wave with
+`k=2*pi` and wavelength `lambda=1`. It runs the `P1`, `P2`, and `P4`
+discretizations on four levels each. `P4M0` starts at four uniform mesh
+intervals per wavelength; resolution doubles between consecutive mesh levels
+and between `P4`, `P2`, and `P1` at a fixed level.
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_periodic_isoresolution.jl \
+  --final-time=0.25 \
+  --output=output/convergence_distributed_periodic_isoresolution.csv
+```
+
+The driver constructs six deterministic structured meshes shared by the
+twelve `P/M` cases. It requires the independently measured Cartesian spacing
+to equal the target spacing to roundoff, and it enforces the same factor-two
+hierarchy for the time step. Inspect resource and time-step planning without
+solving with `--dry-run`. A small MPI check is available with:
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_periodic_isoresolution.jl --smoke
+```
+
+The temporal base step is prescribed independently of the legacy CFL
+estimator:
+
+```text
+dt0 = C * h(P4M0) / 4,  C = 0.8,  h(P4M0) = 0.25
+dt0 = 0.05
+
+       M0  M1  M2  M3       (divisor applied to dt0)
+P4      1   2   4   8
+P2      2   4   8  16
+P1      4   8  16  32
+```
+
+The final time must be an integer multiple of `dt0`. The CSV records the old
+CFL estimate and whether each requested step satisfies it, but that estimate
+does not override this prescribed matrix. Exceeding it produces a warning and
+may cause the separate numerical-convergence verdict to fail.
+
+For every field component, the electric and magnetic vector fields, and the
+combined field, the CSV reports the space-time errors
+`L2(0,T; L2(Omega))` and `Linf(0,T; L2(Omega))`. Spatial L2 errors are
+evaluated with the existing distributed cubature diagnostics at every time-step
+endpoint. The temporal L2 norm uses the composite trapezoidal rule applied to
+the squared spatial L2 error; the temporal Linf norm is the maximum sampled at
+the time-step endpoints. Rates compare consecutive `M` levels at fixed `P`
+using the exact measured Cartesian spacing ratio. Rates for analytically zero
+components describe numerical polarization leakage and can be dominated by
+roundoff once those errors become very small.
+
+Each completed case is atomically saved under `<output-stem>_cases/`. Resume a
+compatible interrupted run with `--resume`; use `--checkpoint-dir=PATH` to
+choose another location. The driver atomically rewrites the partial CSV after
+every fresh case. Structural isoresolution and numerical convergence are
+reported separately, with the latter checking finite and monotonically
+decreasing active-component errors and finest-pair `Ez`/`Hy` rates for both
+temporal norms. The machine-readable summary is `<output-stem>_verdict.toml`.
+
+Run the distributed validation matrix to collect these checks across one rank
+and multiple ranks:
+
+```bash
+julia --project=. examples/validate_distributed_maxwell_matrix.jl \
+  --profile=standard \
+  --cases=cavity-pec,cavity-pmc,periodic \
+  --ranks=1,2
+```
+
+The validation matrix reuses the public convergence and production drivers.
+It writes `validation_matrix.csv` under `output/validation_matrix/`, compares
+rank-1 CSV diagnostics against each multi-rank run within configurable
+tolerances, and records explicit expected-rate checks. For cavity PEC/PMC
+cases the aggregate targets are `E=N+1` and `H=N`; for the periodic plane wave
+the matrix additionally checks the active components `Ez=N+1` and `Hy=N`.
+Use `--profile=smoke` for quick rank-equivalence checks and `--profile=strict`
+for more expensive certification runs.
+
 ## Materials and boundary conditions
 
 Spatially varying isotropic material properties are assigned per element from

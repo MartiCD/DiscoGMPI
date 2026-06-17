@@ -170,6 +170,17 @@ function max_abs_magnetic_rhs(rhs::MaxwellRHS)
     ))
 end
 
+function unit_tangent_to_normal(n::NTuple{3, Float64})
+    trial = abs(n[1]) < 0.9 ? (1.0, 0.0, 0.0) : (0.0, 1.0, 0.0)
+    tangent = (
+        n[2] * trial[3] - n[3] * trial[2],
+        n[3] * trial[1] - n[1] * trial[3],
+        n[1] * trial[2] - n[2] * trial[1],
+    )
+    scale = sqrt(tangent[1]^2 + tangent[2]^2 + tangent[3]^2)
+    return (tangent[1] / scale, tangent[2] / scale, tangent[3] / scale)
+end
+
 @testset "Physical weak derivative operators" begin
     mesh = two_tet_boundary_mesh()
     dg = DGDiscretization(mesh, 2)
@@ -312,6 +323,44 @@ end
     )
 
     @test abs(rate) <= 1e-10
+end
+
+@testset "Poisson-bracket PEC boundary magnetic flux" begin
+    normals = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, -1.0),
+        inv(sqrt(3.0)) .* (-1.0, 1.0, -1.0),
+    )
+    amplitudes = (1.0, -2.0, 0.5, 3.0)
+
+    for normal in normals
+        tangent = unit_tangent_to_normal(normal)
+        minus = (
+            Ex = [amplitude * tangent[1] for amplitude in amplitudes],
+            Ey = [amplitude * tangent[2] for amplitude in amplitudes],
+            Ez = [amplitude * tangent[3] for amplitude in amplitudes],
+            Hx = [0.3 + 0.2 * q for q in eachindex(amplitudes)],
+            Hy = [-0.4 + 0.1 * q for q in eachindex(amplitudes)],
+            Hz = [0.7 - 0.3 * q for q in eachindex(amplitudes)],
+        )
+        normal_electric = normal[1] .* minus.Ex .+
+                          normal[2] .* minus.Ey .+
+                          normal[3] .* minus.Ez
+        plus = DiscoGMPI.pec_boundary_plus_trace(minus, normal)
+        flux = DiscoGMPI.maxwell_poisson_bracket_surface_flux_values(
+            minus,
+            plus,
+            normal;
+            ε = 2.0,
+            μ = 3.0,
+        )
+
+        @test maximum(abs, normal_electric) <= 1e-14
+        @test maximum(abs, flux.fluxHx) <= 1e-14
+        @test maximum(abs, flux.fluxHy) <= 1e-14
+        @test maximum(abs, flux.fluxHz) <= 1e-14
+    end
 end
 
 @testset "Maxwell DG formulations" begin

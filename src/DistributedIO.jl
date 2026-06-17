@@ -242,6 +242,51 @@ function prepare_distributed_mesh_partition(
     return distributed_mesh
 end
 
+"""
+    prepare_distributed_mesh_partition_collective(global_mesh, elem_to_rank, output_dir; ...)
+
+Create rank-local mesh pieces without a rank-zero distribution phase. Every
+rank must provide the same global mesh and partition vector. This trades memory
+for setup scalability and is useful for generated meshes or benchmark cases
+where global inputs are already available on all ranks.
+"""
+function prepare_distributed_mesh_partition_collective(
+    global_mesh::RawVTUMesh,
+    elem_to_rank::AbstractVector{Int},
+    output_dir::AbstractString;
+    comm::MPI.Comm = MPI.COMM_WORLD,
+    boundary_tag_name::String = "boundary_id",
+    material_tag_name::Union{Nothing, String} = nothing,
+    metadata::AbstractDict = Dict{String, Any}(),
+)
+    rank = MPI.Comm_rank(comm)
+    nranks = MPI.Comm_size(comm)
+    boundary_face_tags, material_ids, face_to_elems =
+        root_mesh_distribution_data(
+            global_mesh,
+            elem_to_rank,
+            nranks;
+            boundary_tag_name = boundary_tag_name,
+            material_tag_name = material_tag_name,
+        )
+    distributed_mesh = build_distributed_mesh(
+        global_mesh.points,
+        global_mesh.tets,
+        elem_to_rank,
+        rank;
+        material_id_global = material_ids,
+        boundary_face_tags = boundary_face_tags,
+        face_to_elems_global = face_to_elems,
+    )
+    write_distributed_mesh_partition(
+        output_dir,
+        distributed_mesh;
+        comm = comm,
+        metadata = metadata,
+    )
+    return distributed_mesh
+end
+
 function manifest_piece(
     manifest::AbstractDict,
     rank::Int,
@@ -564,21 +609,70 @@ function partition_metadata_record(
 )
     distributed_mesh = distributed_dg.distributed_mesh
     rank = MPI.Comm_rank(distributed_dg.comm)
+    owned_elements = length(distributed_mesh.partition.owned)
+    ghost_elements = length(distributed_mesh.partition.ghosts)
+    local_elements = owned_elements + ghost_elements
+    local_nodes = length(distributed_mesh.nodes.global_ids)
+    ghost_nodes = Set{Int}()
+    for elem in distributed_mesh.partition.ghosts
+        for node in @view(distributed_mesh.elements.vertices[:, elem])
+            push!(ghost_nodes, node)
+        end
+    end
     owned_global_ids =
         distributed_mesh.elements.global_ids[distributed_mesh.partition.owned]
     interface_faces = sum(
         length(distributed_dg.exchange.faces[neighbor])
-        for neighbor in distributed_dg.exchange.neighbors
+        for neighbor in distributed_dg.exchange.neighbors;
+        init = 0,
     )
+    send_faces = sum(
+        length(distributed_mesh.mpi.comms[neighbor].send_faces)
+        for neighbor in distributed_mesh.mpi.neighbors;
+        init = 0,
+    )
+    recv_faces = sum(
+        length(distributed_mesh.mpi.comms[neighbor].recv_faces)
+        for neighbor in distributed_mesh.mpi.neighbors;
+        init = 0,
+    )
+    send_values = sum(
+        length(distributed_dg.exchange.send_buffers[neighbor])
+        for neighbor in distributed_dg.exchange.neighbors;
+        init = 0,
+    )
+    recv_values = sum(
+        length(distributed_dg.exchange.recv_buffers[neighbor])
+        for neighbor in distributed_dg.exchange.neighbors;
+        init = 0,
+    )
+    nodes_per_element = distributed_dg.dg.ref.Np
+    owned_scale = max(owned_elements, 1)
 
     return (
         rank = rank,
-        owned_elements = length(distributed_mesh.partition.owned),
-        ghost_elements = length(distributed_mesh.partition.ghosts),
-        local_nodes = length(distributed_mesh.nodes.global_ids),
+        owned_elements = owned_elements,
+        ghost_elements = ghost_elements,
+        local_elements = local_elements,
+        local_nodes = local_nodes,
+        ghost_nodes = length(ghost_nodes),
+        owned_dofs = owned_elements * nodes_per_element,
+        ghost_dofs = ghost_elements * nodes_per_element,
+        local_dofs = local_elements * nodes_per_element,
         neighbors = length(distributed_dg.exchange.neighbors),
         neighbor_ranks = join(distributed_dg.exchange.neighbors, ';'),
         interface_faces = interface_faces,
+        interface_faces_per_owned_element =
+            interface_faces / owned_scale,
+        send_faces = send_faces,
+        recv_faces = recv_faces,
+        send_values = send_values,
+        recv_values = recv_values,
+        halo_elements_per_owned_element = ghost_elements / owned_scale,
+        halo_dofs_per_owned_element =
+            (ghost_elements * nodes_per_element) / owned_scale,
+        send_values_per_owned_element = send_values / owned_scale,
+        recv_values_per_owned_element = recv_values / owned_scale,
         first_global_element =
             isempty(owned_global_ids) ? 0 : minimum(owned_global_ids),
         last_global_element =
@@ -614,8 +708,15 @@ function write_distributed_run_metadata(
             ) do io
                 println(
                     io,
-                    "rank,owned_elements,ghost_elements,local_nodes," *
-                    "neighbors,neighbor_ranks,interface_faces," *
+                    "rank,owned_elements,ghost_elements,local_elements," *
+                    "local_nodes,ghost_nodes,owned_dofs,ghost_dofs," *
+                    "local_dofs,neighbors,neighbor_ranks,interface_faces," *
+                    "interface_faces_per_owned_element," *
+                    "send_faces,recv_faces,send_values,recv_values," *
+                    "halo_elements_per_owned_element," *
+                    "halo_dofs_per_owned_element," *
+                    "send_values_per_owned_element," *
+                    "recv_values_per_owned_element," *
                     "first_global_element,last_global_element",
                 )
                 for record in records
@@ -626,10 +727,24 @@ function write_distributed_run_metadata(
                                 record.rank,
                                 record.owned_elements,
                                 record.ghost_elements,
+                                record.local_elements,
                                 record.local_nodes,
+                                record.ghost_nodes,
+                                record.owned_dofs,
+                                record.ghost_dofs,
+                                record.local_dofs,
                                 record.neighbors,
                                 record.neighbor_ranks,
                                 record.interface_faces,
+                                record.interface_faces_per_owned_element,
+                                record.send_faces,
+                                record.recv_faces,
+                                record.send_values,
+                                record.recv_values,
+                                record.halo_elements_per_owned_element,
+                                record.halo_dofs_per_owned_element,
+                                record.send_values_per_owned_element,
+                                record.recv_values_per_owned_element,
                                 record.first_global_element,
                                 record.last_global_element,
                             ),
@@ -641,6 +756,22 @@ function write_distributed_run_metadata(
 
             owned_counts = [record.owned_elements for record in records]
             ghost_counts = [record.ghost_elements for record in records]
+            local_counts = [record.local_elements for record in records]
+            interface_counts = [record.interface_faces for record in records]
+            neighbor_counts = [record.neighbors for record in records]
+            ghost_dof_counts = [record.ghost_dofs for record in records]
+            send_value_counts = [record.send_values for record in records]
+            recv_value_counts = [record.recv_values for record in records]
+            halo_ratios = [
+                record.halo_elements_per_owned_element
+                for record in records
+            ]
+            interface_ratios = [
+                record.interface_faces_per_owned_element
+                for record in records
+            ]
+            owned_minimum = minimum(owned_counts)
+            owned_maximum = maximum(owned_counts)
             metadata = Dict{String, Any}(
                 "format" => "DiscoGMPI run metadata",
                 "version" => 1,
@@ -650,9 +781,39 @@ function write_distributed_run_metadata(
                 "dg_order" => distributed_dg.dg.ref.N,
                 "nodes_per_element" => distributed_dg.dg.ref.Np,
                 "global_elements" => sum(owned_counts),
-                "owned_elements_minimum" => minimum(owned_counts),
-                "owned_elements_maximum" => maximum(owned_counts),
+                "owned_elements_minimum" => owned_minimum,
+                "owned_elements_maximum" => owned_maximum,
+                "owned_elements_average" =>
+                    sum(owned_counts) / max(nranks, 1),
+                "owned_elements_imbalance" =>
+                    owned_minimum == 0 ? 0.0 : owned_maximum / owned_minimum,
+                "local_elements_total" => sum(local_counts),
+                "local_elements_maximum" => maximum(local_counts),
+                "local_elements_average" =>
+                    sum(local_counts) / max(nranks, 1),
                 "ghost_elements_total" => sum(ghost_counts),
+                "ghost_elements_maximum" => maximum(ghost_counts),
+                "ghost_elements_average" =>
+                    sum(ghost_counts) / max(nranks, 1),
+                "ghost_dofs_total" => sum(ghost_dof_counts),
+                "ghost_dofs_maximum" => maximum(ghost_dof_counts),
+                "interface_faces_total" => sum(interface_counts),
+                "interface_faces_maximum" => maximum(interface_counts),
+                "interface_faces_average" =>
+                    sum(interface_counts) / max(nranks, 1),
+                "halo_elements_per_owned_element_maximum" =>
+                    maximum(halo_ratios),
+                "interface_faces_per_owned_element_maximum" =>
+                    maximum(interface_ratios),
+                "neighbor_count_maximum" => maximum(neighbor_counts),
+                "send_values_total" => sum(send_value_counts),
+                "send_values_maximum" => maximum(send_value_counts),
+                "send_values_average" =>
+                    sum(send_value_counts) / max(nranks, 1),
+                "recv_values_total" => sum(recv_value_counts),
+                "recv_values_maximum" => maximum(recv_value_counts),
+                "recv_values_average" =>
+                    sum(recv_value_counts) / max(nranks, 1),
                 "configuration" => toml_value(configuration),
                 "runtime" => toml_value(runtime),
             )

@@ -1,6 +1,6 @@
 // periodic_box_2x1x1_hx4_unstructured.geo
 //
-// Unstructured periodic tetrahedral mesh of [0,2] x [0,1] x [0,1].
+// Unstructured periodic tetrahedral mesh of [0,1] x [0,0.25] x [0,0.25].
 //
 // This file is designed to match the conventions used by the Julia script:
 //   Physical Surface(1): x-min
@@ -18,9 +18,9 @@
 // no Recombine. Gmsh will generate an unstructured triangular surface mesh and
 // an unstructured tetrahedral volume mesh.
 
-Lx = 1.0; //2.0;
-Ly = 0.25; //1.0;
-Lz = 0.25; //1.0;
+Lx = 1.0; //1.0; //2.0;
+Ly = 1.0; //0.25; //1.0;
+Lz = 1.0; //0.25; //1.0;
 
 // Override from the command line with:
 //   gmsh periodic_box_unstructured.geo -3 -setnumber NxTarget 8

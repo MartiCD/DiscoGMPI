@@ -2,6 +2,32 @@ using Test
 using DiscoGMPI
 using DiscoGMPI.DistributedMesh3D
 
+@testset "Legacy VTK tetrahedra without CELL_DATA" begin
+    mktempdir() do directory
+        vtk_path = joinpath(directory, "untagged_tet.vtk")
+        open(vtk_path, "w") do io
+            print(io, """# vtk DataFile Version 2.0
+untagged tetrahedron
+ASCII
+DATASET UNSTRUCTURED_GRID
+POINTS 4 double
+0 0 0
+1 0 0
+0 1 0
+0 0 1
+CELLS 1 5
+4 0 1 2 3
+CELL_TYPES 1
+10
+""")
+        end
+
+        coordinates, tetrahedra = read_mesh_file_tet_vtk(vtk_path)
+        @test size(coordinates) == (3, 4)
+        @test tetrahedra == reshape([1, 2, 3, 4], 4, 1)
+    end
+end
+
 @testset "METIS distributed mesh consistency" begin
     vtk_path = joinpath(@__DIR__,"../","examples", "meshes", "tet_mesh.vtk")
     epart_path = joinpath(@__DIR__,"../","examples", "meshes", "tet_mesh.mesh.epart.2")

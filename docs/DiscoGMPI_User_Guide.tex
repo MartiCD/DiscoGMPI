@@ -2014,20 +2014,31 @@ python3 -m pip install matplotlib
 
 \section{MPI performance measurements}
 
-The current repository does not contain a full MPI scaling harness. For
-meaningful measurements:
+The MPI scaling harness runs strong and weak right-hand-side scaling sweeps:
 
-\begin{enumerate}[leftmargin=*]
-  \item exclude Julia compilation and mesh distribution from the timed region;
-  \item warm up at least one right-hand-side evaluation;
-  \item place an \code{MPI.Barrier} immediately before timing;
-  \item reduce the maximum elapsed time across ranks;
-  \item report owned elements, interface faces, polynomial order, and
-        $N_{fp}$;
-  \item separate right-hand-side, trace exchange, energy reduction, and output
-        costs;
-  \item compare strong and weak scaling.
-\end{enumerate}
+\begin{lstlisting}[language=bash]
+MPI_RANKS="1 2 4 8" \
+SCALING_MODES="strong weak" \
+  bash benchmark/distributed/run_mpi_scaling.sh \
+  --setup=cache --cells=6 --order=3 --iterations=50 --warmup=5
+\end{lstlisting}
+
+Strong scaling keeps \code{--cells} fixed. Weak scaling uses
+\code{round(cells * ranks^(1/3))} cells per axis so the element count grows
+approximately linearly with MPI ranks. The benchmark warms up the RHS, places a
+barrier immediately before timing, reduces maximum elapsed times across ranks,
+and reports separate columns for halo exchange, RHS assembly, ghost zeroing,
+owned elements, interface faces, ghost elements, and message sizes.
+
+Outputs:
+
+\begin{itemize}[leftmargin=*]
+  \item \code{benchmark/distributed/mpi\_scaling\_raw.txt};
+  \item \code{benchmark/distributed/mpi\_scaling.csv};
+  \item per-case \code{run\_metadata.toml} and
+        \code{partition\_metadata.csv} under
+        \code{benchmark/distributed/output}.
+\end{itemize}
 
 \chapter{Output and Visualization}
 
@@ -2130,7 +2141,8 @@ Every production experiment writes:
   \item \code{run\_metadata.toml}: configuration, Julia version, MPI size,
         time-step data, elapsed solve time, and final checkpoint;
   \item \code{partition\_metadata.csv}: owned and ghost elements, local nodes,
-        neighbor ranks, interface-face counts, and global element ranges;
+        neighbor ranks, interface-face counts, halo-size ratios, send/receive
+        buffer sizes, and global element ranges;
   \item \code{paraview\_series.csv}: step, time, and PVTU dataset index.
 \end{itemize}
 

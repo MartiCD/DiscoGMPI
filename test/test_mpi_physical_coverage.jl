@@ -81,6 +81,54 @@ function periodic_cube_mesh()
     )
 end
 
+function rhs_components(rhs::MaxwellRHS)
+    return (
+        rhs.rhsEx,
+        rhs.rhsEy,
+        rhs.rhsEz,
+        rhs.rhsHx,
+        rhs.rhsHy,
+        rhs.rhsHz,
+    )
+end
+
+function field_components(U::MaxwellField)
+    return (U.Ex, U.Ey, U.Ez, U.Hx, U.Hy, U.Hz)
+end
+
+function poison_ghosts!(U::MaxwellField, distributed_dg)
+    for elem in distributed_dg.distributed_mesh.partition.ghosts
+        for component in field_components(U)
+            fill!(@view(component[:, elem]), -1.0e9)
+        end
+    end
+    return U
+end
+
+function owned_rhs_error(global_rhs::MaxwellRHS, local_rhs::MaxwellRHS, distributed_dg)
+    error = 0.0
+
+    for local_elem in distributed_dg.distributed_mesh.partition.owned
+        global_elem =
+            distributed_dg.distributed_mesh.elements.global_ids[local_elem]
+
+        for (global_component, local_component) in
+            zip(rhs_components(global_rhs), rhs_components(local_rhs))
+            error = max(
+                error,
+                maximum(
+                    abs.(
+                        global_component[:, global_elem] .-
+                        local_component[:, local_elem]
+                    ),
+                ),
+            )
+        end
+    end
+
+    return error
+end
+
 @testset "Distributed periodic physical coverage" begin
     NPROCS >= 2 ||
         error("Run this test with at least two MPI ranks.")
@@ -139,6 +187,59 @@ end
         )
     )
     @test MPI.Allreduce(local_maximum, max, COMM) < 1e-13
+
+    serial_mesh = periodic_cube_mesh()
+    serial_dg = DGDiscretization(serial_mesh, 2)
+    serial_periodic = build_periodic_flux_faces(
+        serial_mesh,
+        serial_dg.ref,
+        serial_dg.flux_faces,
+        default_unit_box_periodic_specs(),
+    )
+    nonzero_periodic = interpolate_maxwell_field(
+        serial_mesh,
+        serial_dg.ref,
+        (x, y, z) -> (
+            sin(2pi * x) + 0.25 * cos(2pi * y),
+            cos(2pi * y) + 0.20 * sin(2pi * z),
+            sin(2pi * z) + 0.15 * cos(2pi * x),
+        ),
+        (x, y, z) -> (
+            cos(2pi * z) - 0.10 * sin(2pi * y),
+            sin(2pi * x) + 0.30 * cos(2pi * z),
+            cos(2pi * y) - 0.20 * sin(2pi * x),
+        ),
+    )
+    serial_rhs = DiscoGMPI.similar_maxwell_rhs(nonzero_periodic)
+    maxwell_rhs_periodic!(
+        serial_rhs,
+        nonzero_periodic,
+        serial_dg,
+        serial_periodic,
+        registry,
+        PoissonBracketFormulation(),
+    )
+
+    local_periodic = localize_maxwell_field(nonzero_periodic, distributed_dg)
+    poison_ghosts!(local_periodic, distributed_dg)
+    local_rhs = DiscoGMPI.similar_maxwell_rhs(local_periodic)
+    maxwell_rhs_periodic!(
+        local_rhs,
+        local_periodic,
+        distributed_dg,
+        periodic,
+        registry,
+        PoissonBracketFormulation(),
+        materials,
+    )
+    local_rhs_norm = maximum(
+        maximum(abs, component[:, owned])
+        for component in rhs_components(local_rhs)
+    )
+    local_periodic_error =
+        owned_rhs_error(serial_rhs, local_rhs, distributed_dg)
+    @test MPI.Allreduce(local_rhs_norm, max, COMM) > 1e-8
+    @test MPI.Allreduce(local_periodic_error, max, COMM) < 1e-10
 
     plane_wave = interpolate_maxwell_field(
         distributed_dg,

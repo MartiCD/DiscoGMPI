@@ -11,25 +11,6 @@ using MPI
 using DiscoGMPI
 using LinearAlgebra: dot
 using Printf
-using WriteVTK:
-    MeshCell,
-    VTKCellTypes,
-    VTKCellData,
-    VTKFieldData,
-    VTKPointData,
-    pvtk_grid
-
-include(
-    joinpath(
-        @__DIR__,
-        "..",
-        "src",
-        "solver",
-        "kernels",
-        "JaskowiecSukumar.jl",
-    ),
-)
-
 const DEFAULT_WAVE_NUMBER = 2.0 * pi
 const MAGNETIC_AMPLITUDE = 1.0
 const TET_FACE_NODE_IDS = (
@@ -52,6 +33,7 @@ struct ExperimentConfig
     repartition::Bool
     distributed_mesh_dir::String
     rebuild_distributed_mesh::Bool
+    collective_distributed_mesh_prep::Bool
     output_dir::String
     polynomial_order::Int
     esprk_order::Int
@@ -71,59 +53,6 @@ end
 struct PeriodicBox
     lower::NTuple{3, Float64}
     upper::NTuple{3, Float64}
-end
-
-struct PlaneWaveParameters
-    wave_number::Float64
-    angular_frequency::Float64
-    magnetic_amplitude::Float64
-    x_origin::Float64
-end
-
-struct MaxwellQuadratureDiagnostics
-    cubature_order::Int
-    electric_energy::Float64
-    magnetic_energy::Float64
-    total_energy::Float64
-    exact_electric_energy::Float64
-    exact_magnetic_energy::Float64
-    exact_total_energy::Float64
-    electric_l2::Float64
-    exact_electric_l2::Float64
-    electric_error_l2::Float64
-    electric_relative_error::Float64
-    magnetic_l2::Float64
-    exact_magnetic_l2::Float64
-    magnetic_error_l2::Float64
-    magnetic_relative_error::Float64
-    field_error_l2::Float64
-    field_relative_error::Float64
-    energy_density_l2::Float64
-    exact_energy_density_l2::Float64
-    energy_density_error_l2::Float64
-    energy_density_relative_error::Float64
-    optical_chirality::Float64
-    exact_optical_chirality::Float64
-    optical_chirality_error::Float64
-    optical_chirality_density_l2::Float64
-    exact_optical_chirality_density_l2::Float64
-    optical_chirality_density_error_l2::Float64
-    electric_charge::Float64
-    magnetic_charge::Float64
-    exact_electric_charge::Float64
-    exact_magnetic_charge::Float64
-    linear_momentum_x::Float64
-    linear_momentum_y::Float64
-    linear_momentum_z::Float64
-    exact_linear_momentum_x::Float64
-    exact_linear_momentum_y::Float64
-    exact_linear_momentum_z::Float64
-    angular_momentum_x::Float64
-    angular_momentum_y::Float64
-    angular_momentum_z::Float64
-    exact_angular_momentum_x::Float64
-    exact_angular_momentum_y::Float64
-    exact_angular_momentum_z::Float64
 end
 
 function usage(io::IO = stdout)
@@ -150,6 +79,12 @@ Options:
   --rebuild-distributed-mesh
                         Recreate the rank-local mesh cache from --mesh and
                         the partition before running.
+  --collective-distributed-mesh-prep
+                        Recreate a missing or stale rank-local mesh cache by
+                        having every rank read the global mesh and partition,
+                        avoiding root-built rank-local mesh packets. If
+                        partition generation is needed, rank zero still runs
+                        mpmetis once before the collective read.
   --output-dir PATH     Output directory.
                         Default: output/distributed_periodic_poisson_bracket
   --order N             DG polynomial order (N >= 2). Order 1 aliases the
@@ -225,6 +160,7 @@ function parse_arguments(
     repartition = false
     distributed_mesh_dir = ""
     rebuild_distributed_mesh = false
+    collective_distributed_mesh_prep = false
     output_dir =
         joinpath(
             repository_root,
@@ -276,6 +212,8 @@ function parse_arguments(
             distributed_mesh_dir = abspath(value)
         elseif arg == "--rebuild-distributed-mesh"
             rebuild_distributed_mesh = true
+        elseif arg == "--collective-distributed-mesh-prep"
+            collective_distributed_mesh_prep = true
         elseif startswith(arg, "--output-dir")
             value, i = option_value(args, i, "--output-dir")
             output_dir = abspath(value)
@@ -395,6 +333,7 @@ function parse_arguments(
         repartition,
         distributed_mesh_dir,
         rebuild_distributed_mesh,
+        collective_distributed_mesh_prep,
         output_dir,
         polynomial_order,
         esprk_order,
@@ -526,70 +465,6 @@ function load_periodic_mesh(mesh_path::String)
     return mesh
 end
 
-function exact_periodic_wave_functions(
-    time::Float64;
-    epsilon::Float64,
-    mu::Float64,
-    wave::PlaneWaveParameters,
-)
-    electric_scale =
-        -wave.wave_number * wave.magnetic_amplitude /
-        (wave.angular_frequency * epsilon)
-    phase = (x, time_value) ->
-        wave.wave_number * (x - wave.x_origin) -
-        wave.angular_frequency * time_value
-
-    electric = (x, y, z) ->
-        (0.0, 0.0, electric_scale * sin(phase(x, time)))
-    magnetic = (x, y, z) ->
-        (0.0, wave.magnetic_amplitude * sin(phase(x, time)), 0.0)
-
-    return electric, magnetic
-end
-
-function exact_periodic_wave_curl_functions(
-    time::Float64;
-    epsilon::Float64,
-    mu::Float64,
-    wave::PlaneWaveParameters,
-)
-    electric_scale =
-        -wave.wave_number * wave.magnetic_amplitude /
-        (wave.angular_frequency * epsilon)
-    phase = (x, time_value) ->
-        wave.wave_number * (x - wave.x_origin) -
-        wave.angular_frequency * time_value
-
-    curl_electric = (x, y, z) ->
-        (
-            0.0,
-            -electric_scale * wave.wave_number * cos(phase(x, time)),
-            0.0,
-        )
-    curl_magnetic = (x, y, z) ->
-        (
-            0.0,
-            0.0,
-            wave.wave_number * wave.magnetic_amplitude * cos(phase(x, time)),
-        )
-
-    return curl_electric, curl_magnetic
-end
-
-function optical_chirality_density(
-    electric::NTuple{3, Float64},
-    curl_electric::NTuple{3, Float64},
-    magnetic::NTuple{3, Float64},
-    curl_magnetic::NTuple{3, Float64};
-    epsilon::Float64,
-    mu::Float64,
-)
-    return 0.5 * (
-        epsilon * dot(electric, curl_electric) +
-        mu * dot(magnetic, curl_magnetic)
-    )
-end
-
 function periodic_boundary_specs(box::PeriodicBox)
     Lx, Ly, Lz = periodic_box_lengths(box)
     return (
@@ -669,18 +544,6 @@ function resolved_cubature_order(config::ExperimentConfig)
     return order
 end
 
-function reference_interpolation_matrix(
-    ref::ReferenceTet,
-    cubature_points::Matrix{Float64},
-)
-    rq = collect(@view cubature_points[:, 1])
-    sq = collect(@view cubature_points[:, 2])
-    tq = collect(@view cubature_points[:, 3])
-    modal_values =
-        DiscoGMPI.orthonormal_vandermonde_tet(rq, sq, tq, ref.basis)
-    return modal_values * ref.invV
-end
-
 function distributed_quadrature_diagnostics(
     U::MaxwellField,
     distributed_dg::DistributedDGDiscretization,
@@ -690,552 +553,15 @@ function distributed_quadrature_diagnostics(
     mu::Float64,
     wave::PlaneWaveParameters,
 )
-    cubature_points, cubature_weights, number_cubature_points =
-        get_JaskowiecSukumar_cubature(cubature_order)
-    interpolation =
-        reference_interpolation_matrix(distributed_dg.dg.ref, cubature_points)
-    exact_electric, exact_magnetic = exact_periodic_wave_functions(
-        time;
+    return distributed_periodic_quadrature_diagnostics(
+        U,
+        distributed_dg,
+        time,
+        cubature_order;
         epsilon = epsilon,
         mu = mu,
         wave = wave,
     )
-    exact_curl_electric, exact_curl_magnetic =
-        exact_periodic_wave_curl_functions(
-            time;
-            epsilon = epsilon,
-            mu = mu,
-            wave = wave,
-        )
-
-    mesh = distributed_dg.dg.mesh
-    mappings = distributed_dg.dg.mappings.tet_mappings
-    physical_operators = distributed_dg.dg.physops.elements
-
-    # Energies, field norms/errors, chirality, charges, and momenta.
-    local_sums = zeros(Float64, 32)
-
-    for elem in distributed_dg.distributed_mesh.partition.owned
-        tet_nodes = @view mesh.tets[:, elem]
-        jacobian = mappings[elem].absdetJ
-        operators = physical_operators[elem]
-
-        @views begin
-            Ex = U.Ex[:, elem]
-            Ey = U.Ey[:, elem]
-            Ez = U.Ez[:, elem]
-            Hx = U.Hx[:, elem]
-            Hy = U.Hy[:, elem]
-            Hz = U.Hz[:, elem]
-            divergence_electric =
-                operators.Dx * Ex +
-                operators.Dy * Ey +
-                operators.Dz * Ez
-            divergence_magnetic =
-                operators.Dx * Hx +
-                operators.Dy * Hy +
-                operators.Dz * Hz
-            curl_electric_x =
-                operators.Dy * Ez - operators.Dz * Ey
-            curl_electric_y =
-                operators.Dz * Ex - operators.Dx * Ez
-            curl_electric_z =
-                operators.Dx * Ey - operators.Dy * Ex
-            curl_magnetic_x =
-                operators.Dy * Hz - operators.Dz * Hy
-            curl_magnetic_y =
-                operators.Dz * Hx - operators.Dx * Hz
-            curl_magnetic_z =
-                operators.Dx * Hy - operators.Dy * Hx
-
-            for q in 1:number_cubature_points
-                r = cubature_points[q, 1]
-                s = cubature_points[q, 2]
-                t = cubature_points[q, 3]
-                x, y, z = DiscoGMPI.map_to_physical(
-                    mesh.points,
-                    tet_nodes,
-                    r,
-                    s,
-                    t,
-                )
-
-                exact_Ex, exact_Ey, exact_Ez = exact_electric(x, y, z)
-                exact_Hx, exact_Hy, exact_Hz = exact_magnetic(x, y, z)
-
-                row = view(interpolation, q, :)
-                numerical_Ex = dot(row, Ex)
-                numerical_Ey = dot(row, Ey)
-                numerical_Ez = dot(row, Ez)
-                numerical_Hx = dot(row, Hx)
-                numerical_Hy = dot(row, Hy)
-                numerical_Hz = dot(row, Hz)
-
-                numerical_electric_squared =
-                    numerical_Ex^2 + numerical_Ey^2 + numerical_Ez^2
-                numerical_magnetic_squared =
-                    numerical_Hx^2 + numerical_Hy^2 + numerical_Hz^2
-                exact_electric_squared =
-                    exact_Ex^2 + exact_Ey^2 + exact_Ez^2
-                exact_magnetic_squared =
-                    exact_Hx^2 + exact_Hy^2 + exact_Hz^2
-
-                electric_error_squared =
-                    (numerical_Ex - exact_Ex)^2 +
-                    (numerical_Ey - exact_Ey)^2 +
-                    (numerical_Ez - exact_Ez)^2
-                magnetic_error_squared =
-                    (numerical_Hx - exact_Hx)^2 +
-                    (numerical_Hy - exact_Hy)^2 +
-                    (numerical_Hz - exact_Hz)^2
-
-                numerical_electric_energy_density =
-                    0.5 * epsilon * numerical_electric_squared
-                numerical_magnetic_energy_density =
-                    0.5 * mu * numerical_magnetic_squared
-                numerical_energy_density =
-                    numerical_electric_energy_density +
-                    numerical_magnetic_energy_density
-
-                exact_electric_energy_density =
-                    0.5 * epsilon * exact_electric_squared
-                exact_magnetic_energy_density =
-                    0.5 * mu * exact_magnetic_squared
-                exact_energy_density =
-                    exact_electric_energy_density +
-                    exact_magnetic_energy_density
-
-                numerical_electric = (
-                    numerical_Ex,
-                    numerical_Ey,
-                    numerical_Ez,
-                )
-                numerical_magnetic = (
-                    numerical_Hx,
-                    numerical_Hy,
-                    numerical_Hz,
-                )
-                numerical_curl_electric = (
-                    dot(row, curl_electric_x),
-                    dot(row, curl_electric_y),
-                    dot(row, curl_electric_z),
-                )
-                numerical_curl_magnetic = (
-                    dot(row, curl_magnetic_x),
-                    dot(row, curl_magnetic_y),
-                    dot(row, curl_magnetic_z),
-                )
-                exact_electric_vector = (exact_Ex, exact_Ey, exact_Ez)
-                exact_magnetic_vector = (exact_Hx, exact_Hy, exact_Hz)
-                exact_curl_electric_vector =
-                    exact_curl_electric(x, y, z)
-                exact_curl_magnetic_vector =
-                    exact_curl_magnetic(x, y, z)
-                numerical_optical_chirality =
-                    optical_chirality_density(
-                        numerical_electric,
-                        numerical_curl_electric,
-                        numerical_magnetic,
-                        numerical_curl_magnetic;
-                        epsilon = epsilon,
-                        mu = mu,
-                    )
-                exact_optical_chirality =
-                    optical_chirality_density(
-                        exact_electric_vector,
-                        exact_curl_electric_vector,
-                        exact_magnetic_vector,
-                        exact_curl_magnetic_vector;
-                        epsilon = epsilon,
-                        mu = mu,
-                    )
-
-                electric_charge_density =
-                    epsilon * dot(row, divergence_electric)
-                magnetic_charge_density =
-                    mu * dot(row, divergence_magnetic)
-
-                momentum_scale = epsilon * mu
-                momentum_x =
-                    momentum_scale *
-                    (numerical_Ey * numerical_Hz -
-                     numerical_Ez * numerical_Hy)
-                momentum_y =
-                    momentum_scale *
-                    (numerical_Ez * numerical_Hx -
-                     numerical_Ex * numerical_Hz)
-                momentum_z =
-                    momentum_scale *
-                    (numerical_Ex * numerical_Hy -
-                     numerical_Ey * numerical_Hx)
-                exact_momentum_x =
-                    momentum_scale *
-                    (exact_Ey * exact_Hz - exact_Ez * exact_Hy)
-                exact_momentum_y =
-                    momentum_scale *
-                    (exact_Ez * exact_Hx - exact_Ex * exact_Hz)
-                exact_momentum_z =
-                    momentum_scale *
-                    (exact_Ex * exact_Hy - exact_Ey * exact_Hx)
-
-                angular_momentum_x = y * momentum_z - z * momentum_y
-                angular_momentum_y = z * momentum_x - x * momentum_z
-                angular_momentum_z = x * momentum_y - y * momentum_x
-                exact_angular_momentum_x =
-                    y * exact_momentum_z - z * exact_momentum_y
-                exact_angular_momentum_y =
-                    z * exact_momentum_x - x * exact_momentum_z
-                exact_angular_momentum_z =
-                    x * exact_momentum_y - y * exact_momentum_x
-
-                physical_weight = jacobian * cubature_weights[q]
-
-                local_sums[1] +=
-                    physical_weight * numerical_electric_energy_density
-                local_sums[2] +=
-                    physical_weight * numerical_magnetic_energy_density
-                local_sums[3] +=
-                    physical_weight * exact_electric_energy_density
-                local_sums[4] +=
-                    physical_weight * exact_magnetic_energy_density
-                local_sums[5] +=
-                    physical_weight * numerical_electric_squared
-                local_sums[6] +=
-                    physical_weight * exact_electric_squared
-                local_sums[7] +=
-                    physical_weight * electric_error_squared
-                local_sums[8] +=
-                    physical_weight * numerical_magnetic_squared
-                local_sums[9] +=
-                    physical_weight * exact_magnetic_squared
-                local_sums[10] +=
-                    physical_weight * magnetic_error_squared
-                local_sums[11] +=
-                    physical_weight * numerical_energy_density^2
-                local_sums[12] +=
-                    physical_weight * exact_energy_density^2
-                local_sums[13] +=
-                    physical_weight *
-                    (numerical_energy_density - exact_energy_density)^2
-                local_sums[14] +=
-                    physical_weight * numerical_optical_chirality
-                local_sums[15] +=
-                    physical_weight * exact_optical_chirality
-                local_sums[16] +=
-                    physical_weight * numerical_optical_chirality^2
-                local_sums[17] +=
-                    physical_weight * exact_optical_chirality^2
-                local_sums[18] +=
-                    physical_weight *
-                    (numerical_optical_chirality -
-                     exact_optical_chirality)^2
-                local_sums[19] +=
-                    physical_weight * electric_charge_density
-                local_sums[20] +=
-                    physical_weight * magnetic_charge_density
-                local_sums[21] += physical_weight * momentum_x
-                local_sums[22] += physical_weight * momentum_y
-                local_sums[23] += physical_weight * momentum_z
-                local_sums[24] += physical_weight * exact_momentum_x
-                local_sums[25] += physical_weight * exact_momentum_y
-                local_sums[26] += physical_weight * exact_momentum_z
-                local_sums[27] += physical_weight * angular_momentum_x
-                local_sums[28] += physical_weight * angular_momentum_y
-                local_sums[29] += physical_weight * angular_momentum_z
-                local_sums[30] +=
-                    physical_weight * exact_angular_momentum_x
-                local_sums[31] +=
-                    physical_weight * exact_angular_momentum_y
-                local_sums[32] +=
-                    physical_weight * exact_angular_momentum_z
-            end
-        end
-    end
-
-    sums = MPI.Allreduce(local_sums, +, distributed_dg.comm)
-    electric_l2 = sqrt(max(sums[5], 0.0))
-    exact_electric_l2 = sqrt(max(sums[6], 0.0))
-    electric_error_l2 = sqrt(max(sums[7], 0.0))
-    magnetic_l2 = sqrt(max(sums[8], 0.0))
-    exact_magnetic_l2 = sqrt(max(sums[9], 0.0))
-    magnetic_error_l2 = sqrt(max(sums[10], 0.0))
-    field_error_l2 =
-        sqrt(max(sums[7] + sums[10], 0.0))
-    exact_field_l2 =
-        sqrt(max(sums[6] + sums[9], 0.0))
-    energy_density_l2 = sqrt(max(sums[11], 0.0))
-    exact_energy_density_l2 = sqrt(max(sums[12], 0.0))
-    energy_density_error_l2 = sqrt(max(sums[13], 0.0))
-    optical_chirality_density_l2 = sqrt(max(sums[16], 0.0))
-    exact_optical_chirality_density_l2 = sqrt(max(sums[17], 0.0))
-    optical_chirality_density_error_l2 = sqrt(max(sums[18], 0.0))
-
-    return MaxwellQuadratureDiagnostics(
-        cubature_order,
-        sums[1],
-        sums[2],
-        sums[1] + sums[2],
-        sums[3],
-        sums[4],
-        sums[3] + sums[4],
-        electric_l2,
-        exact_electric_l2,
-        electric_error_l2,
-        electric_error_l2 / max(exact_electric_l2, eps(Float64)),
-        magnetic_l2,
-        exact_magnetic_l2,
-        magnetic_error_l2,
-        magnetic_error_l2 / max(exact_magnetic_l2, eps(Float64)),
-        field_error_l2,
-        field_error_l2 / max(exact_field_l2, eps(Float64)),
-        energy_density_l2,
-        exact_energy_density_l2,
-        energy_density_error_l2,
-        energy_density_error_l2 /
-        max(exact_energy_density_l2, eps(Float64)),
-        sums[14],
-        sums[15],
-        sums[14] - sums[15],
-        optical_chirality_density_l2,
-        exact_optical_chirality_density_l2,
-        optical_chirality_density_error_l2,
-        sums[19],
-        sums[20],
-        0.0,
-        0.0,
-        sums[21],
-        sums[22],
-        sums[23],
-        sums[24],
-        sums[25],
-        sums[26],
-        sums[27],
-        sums[28],
-        sums[29],
-        sums[30],
-        sums[31],
-        sums[32],
-    )
-end
-
-function write_quadrature_diagnostics_row(
-    io::IO,
-    step::Int,
-    time::Float64,
-    diagnostics::MaxwellQuadratureDiagnostics,
-)
-    energy_error =
-        diagnostics.total_energy - diagnostics.exact_total_energy
-    relative_energy_error =
-        energy_error /
-        max(abs(diagnostics.exact_total_energy), eps(Float64))
-
-    values = (
-        step,
-        time,
-        diagnostics.cubature_order,
-        diagnostics.electric_energy,
-        diagnostics.magnetic_energy,
-        diagnostics.total_energy,
-        diagnostics.exact_electric_energy,
-        diagnostics.exact_magnetic_energy,
-        diagnostics.exact_total_energy,
-        energy_error,
-        relative_energy_error,
-        diagnostics.electric_l2,
-        diagnostics.exact_electric_l2,
-        diagnostics.electric_error_l2,
-        diagnostics.electric_relative_error,
-        diagnostics.magnetic_l2,
-        diagnostics.exact_magnetic_l2,
-        diagnostics.magnetic_error_l2,
-        diagnostics.magnetic_relative_error,
-        diagnostics.field_error_l2,
-        diagnostics.field_relative_error,
-        diagnostics.energy_density_l2,
-        diagnostics.exact_energy_density_l2,
-        diagnostics.energy_density_error_l2,
-        diagnostics.energy_density_relative_error,
-        diagnostics.optical_chirality,
-        diagnostics.exact_optical_chirality,
-        diagnostics.optical_chirality_error,
-        diagnostics.optical_chirality_density_l2,
-        diagnostics.exact_optical_chirality_density_l2,
-        diagnostics.optical_chirality_density_error_l2,
-        diagnostics.electric_charge,
-        diagnostics.magnetic_charge,
-        diagnostics.exact_electric_charge,
-        diagnostics.exact_magnetic_charge,
-        diagnostics.linear_momentum_x,
-        diagnostics.linear_momentum_y,
-        diagnostics.linear_momentum_z,
-        diagnostics.exact_linear_momentum_x,
-        diagnostics.exact_linear_momentum_y,
-        diagnostics.exact_linear_momentum_z,
-        diagnostics.angular_momentum_x,
-        diagnostics.angular_momentum_y,
-        diagnostics.angular_momentum_z,
-        diagnostics.exact_angular_momentum_x,
-        diagnostics.exact_angular_momentum_y,
-        diagnostics.exact_angular_momentum_z,
-    )
-    println(io, join(values, ','))
-    flush(io)
-    return nothing
-end
-
-function reference_vertex_node_ids(ref::ReferenceTet; tol::Float64 = 1e-12)
-    ids = Vector{Int}(undef, 4)
-
-    for vertex in 1:4
-        rv, sv, tv = REF_TET_VERTEX_COORDS[vertex]
-        matches = findall(
-            node -> abs(ref.r[node] - rv) < tol &&
-                    abs(ref.s[node] - sv) < tol &&
-                    abs(ref.t[node] - tv) < tol,
-            1:ref.Np,
-        )
-        length(matches) == 1 ||
-            error("Could not identify reference tetrahedron vertex $vertex.")
-        ids[vertex] = only(matches)
-    end
-
-    return ids
-end
-
-function vtk_lagrange_triangle_barycentric_indices(order::Int)
-    order >= 0 || throw(ArgumentError("Lagrange order must be non-negative."))
-    order == 0 && return NTuple{3, Int}[(0, 0, 0)]
-
-    indices = NTuple{3, Int}[
-        (0, 0, order),
-        (order, 0, 0),
-        (0, order, 0),
-    ]
-    for offset in 1:(order - 1)
-        push!(indices, (offset, 0, order - offset))
-    end
-    for offset in 1:(order - 1)
-        push!(indices, (order - offset, offset, 0))
-    end
-    for offset in 1:(order - 1)
-        push!(indices, (0, order - offset, offset))
-    end
-    if order >= 3
-        for inner in vtk_lagrange_triangle_barycentric_indices(order - 3)
-            push!(indices, ntuple(i -> inner[i] + 1, 3))
-        end
-    end
-    return indices
-end
-
-function vtk_lagrange_tetra_barycentric_indices(order::Int)
-    order >= 0 || throw(ArgumentError("Lagrange order must be non-negative."))
-    order == 0 && return NTuple{4, Int}[(0, 0, 0, 0)]
-
-    indices = NTuple{4, Int}[
-        (0, 0, 0, order),
-        (order, 0, 0, 0),
-        (0, order, 0, 0),
-        (0, 0, order, 0),
-    ]
-    edge_vertices = (
-        (0, 1),
-        (1, 2),
-        (2, 0),
-        (0, 3),
-        (1, 3),
-        (2, 3),
-    )
-    barycentric_slot = (4, 1, 2, 3)
-    for (first_vertex, second_vertex) in edge_vertices
-        for offset in 1:(order - 1)
-            values = zeros(Int, 4)
-            values[barycentric_slot[first_vertex + 1]] = order - offset
-            values[barycentric_slot[second_vertex + 1]] = offset
-            push!(indices, Tuple(values))
-        end
-    end
-
-    if order >= 3
-        face_vertices = (
-            (0, 1, 3),
-            (2, 3, 1),
-            (0, 3, 2),
-            (0, 2, 1),
-        )
-        face_interior = [
-            ntuple(i -> value[i] + 1, 3)
-            for value in
-                vtk_lagrange_triangle_barycentric_indices(order - 3)
-        ]
-        for (first_vertex, second_vertex, third_vertex) in face_vertices
-            for local_index in face_interior
-                values = zeros(Int, 4)
-                values[barycentric_slot[first_vertex + 1]] = local_index[3]
-                values[barycentric_slot[second_vertex + 1]] = local_index[1]
-                values[barycentric_slot[third_vertex + 1]] = local_index[2]
-                push!(indices, Tuple(values))
-            end
-        end
-    end
-
-    if order >= 4
-        for inner in vtk_lagrange_tetra_barycentric_indices(order - 4)
-            push!(indices, ntuple(i -> inner[i] + 1, 4))
-        end
-    end
-    return indices
-end
-
-function vtk_lagrange_tetra_node_ids(ref::ReferenceTet)
-    ref.N >= 1 ||
-        throw(ArgumentError("ParaView Lagrange output requires order >= 1."))
-    nodes_by_barycentric = Dict{NTuple{4, Int}, Int}()
-    for node in 1:ref.Np
-        lambda2 = round(Int, ref.N * (ref.r[node] + 1.0) / 2.0)
-        lambda3 = round(Int, ref.N * (ref.s[node] + 1.0) / 2.0)
-        lambda4 = round(Int, ref.N * (ref.t[node] + 1.0) / 2.0)
-        lambda1 = ref.N - lambda2 - lambda3 - lambda4
-        nodes_by_barycentric[
-            (lambda2, lambda3, lambda4, lambda1)
-        ] = node
-    end
-
-    vtk_indices = vtk_lagrange_tetra_barycentric_indices(ref.N)
-    length(vtk_indices) == ref.Np ||
-        error("Incorrect VTK Lagrange node count for order $(ref.N).")
-    all(haskey(nodes_by_barycentric, index) for index in vtk_indices) ||
-        error("The DG and VTK Lagrange node sets do not match.")
-    return [nodes_by_barycentric[index] for index in vtk_indices]
-end
-
-function write_energy_row(
-    io::IO,
-    step::Int,
-    time::Float64,
-    energy::DiscoGMPI.MaxwellEnergy,
-    initial_total::Float64,
-)
-    relative_drift =
-        (energy.total - initial_total) / max(initial_total, eps(Float64))
-    values = (
-        step,
-        time,
-        energy.electric,
-        energy.magnetic,
-        energy.total,
-        relative_drift,
-        energy.Ex,
-        energy.Ey,
-        energy.Ez,
-        energy.Hx,
-        energy.Hy,
-        energy.Hz,
-    )
-    println(io, join(values, ','))
-    flush(io)
-    return relative_drift
 end
 
 function write_parallel_fields(
@@ -1247,209 +573,20 @@ function write_parallel_fields(
     mu::Float64,
     wave::PlaneWaveParameters,
 )
-    rank = MPI.Comm_rank(distributed_dg.comm)
-    nranks = MPI.Comm_size(distributed_dg.comm)
-    mesh = distributed_dg.dg.mesh
-    distributed_mesh = distributed_dg.distributed_mesh
-    owned = distributed_mesh.partition.owned
-    ref = distributed_dg.dg.ref
-    vtk_node_ids = vtk_lagrange_tetra_node_ids(ref)
-    nowned = length(owned)
-    nodes_per_element = ref.Np
-
-    points = zeros(Float64, 3, nodes_per_element * nowned)
-    electric = zeros(Float64, 3, nodes_per_element * nowned)
-    magnetic = zeros(Float64, 3, nodes_per_element * nowned)
-    exact_electric_values = similar(electric)
-    exact_magnetic_values = similar(magnetic)
-    cells = Vector{MeshCell}(undef, nowned)
-    global_element_ids = Vector{Int}(undef, nowned)
     exact_electric, exact_magnetic = exact_periodic_wave_functions(
         time;
         epsilon = epsilon,
         mu = mu,
         wave = wave,
     )
-
-    for (owned_index, local_elem) in enumerate(owned)
-        first_node = nodes_per_element * (owned_index - 1) + 1
-        cell_nodes = collect(first_node:(first_node + nodes_per_element - 1))
-        cells[owned_index] =
-            MeshCell(VTKCellTypes.VTK_LAGRANGE_TETRAHEDRON, cell_nodes)
-        global_element_ids[owned_index] =
-            distributed_mesh.elements.global_ids[local_elem]
-
-        tet_nodes = @view mesh.tets[:, local_elem]
-        for vtk_node in 1:nodes_per_element
-            output_node = cell_nodes[vtk_node]
-            field_node = vtk_node_ids[vtk_node]
-            x, y, z = DiscoGMPI.map_to_physical(
-                mesh.points,
-                tet_nodes,
-                ref.r[field_node],
-                ref.s[field_node],
-                ref.t[field_node],
-            )
-            points[:, output_node] .= (x, y, z)
-            electric[:, output_node] .= (
-                U.Ex[field_node, local_elem],
-                U.Ey[field_node, local_elem],
-                U.Ez[field_node, local_elem],
-            )
-            magnetic[:, output_node] .= (
-                U.Hx[field_node, local_elem],
-                U.Hy[field_node, local_elem],
-                U.Hz[field_node, local_elem],
-            )
-            exact_electric_values[:, output_node] .= exact_electric(x, y, z)
-            exact_magnetic_values[:, output_node] .= exact_magnetic(x, y, z)
-        end
-    end
-
-    electric_error = electric - exact_electric_values
-    magnetic_error = magnetic - exact_magnetic_values
-    electric_magnitude = vec(sqrt.(sum(abs2, electric; dims = 1)))
-    magnetic_magnitude = vec(sqrt.(sum(abs2, magnetic; dims = 1)))
-
-    return pvtk_grid(
+    return write_parallel_maxwell_fields(
         output_basename,
-        points,
-        cells;
-        part = rank + 1,
-        nparts = nranks,
-        ismain = rank == 0,
-        append = false,
-        compress = false,
-    ) do vtk
-        vtk[
-            "ElectricField",
-            VTKPointData(),
-            component_names = ("Ex", "Ey", "Ez"),
-        ] = electric
-        vtk[
-            "MagneticField",
-            VTKPointData(),
-            component_names = ("Hx", "Hy", "Hz"),
-        ] = magnetic
-        vtk[
-            "ExactElectricField",
-            VTKPointData(),
-            component_names = ("ExactEx", "ExactEy", "ExactEz"),
-        ] = exact_electric_values
-        vtk[
-            "ExactMagneticField",
-            VTKPointData(),
-            component_names = ("ExactHx", "ExactHy", "ExactHz"),
-        ] = exact_magnetic_values
-        vtk[
-            "ElectricFieldError",
-            VTKPointData(),
-            component_names = ("ErrorEx", "ErrorEy", "ErrorEz"),
-        ] = electric_error
-        vtk[
-            "MagneticFieldError",
-            VTKPointData(),
-            component_names = ("ErrorHx", "ErrorHy", "ErrorHz"),
-        ] = magnetic_error
-        vtk["ElectricFieldMagnitude", VTKPointData()] = electric_magnitude
-        vtk["MagneticFieldMagnitude", VTKPointData()] = magnetic_magnitude
-        vtk["GlobalElementId", VTKCellData()] = global_element_ids
-        vtk["OwnerRank", VTKCellData()] = fill(rank, nowned)
-        vtk["PolynomialOrder", VTKCellData()] =
-            fill(distributed_dg.dg.ref.N, nowned)
-        vtk["TimeValue", VTKFieldData()] = time
-    end
-end
-
-function xml_escape(value::AbstractString)
-    escaped = replace(value, '&' => "&amp;")
-    escaped = replace(escaped, '<' => "&lt;")
-    escaped = replace(escaped, '>' => "&gt;")
-    escaped = replace(escaped, '"' => "&quot;")
-    return replace(escaped, '\'' => "&apos;")
-end
-
-function atomic_output_file(writer::Function, path::String)
-    mkpath(dirname(path))
-    temporary = path * ".tmp.$(getpid())"
-    try
-        open(temporary, "w") do io
-            writer(io)
-            flush(io)
-        end
-        mv(temporary, path; force = true)
-    finally
-        isfile(temporary) && rm(temporary; force = true)
-    end
-    return path
-end
-
-function read_paraview_series(path::String)
-    entries = NamedTuple{(:step, :time, :dataset), Tuple{Int, Float64, String}}[]
-    isfile(path) || return entries
-
-    open(path, "r") do io
-        first = true
-        for line in eachline(io)
-            if first
-                first = false
-                continue
-            end
-            stripped = strip(line)
-            isempty(stripped) && continue
-            fields = split(stripped, ','; limit = 3)
-            length(fields) == 3 ||
-                error("Invalid ParaView series row in $path: $line")
-            push!(
-                entries,
-                (
-                    step = parse(Int, fields[1]),
-                    time = parse(Float64, fields[2]),
-                    dataset = fields[3],
-                ),
-            )
-        end
-    end
-    return entries
-end
-
-function write_paraview_series(
-    output_dir::String,
-    entries,
-)
-    entries_by_step = Dict(entry.step => entry for entry in entries)
-    sorted_entries =
-        sort(collect(values(entries_by_step)); by = entry -> entry.step)
-    csv_path = joinpath(output_dir, "paraview_series.csv")
-    atomic_output_file(csv_path) do io
-        println(io, "step,time,dataset")
-        for entry in sorted_entries
-            println(io, entry.step, ',', entry.time, ',', entry.dataset)
-        end
-    end
-
-    pvd_path = joinpath(output_dir, "fields.pvd")
-    atomic_output_file(pvd_path) do io
-        println(io, "<?xml version=\"1.0\"?>")
-        println(
-            io,
-            "<VTKFile type=\"Collection\" version=\"0.1\" " *
-            "byte_order=\"LittleEndian\">",
-        )
-        println(io, "  <Collection>")
-        for entry in sorted_entries
-            println(
-                io,
-                "    <DataSet timestep=\"", entry.time,
-                "\" group=\"\" part=\"0\" file=\"",
-                xml_escape(entry.dataset),
-                "\"/>",
-            )
-        end
-        println(io, "  </Collection>")
-        println(io, "</VTKFile>")
-    end
-    return sorted_entries
+        distributed_dg,
+        U;
+        time = time,
+        exact_electric = exact_electric,
+        exact_magnetic = exact_magnetic,
+    )
 end
 
 function write_paraview_snapshot!(
@@ -1463,158 +600,22 @@ function write_paraview_snapshot!(
     epsilon::Float64,
     mu::Float64,
 )
-    rank = MPI.Comm_rank(distributed_dg.comm)
-    fields_dir = joinpath(output_dir, "fields")
-    collective_root_action(
-        distributed_dg.comm,
-        "ParaView output directory creation",
-    ) do
-        mkpath(fields_dir)
-    end
-    MPI.Barrier(distributed_dg.comm)
-
-    basename = @sprintf("fields_step%08d", step)
-    output_basename = joinpath(fields_dir, basename)
-    collective_rank_action(
-        distributed_dg.comm,
-        "Parallel VTK snapshot writing at step $step",
-    ) do
-        write_parallel_fields(
-            output_basename,
-            distributed_dg,
-            U;
-            time = time,
-            epsilon = epsilon,
-            mu = mu,
-            wave = wave,
-        )
-    end
-    MPI.Barrier(distributed_dg.comm)
-
-    root_error = nothing
-    if rank == 0
-        try
-            filter!(entry -> entry.step != step, entries)
-            push!(
-                entries,
-                (
-                    step = step,
-                    time = time,
-                    dataset = joinpath("fields", basename * ".pvtu"),
-                ),
-            )
-            replacement = write_paraview_series(output_dir, entries)
-            empty!(entries)
-            append!(entries, replacement)
-        catch error
-            root_error = sprint(showerror, error)
-        end
-    end
-    root_error = MPI.bcast(root_error, distributed_dg.comm; root = 0)
-    root_error === nothing ||
-        error("ParaView collection writing failed: $root_error")
-    MPI.Barrier(distributed_dg.comm)
-    return nothing
-end
-
-function checkpoint_step_dir(root::String, step::Int)
-    return joinpath(root, @sprintf("step%08d", step))
-end
-
-function write_latest_checkpoint(
-    checkpoint_root::String,
-    checkpoint_path::String,
-    step::Int,
-    time::Float64,
-)
-    path = joinpath(checkpoint_root, "latest.toml")
-    atomic_output_file(path) do io
-        println(io, "step = ", step)
-        println(io, "time = ", time)
-        println(
-            io,
-            "path = \"",
-            replace(relpath(checkpoint_path, checkpoint_root), '"' => "\\\""),
-            "\"",
-        )
-    end
-    return path
-end
-
-function collectively_write_latest_checkpoint(
-    comm::MPI.Comm,
-    checkpoint_root::String,
-    checkpoint_path::String,
-    step::Int,
-    time::Float64,
-)
-    rank = MPI.Comm_rank(comm)
-    root_error = nothing
-    if rank == 0
-        try
-            write_latest_checkpoint(
-                checkpoint_root,
-                checkpoint_path,
-                step,
-                time,
-            )
-        catch error
-            root_error = sprint(showerror, error)
-        end
-    end
-    root_error = MPI.bcast(root_error, comm; root = 0)
-    root_error === nothing ||
-        error("Latest-checkpoint pointer writing failed: $root_error")
-    MPI.Barrier(comm)
-    return nothing
-end
-
-function collective_root_action(
-    action::Function,
-    comm::MPI.Comm,
-    context::String,
-)
-    rank = MPI.Comm_rank(comm)
-    root_error = nothing
-    if rank == 0
-        try
-            action()
-        catch error
-            root_error = sprint(showerror, error)
-        end
-    end
-    root_error = MPI.bcast(root_error, comm; root = 0)
-    root_error === nothing || error("$context failed: $root_error")
-    return nothing
-end
-
-function collective_rank_action(
-    action::Function,
-    comm::MPI.Comm,
-    context::String,
-)
-    rank = MPI.Comm_rank(comm)
-    local_error = nothing
-    try
-        action()
-    catch error
-        local_error = sprint(showerror, error)
-    end
-    errors = MPI.gather(local_error, comm; root = 0)
-    message = nothing
-    if rank == 0
-        failures = [
-            "rank $(index - 1): $error"
-            for (index, error) in enumerate(errors)
-            if error !== nothing
-        ]
-        if !isempty(failures)
-            message = context * " failed:\n" * join(failures, "\n")
-        end
-    end
-    message = MPI.bcast(message, comm; root = 0)
-    message === nothing || error(message)
-    return nothing
+    exact_electric, exact_magnetic = exact_periodic_wave_functions(
+        time;
+        epsilon = epsilon,
+        mu = mu,
+        wave = wave,
+    )
+    return write_maxwell_paraview_snapshot!(
+        entries,
+        output_dir,
+        distributed_dg,
+        U,
+        step,
+        time;
+        exact_electric = exact_electric,
+        exact_magnetic = exact_magnetic,
+    )
 end
 
 function write_final_integration_points(
@@ -1627,14 +628,6 @@ function write_final_integration_points(
     mu::Float64,
     wave::PlaneWaveParameters,
 )
-    rank = MPI.Comm_rank(distributed_dg.comm)
-    rank_label = lpad(string(rank), 4, '0')
-    output_path =
-        joinpath(output_dir, "integration_points_rank$rank_label.csv")
-    cubature_points, cubature_weights, number_cubature_points =
-        get_JaskowiecSukumar_cubature(cubature_order)
-    interpolation =
-        reference_interpolation_matrix(distributed_dg.dg.ref, cubature_points)
     exact_electric, exact_magnetic = exact_periodic_wave_functions(
         time;
         epsilon = epsilon,
@@ -1648,233 +641,18 @@ function write_final_integration_points(
             mu = mu,
             wave = wave,
         )
-
-    mesh = distributed_dg.dg.mesh
-    distributed_mesh = distributed_dg.distributed_mesh
-    mappings = distributed_dg.dg.mappings.tet_mappings
-    physical_operators = distributed_dg.dg.physops.elements
-
-    open(output_path, "w") do io
-        println(
-            io,
-            "global_element,local_element,integration_point,r,s,t,x,y,z," *
-            "physical_weight,Ex,Ey,Ez,exact_Ex,exact_Ey,exact_Ez," *
-            "Hx,Hy,Hz,exact_Hx,exact_Hy,exact_Hz," *
-            "electric_energy_density,magnetic_energy_density," *
-            "total_energy_density,exact_total_energy_density," *
-            "energy_density_error,optical_chirality_density," *
-            "exact_optical_chirality_density," *
-            "optical_chirality_density_error,electric_charge_density," *
-            "magnetic_charge_density,exact_electric_charge_density," *
-            "exact_magnetic_charge_density,momentum_x,momentum_y," *
-            "momentum_z,exact_momentum_x,exact_momentum_y," *
-            "exact_momentum_z,angular_momentum_x,angular_momentum_y," *
-            "angular_momentum_z,exact_angular_momentum_x," *
-            "exact_angular_momentum_y,exact_angular_momentum_z",
-        )
-
-        for elem in distributed_mesh.partition.owned
-            global_elem = distributed_mesh.elements.global_ids[elem]
-            tet_nodes = @view mesh.tets[:, elem]
-            jacobian = mappings[elem].absdetJ
-            operators = physical_operators[elem]
-
-            @views begin
-                Ex = U.Ex[:, elem]
-                Ey = U.Ey[:, elem]
-                Ez = U.Ez[:, elem]
-                Hx = U.Hx[:, elem]
-                Hy = U.Hy[:, elem]
-                Hz = U.Hz[:, elem]
-                divergence_electric =
-                    operators.Dx * Ex +
-                    operators.Dy * Ey +
-                    operators.Dz * Ez
-                divergence_magnetic =
-                    operators.Dx * Hx +
-                    operators.Dy * Hy +
-                    operators.Dz * Hz
-                curl_electric_x =
-                    operators.Dy * Ez - operators.Dz * Ey
-                curl_electric_y =
-                    operators.Dz * Ex - operators.Dx * Ez
-                curl_electric_z =
-                    operators.Dx * Ey - operators.Dy * Ex
-                curl_magnetic_x =
-                    operators.Dy * Hz - operators.Dz * Hy
-                curl_magnetic_y =
-                    operators.Dz * Hx - operators.Dx * Hz
-                curl_magnetic_z =
-                    operators.Dx * Hy - operators.Dy * Hx
-
-                for q in 1:number_cubature_points
-                    r = cubature_points[q, 1]
-                    s = cubature_points[q, 2]
-                    t = cubature_points[q, 3]
-                    x, y, z = DiscoGMPI.map_to_physical(
-                        mesh.points,
-                        tet_nodes,
-                        r,
-                        s,
-                        t,
-                    )
-
-                    exact_Ex, exact_Ey, exact_Ez =
-                        exact_electric(x, y, z)
-                    exact_Hx, exact_Hy, exact_Hz =
-                        exact_magnetic(x, y, z)
-                    row = view(interpolation, q, :)
-                    numerical_Ex = dot(row, Ex)
-                    numerical_Ey = dot(row, Ey)
-                    numerical_Ez = dot(row, Ez)
-                    numerical_Hx = dot(row, Hx)
-                    numerical_Hy = dot(row, Hy)
-                    numerical_Hz = dot(row, Hz)
-
-                    electric_energy_density =
-                        0.5 * epsilon *
-                        (
-                            numerical_Ex^2 +
-                            numerical_Ey^2 +
-                            numerical_Ez^2
-                        )
-                    magnetic_energy_density =
-                        0.5 * mu *
-                        (
-                            numerical_Hx^2 +
-                            numerical_Hy^2 +
-                            numerical_Hz^2
-                        )
-                    total_energy_density =
-                        electric_energy_density + magnetic_energy_density
-                    exact_total_energy_density =
-                        0.5 * epsilon *
-                        (exact_Ex^2 + exact_Ey^2 + exact_Ez^2) +
-                        0.5 * mu *
-                        (exact_Hx^2 + exact_Hy^2 + exact_Hz^2)
-                    numerical_optical_chirality =
-                        optical_chirality_density(
-                            (numerical_Ex, numerical_Ey, numerical_Ez),
-                            (
-                                dot(row, curl_electric_x),
-                                dot(row, curl_electric_y),
-                                dot(row, curl_electric_z),
-                            ),
-                            (numerical_Hx, numerical_Hy, numerical_Hz),
-                            (
-                                dot(row, curl_magnetic_x),
-                                dot(row, curl_magnetic_y),
-                                dot(row, curl_magnetic_z),
-                            );
-                            epsilon = epsilon,
-                            mu = mu,
-                        )
-                    exact_optical_chirality =
-                        optical_chirality_density(
-                            (exact_Ex, exact_Ey, exact_Ez),
-                            exact_curl_electric(x, y, z),
-                            (exact_Hx, exact_Hy, exact_Hz),
-                            exact_curl_magnetic(x, y, z);
-                            epsilon = epsilon,
-                            mu = mu,
-                        )
-                    electric_charge_density =
-                        epsilon * dot(row, divergence_electric)
-                    magnetic_charge_density =
-                        mu * dot(row, divergence_magnetic)
-
-                    momentum_scale = epsilon * mu
-                    momentum_x =
-                        momentum_scale *
-                        (numerical_Ey * numerical_Hz -
-                         numerical_Ez * numerical_Hy)
-                    momentum_y =
-                        momentum_scale *
-                        (numerical_Ez * numerical_Hx -
-                         numerical_Ex * numerical_Hz)
-                    momentum_z =
-                        momentum_scale *
-                        (numerical_Ex * numerical_Hy -
-                         numerical_Ey * numerical_Hx)
-                    exact_momentum_x =
-                        momentum_scale *
-                        (exact_Ey * exact_Hz - exact_Ez * exact_Hy)
-                    exact_momentum_y =
-                        momentum_scale *
-                        (exact_Ez * exact_Hx - exact_Ex * exact_Hz)
-                    exact_momentum_z =
-                        momentum_scale *
-                        (exact_Ex * exact_Hy - exact_Ey * exact_Hx)
-
-                    angular_momentum_x =
-                        y * momentum_z - z * momentum_y
-                    angular_momentum_y =
-                        z * momentum_x - x * momentum_z
-                    angular_momentum_z =
-                        x * momentum_y - y * momentum_x
-                    exact_angular_momentum_x =
-                        y * exact_momentum_z - z * exact_momentum_y
-                    exact_angular_momentum_y =
-                        z * exact_momentum_x - x * exact_momentum_z
-                    exact_angular_momentum_z =
-                        x * exact_momentum_y - y * exact_momentum_x
-
-                    values = (
-                        global_elem,
-                        elem,
-                        q,
-                        r,
-                        s,
-                        t,
-                        x,
-                        y,
-                        z,
-                        jacobian * cubature_weights[q],
-                        numerical_Ex,
-                        numerical_Ey,
-                        numerical_Ez,
-                        exact_Ex,
-                        exact_Ey,
-                        exact_Ez,
-                        numerical_Hx,
-                        numerical_Hy,
-                        numerical_Hz,
-                        exact_Hx,
-                        exact_Hy,
-                        exact_Hz,
-                        electric_energy_density,
-                        magnetic_energy_density,
-                        total_energy_density,
-                        exact_total_energy_density,
-                        total_energy_density - exact_total_energy_density,
-                        numerical_optical_chirality,
-                        exact_optical_chirality,
-                        numerical_optical_chirality -
-                        exact_optical_chirality,
-                        electric_charge_density,
-                        magnetic_charge_density,
-                        0.0,
-                        0.0,
-                        momentum_x,
-                        momentum_y,
-                        momentum_z,
-                        exact_momentum_x,
-                        exact_momentum_y,
-                        exact_momentum_z,
-                        angular_momentum_x,
-                        angular_momentum_y,
-                        angular_momentum_z,
-                        exact_angular_momentum_x,
-                        exact_angular_momentum_y,
-                        exact_angular_momentum_z,
-                    )
-                    println(io, join(values, ','))
-                end
-            end
-        end
-    end
-
-    return output_path
+    return write_maxwell_integration_points(
+        output_dir,
+        distributed_dg,
+        U,
+        cubature_order;
+        epsilon = epsilon,
+        mu = mu,
+        exact_electric = exact_electric,
+        exact_magnetic = exact_magnetic,
+        exact_curl_electric = exact_curl_electric,
+        exact_curl_magnetic = exact_curl_magnetic,
+    )
 end
 
 function generate_metis_partition(config::ExperimentConfig)
@@ -1912,6 +690,48 @@ function generate_metis_partition(config::ExperimentConfig)
     return config.partition_path
 end
 
+function ensure_partition_file(
+    config::ExperimentConfig,
+    rank::Int,
+    comm::MPI.Comm,
+)
+    local_error = nothing
+    if rank == 0
+        try
+            if config.repartition || !isfile(config.partition_path)
+                generate_metis_partition(config)
+            end
+        catch error
+            local_error = sprint(showerror, error)
+        end
+    end
+    local_error = MPI.bcast(local_error, comm; root = 0)
+    local_error === nothing || error(local_error)
+    MPI.Barrier(comm)
+    return config.partition_path
+end
+
+function validate_partition(
+    partition::AbstractVector{<:Integer},
+    mesh::RawVTUMesh,
+    config::ExperimentConfig,
+    nranks::Int,
+)
+    length(partition) == size(mesh.tets, 2) ||
+        error(
+            "Partition file $(config.partition_path) has " *
+            "$(length(partition)) entries, but mesh " *
+            "$(config.mesh_path) has $(size(mesh.tets, 2)) " *
+            "tetrahedra. Use a partition generated for this mesh, " *
+            "or regenerate it with --repartition.",
+        )
+    all(part -> 0 <= part < config.partition_count, partition) ||
+        error("Partition entries must be zero-based ranks in 0:$(nranks - 1).")
+    all(part -> any(==(part), partition), 0:(config.partition_count - 1)) ||
+        error("Every MPI rank must own at least one tetrahedron.")
+    return nothing
+end
+
 function load_root_inputs(
     config::ExperimentConfig,
     rank::Int,
@@ -1932,21 +752,7 @@ function load_root_inputs(
                 generate_metis_partition(config)
             end
             partition = read_metis_epart(config.partition_path)
-            length(partition) == size(mesh.tets, 2) ||
-                error(
-                    "Partition file $(config.partition_path) has " *
-                    "$(length(partition)) entries, but mesh " *
-                    "$(config.mesh_path) has $(size(mesh.tets, 2)) " *
-                    "tetrahedra. Use a partition generated for this mesh, " *
-                    "or regenerate it with --repartition.",
-                )
-            all(part -> 0 <= part < config.partition_count, partition) ||
-                error("Partition entries must be zero-based ranks in 0:$(nranks - 1).")
-            all(
-                part -> any(==(part), partition),
-                0:(config.partition_count - 1),
-            ) ||
-                error("Every MPI rank must own at least one tetrahedron.")
+            validate_partition(partition, mesh, config, nranks)
         catch error
             load_error = sprint(showerror, error)
         end
@@ -1954,6 +760,45 @@ function load_root_inputs(
 
     load_error = MPI.bcast(load_error, comm; root = 0)
     load_error === nothing || error(load_error)
+    return mesh, partition
+end
+
+function load_collective_inputs(
+    config::ExperimentConfig,
+    rank::Int,
+    nranks::Int,
+    comm::MPI.Comm,
+)
+    ensure_partition_file(config, rank, comm)
+
+    local_error = nothing
+    mesh = nothing
+    partition = nothing
+
+    try
+        isfile(config.mesh_path) ||
+            error("Mesh file not found: $(config.mesh_path)")
+        mesh = load_periodic_mesh(config.mesh_path)
+        partition = read_metis_epart(config.partition_path)
+        validate_partition(partition, mesh, config, nranks)
+    catch error
+        local_error = sprint(showerror, error)
+    end
+
+    errors = MPI.gather(local_error, comm; root = 0)
+    message = nothing
+    if rank == 0
+        failures = [
+            "rank $(index - 1): $error"
+            for (index, error) in enumerate(errors)
+            if error !== nothing
+        ]
+        !isempty(failures) &&
+            (message = "Collective mesh input loading failed:\n" *
+                       join(failures, "\n"))
+    end
+    message = MPI.bcast(message, comm; root = 0)
+    message === nothing || error(message)
     return mesh, partition
 end
 
@@ -1982,25 +827,42 @@ function load_or_prepare_distributed_dg(
         ), "rank-local cache"
     end
 
-    root_mesh, root_partition =
-        load_root_inputs(config, rank, nranks, comm)
-    prepare_distributed_mesh_partition(
-        root_mesh,
-        root_partition,
-        config.distributed_mesh_dir;
-        comm = comm,
-        metadata = Dict(
-            "source_mesh" => config.mesh_path,
-            "source_partition" => config.partition_path,
-            "partition_count" => config.partition_count,
-            "boundary_condition" => "periodic",
-        ),
+    preparation_metadata = Dict(
+        "source_mesh" => config.mesh_path,
+        "source_partition" => config.partition_path,
+        "partition_count" => config.partition_count,
+        "boundary_condition" => "periodic",
+        "collective_distributed_mesh_prep" =>
+            config.collective_distributed_mesh_prep,
     )
+    mesh_load_mode = if config.collective_distributed_mesh_prep
+        mesh, partition =
+            load_collective_inputs(config, rank, nranks, comm)
+        prepare_distributed_mesh_partition_collective(
+            mesh,
+            partition,
+            config.distributed_mesh_dir;
+            comm = comm,
+            metadata = preparation_metadata,
+        )
+        "collectively prepared rank-local cache"
+    else
+        root_mesh, root_partition =
+            load_root_inputs(config, rank, nranks, comm)
+        prepare_distributed_mesh_partition(
+            root_mesh,
+            root_partition,
+            config.distributed_mesh_dir;
+            comm = comm,
+            metadata = preparation_metadata,
+        )
+        "root-prepared rank-local cache"
+    end
     return build_distributed_dg_from_partition(
         config.distributed_mesh_dir,
         config.polynomial_order;
         comm = comm,
-    ), "prepared rank-local cache"
+    ), mesh_load_mode
 end
 
 function experiment_configuration(
@@ -2016,6 +878,8 @@ function experiment_configuration(
         "partition_count" => config.partition_count,
         "repartition" => config.repartition,
         "distributed_mesh_dir" => config.distributed_mesh_dir,
+        "collective_distributed_mesh_prep" =>
+            config.collective_distributed_mesh_prep,
         "mesh_load_mode" => mesh_load_mode,
         "output_dir" => config.output_dir,
         "polynomial_order" => config.polynomial_order,
@@ -2284,35 +1148,8 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         "Diagnostic history initialization",
     ) do
         if write_history_header
-            println(
-                energy_io,
-                "step,time,electric,magnetic,total,relative_drift," *
-                "Ex,Ey,Ez,Hx,Hy,Hz",
-            )
-            println(
-                quadrature_io,
-                "step,time,cubature_order,electric_energy,magnetic_energy," *
-                "total_energy,exact_electric_energy,exact_magnetic_energy," *
-                "exact_total_energy,energy_error,relative_energy_error," *
-                "electric_l2,exact_electric_l2,electric_error_l2," *
-                "electric_relative_error,magnetic_l2,exact_magnetic_l2," *
-                "magnetic_error_l2,magnetic_relative_error,field_error_l2," *
-                "field_relative_error,energy_density_l2," *
-                "exact_energy_density_l2,energy_density_error_l2," *
-                "energy_density_relative_error,optical_chirality," *
-                "exact_optical_chirality,optical_chirality_error," *
-                "optical_chirality_density_l2," *
-                "exact_optical_chirality_density_l2," *
-                "optical_chirality_density_error_l2,electric_charge," *
-                "magnetic_charge,exact_electric_charge," *
-                "exact_magnetic_charge,linear_momentum_x," *
-                "linear_momentum_y,linear_momentum_z," *
-                "exact_linear_momentum_x,exact_linear_momentum_y," *
-                "exact_linear_momentum_z,angular_momentum_x," *
-                "angular_momentum_y,angular_momentum_z," *
-                "exact_angular_momentum_x,exact_angular_momentum_y," *
-                "exact_angular_momentum_z",
-            )
+            write_energy_header(energy_io)
+            write_quadrature_diagnostics_header(quadrature_io)
             write_energy_row(
                 energy_io,
                 start_step,

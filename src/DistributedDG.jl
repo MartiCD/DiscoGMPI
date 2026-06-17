@@ -724,6 +724,76 @@ function zero_ghost_maxwell_rhs!(
     return rhs
 end
 
+function profile_distributed_maxwell_rhs!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+    tag::Int = 24017,
+)
+    start_ns = time_ns()
+    exchange_maxwell_ghost_traces!(U, distributed_dg; tag = tag)
+    after_halo_ns = time_ns()
+
+    maxwell_rhs!(
+        rhs,
+        U,
+        distributed_dg.dg,
+        registry,
+        formulation;
+        ε = ε,
+        μ = μ,
+    )
+    after_rhs_ns = time_ns()
+
+    zero_ghost_maxwell_rhs!(rhs, distributed_dg)
+    after_zero_ns = time_ns()
+
+    return (
+        halo_exchange_seconds = (after_halo_ns - start_ns) * 1.0e-9,
+        rhs_assembly_seconds = (after_rhs_ns - after_halo_ns) * 1.0e-9,
+        ghost_zero_seconds = (after_zero_ns - after_rhs_ns) * 1.0e-9,
+        total_seconds = (after_zero_ns - start_ns) * 1.0e-9,
+    )
+end
+
+function profile_distributed_maxwell_rhs!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials;
+    tag::Int = 24017,
+)
+    start_ns = time_ns()
+    exchange_maxwell_ghost_traces!(U, distributed_dg; tag = tag)
+    after_halo_ns = time_ns()
+
+    maxwell_rhs!(
+        rhs,
+        U,
+        distributed_dg.dg,
+        registry,
+        formulation,
+        materials,
+    )
+    after_rhs_ns = time_ns()
+
+    zero_ghost_maxwell_rhs!(rhs, distributed_dg)
+    after_zero_ns = time_ns()
+
+    return (
+        halo_exchange_seconds = (after_halo_ns - start_ns) * 1.0e-9,
+        rhs_assembly_seconds = (after_rhs_ns - after_halo_ns) * 1.0e-9,
+        ghost_zero_seconds = (after_zero_ns - after_rhs_ns) * 1.0e-9,
+        total_seconds = (after_zero_ns - start_ns) * 1.0e-9,
+    )
+end
+
 function maxwell_rhs!(
     rhs::MaxwellRHS,
     U::MaxwellField,

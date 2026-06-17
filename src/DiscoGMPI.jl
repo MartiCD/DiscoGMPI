@@ -3,8 +3,10 @@ module DiscoGMPI
 
 using LinearAlgebra
 using MPI
+using Printf
 using ReadVTK
 using VTKBase
+using WriteVTK
 
 # Serial/threaded solver API inherited from DiscoG3D.
 export RawVTUMesh,
@@ -165,6 +167,7 @@ export RawVTUMesh,
        build_distributed_dg_from_root,
        build_distributed_dg_from_partition,
        prepare_distributed_mesh_partition,
+       prepare_distributed_mesh_partition_collective,
        write_distributed_mesh_partition,
        load_distributed_mesh_partition,
        DistributedCheckpointState,
@@ -174,6 +177,7 @@ export RawVTUMesh,
        localize_maxwell_field,
        exchange_maxwell_ghost_traces!,
        zero_ghost_maxwell_rhs!,
+       profile_distributed_maxwell_rhs!,
        make_distributed_maxwell_rhs_function,
        distributed_maxwell_energy,
        distributed_maxwell_invariants,
@@ -185,7 +189,49 @@ export RawVTUMesh,
        distributed_rk_step!,
        distributed_partitioned_symplectic_rk_step!,
        run_distributed_maxwell_time_steps!,
-       run_distributed_maxwell_partitioned_symplectic_time_steps!
+       run_distributed_maxwell_partitioned_symplectic_time_steps!,
+       get_JaskowiecSukumar_cubature,
+       PlaneWaveParameters,
+       exact_cavity_mode_functions,
+       exact_cavity_mode_curl_functions,
+       exact_periodic_wave_functions,
+       exact_periodic_wave_curl_functions,
+       optical_chirality_density,
+       MaxwellQuadratureDiagnostics,
+       DistributedMeshQualityMetrics,
+       distributed_mesh_quality_metrics,
+       reference_interpolation_matrix,
+       distributed_maxwell_quadrature_diagnostics,
+       distributed_cavity_quadrature_diagnostics,
+       distributed_periodic_quadrature_diagnostics,
+       distributed_maxwell_linf_errors,
+       distributed_cavity_linf_errors,
+       distributed_periodic_linf_errors,
+       DistributedMaxwellComponentL2Workspace,
+       distributed_maxwell_component_l2_errors!,
+       distributed_maxwell_component_l2_errors,
+       distributed_cavity_component_l2_errors,
+       distributed_periodic_component_l2_errors!,
+       distributed_periodic_component_l2_errors,
+       write_energy_header,
+       write_energy_row,
+       write_quadrature_diagnostics_header,
+       write_quadrature_diagnostics_row,
+       reference_vertex_node_ids,
+       vtk_lagrange_tetra_barycentric_indices,
+       vtk_lagrange_tetra_node_ids,
+       write_parallel_maxwell_fields,
+       xml_escape,
+       atomic_output_file,
+       checkpoint_step_dir,
+       write_latest_checkpoint,
+       collectively_write_latest_checkpoint,
+       read_paraview_series,
+       write_paraview_series,
+       collective_root_action,
+       collective_rank_action,
+       write_maxwell_paraview_snapshot!,
+       write_maxwell_integration_points
 
 include("MetisIO.jl")
 using .MetisIO
@@ -228,6 +274,7 @@ include("solver/kernels/topology.jl")
 include("solver/kernels/geometry.jl")
 include("solver/kernels/metrics.jl")
 include("solver/kernels/reference_tet.jl")
+include("solver/kernels/JaskowiecSukumar.jl")
 include("solver/kernels/face_operators.jl")
 include("solver/kernels/physical_operators.jl")
 include("solver/kernels/trace_maps.jl")
@@ -242,6 +289,9 @@ include("DistributedDG.jl")
 include("PhysicalCoverage.jl")
 include("NonlinearPML.jl")
 include("DistributedIO.jl")
+include("MaxwellExactSolutions.jl")
+include("MaxwellDiagnostics.jl")
+include("MaxwellOutput.jl")
 
 # # ------------------------------------------------------------------------------------------------------------------------------
 # # I'll organize the code in a way that allows for easy extension in the future. For now, I'll just set up the basic structure.
