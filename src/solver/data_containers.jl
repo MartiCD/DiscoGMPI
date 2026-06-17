@@ -348,10 +348,47 @@ end
 @enum MaxwellBoundaryKind begin
     MaxwellBC_None = 0
     MaxwellBC_PEC = 1
+    MaxwellBC_PMC = 2
+    MaxwellBC_Absorbing = 3
 end
 
 struct MaxwellBoundaryRegistry
     kinds::Dict{Int, MaxwellBoundaryKind}
+end
+
+struct MaxwellMaterial
+    epsilon::Float64
+    permeability::Float64
+
+    function MaxwellMaterial(epsilon::Real, permeability::Real)
+        epsilon > 0 ||
+            throw(ArgumentError("Maxwell permittivity must be positive."))
+        permeability > 0 ||
+            throw(ArgumentError("Maxwell permeability must be positive."))
+        return new(Float64(epsilon), Float64(permeability))
+    end
+end
+
+struct MaxwellElementMaterials
+    epsilon::Vector{Float64}
+    permeability::Vector{Float64}
+
+    function MaxwellElementMaterials(
+        epsilon::AbstractVector{<:Real},
+        permeability::AbstractVector{<:Real},
+    )
+        length(epsilon) == length(permeability) ||
+            throw(
+                ArgumentError(
+                    "Element permittivity and permeability arrays must have equal length.",
+                ),
+            )
+        all(>(0), epsilon) ||
+            throw(ArgumentError("All element permittivities must be positive."))
+        all(>(0), permeability) ||
+            throw(ArgumentError("All element permeabilities must be positive."))
+        return new(Float64.(epsilon), Float64.(permeability))
+    end
 end
 
 @enum MaxwellFluxKind begin
@@ -387,6 +424,14 @@ struct MaxwellEnergy
     Hx::Float64
     Hy::Float64
     Hz::Float64
+end
+
+struct MaxwellInvariantDiagnostics
+    energy::MaxwellEnergy
+    electric_charge::Float64
+    magnetic_charge::Float64
+    linear_momentum::NTuple{3, Float64}
+    angular_momentum::NTuple{3, Float64}
 end
 
 struct ExplicitRKScheme

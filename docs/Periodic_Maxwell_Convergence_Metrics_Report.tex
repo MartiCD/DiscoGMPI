@@ -1,0 +1,982 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!65!black,
+  pdftitle={Error, Norm, and Convergence-Rate Computation in the Distributed Periodic Maxwell Study},
+  pdfauthor={DiscoGMPI}
+}
+
+\newcommand{\vect}[1]{\boldsymbol{#1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left| #1 \right|}
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\mcode}[1]{\mathtt{\detokenize{#1}}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Oh}{\Omega_h}
+\newcommand{\Eex}{\vect E^{\mathrm{ex}}}
+\newcommand{\Hex}{\vect H^{\mathrm{ex}}}
+\newcommand{\Eh}{\vect E_h}
+\newcommand{\Hh}{\vect H_h}
+
+\lstdefinestyle{shell}{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\title{Error, Norm, and Convergence-Rate Computation\\
+in the Distributed Periodic Poisson-Bracket Maxwell Study}
+\author{DiscoGMPI Technical Report}
+\date{June 15, 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose and scope}
+
+This report documents, in mathematical and implementation terms, the
+diagnostics computed by the convergence driver
+\begin{center}
+\code{examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl}.
+\end{center}
+It covers:
+\begin{itemize}[leftmargin=*]
+  \item component-wise errors for
+        \(E_x,E_y,E_z,H_x,H_y,H_z\);
+  \item aggregate electric, magnetic, and six-component field errors;
+  \item relative field errors;
+  \item quadrature-sampled \(L^\infty\) diagnostics;
+  \item energy discrepancy and discrete energy drift;
+  \item mesh-size measures;
+  \item observed convergence rates;
+  \item the final PASS/FAIL convergence verdict.
+\end{itemize}
+
+The report follows the current source code. It also identifies distinctions
+that are important when interpreting the CSV output:
+\begin{enumerate}[leftmargin=*]
+  \item The CSV distinguishes the requested and measured mesh sizes.
+        \code{target_h} records the Gmsh request. Rates use the measured
+        \code{characteristic_h}.
+  \item \code{energy_error} compares numerical and analytical energies at the
+        final time, while \code{relative_energy_error} measures numerical
+        energy drift from the initial numerical energy.
+  \item the reported \(L^\infty\) values are maxima over cubature points, not
+        mathematically exact suprema over the continuous domain.
+  \item component rates for exact-zero components measure decay of numerical
+        leakage and can become dominated by roundoff.
+\end{enumerate}
+
+\section{Relevant source-code path}
+
+The computation is split across the following files.
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.38\textwidth}
+                  >{\raggedright\arraybackslash}p{0.56\textwidth}}
+\toprule
+Source & Responsibility \\
+\midrule
+\endhead
+\code{examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl}
+&
+Mesh-family generation, time integration, component errors, sampled
+\(L^\infty\) errors, rate calculation, CSV writing, and PASS/FAIL logic.
+\\
+\code{examples/distributed_periodic_poisson_bracket_maxwell.jl}
+&
+Analytical plane wave, nodal-to-cubature interpolation, aggregate field
+norms, analytical energy, charge, and related quadrature diagnostics.
+\\
+\code{examples/meshes/periodic_box_unstructured.geo}
+&
+Periodic box geometry and the Gmsh parameter
+\code{NxTarget}, with \(h_{\mathrm{target}}=L_x/N_x\).
+\\
+\code{src/solver/kernels/metrics.jl}
+&
+Affine reference-to-physical tetrahedron map and element Jacobian.
+\\
+\code{src/solver/kernels/reference_tet.jl}
+&
+Degree-\(N\) nodal tetrahedral basis, Vandermonde matrices, mass matrix, and
+reference derivative operators.
+\\
+\code{src/solver/kernels/JaskowiecSukumar.jl}
+&
+Jaskowiec--Sukumar tetrahedral cubature points and weights.
+\\
+\code{src/DistributedDG.jl}
+&
+Distributed mass-matrix Maxwell energy and MPI reduction over owned
+elements.
+\\
+\bottomrule
+\end{longtable}
+
+\section{Analytical Maxwell problem}
+
+\subsection{Material model and wave parameters}
+
+The convergence driver currently enforces
+\[
+  \varepsilon=1,\qquad \mu=1,
+\]
+although the analytical helper functions retain the general symbols
+\(\varepsilon\) and \(\mu\). The wave speed and dispersion relation are
+\[
+  c=\frac{1}{\sqrt{\varepsilon\mu}},
+  \qquad
+  \omega = kc = \frac{k}{\sqrt{\varepsilon\mu}}.
+\]
+The magnetic amplitude is \(H_0=1\).
+
+Let \(x_0=x_{\min}\) be the lower \(x\)-coordinate inferred from the mesh.
+The phase is
+\[
+  \theta(x,t)=k(x-x_0)-\omega t.
+\]
+The analytical fields used for initialization and final-time error
+measurement are
+\begin{align}
+  \Eex(x,y,z,t)
+    &=
+    \left(
+      0,\,
+      0,\,
+      -\frac{kH_0}{\omega\varepsilon}\sin\theta
+    \right),
+  \\
+  \Hex(x,y,z,t)
+    &=
+    \left(
+      0,\,
+      H_0\sin\theta,\,
+      0
+    \right).
+\end{align}
+For the default \(\varepsilon=\mu=H_0=1\), \(\omega=k\), so
+\[
+  \Eex=(0,0,-\sin\theta),
+  \qquad
+  \Hex=(0,\sin\theta,0).
+\]
+
+The exact nonzero components are therefore \(E_z\) and \(H_y\). The exact
+components \(E_x,E_y,H_x,H_z\) are identically zero. This fact is important
+when interpreting their component-wise errors and rates.
+
+\subsection{Periodic compatibility}
+
+For a box of length \(L_x=x_{\max}-x_{\min}\), the driver requires
+\[
+  \frac{kL_x}{2\pi}\in\mathbb{N}.
+\]
+Thus an integer number of wavelengths fits across the periodic \(x\)
+direction. Opposite faces in all three coordinate directions are paired,
+using translations
+\[
+  (-L_x,0,0),\qquad
+  (0,-L_y,0),\qquad
+  (0,0,-L_z).
+\]
+
+\section{Mesh family and mesh-size definitions}
+
+\subsection{Gmsh target refinement}
+
+The Gmsh geometry defines
+\[
+  h_{\mathrm{target}}=\frac{L_x}{N_x},
+\]
+where \(N_x\) is the value of \code{NxTarget}. With a base target
+\(N_{x,0}\), the convergence driver constructs
+\[
+  N_{x,\ell}=2^\ell N_{x,0},
+  \qquad \ell=0,1,\ldots,L-1.
+\]
+Therefore,
+\[
+  h_{\mathrm{target},\ell}
+    =\frac{L_x}{N_{x,\ell}}
+    =2^{-\ell}h_{\mathrm{target},0}.
+\]
+For the default four levels, this is exactly
+\[
+  h_0,\quad \frac{h_0}{2},\quad \frac{h_0}{4},\quad \frac{h_0}{8}.
+\]
+
+Gmsh creates a new unstructured tetrahedral mesh for every level. The meshes
+are not required to be nested. \code{target_h} represents the requested
+Gmsh size, not the diameter of every tetrahedron.
+
+\subsection{Characteristic mesh size}
+
+The driver also reports
+\[
+  h_{\mathrm{char}}
+    =
+    \left(\frac{\abs{\Omega}}{N_{\mathrm{el}}}\right)^{1/3},
+\]
+where \(N_{\mathrm{el}}\) is the global tetrahedron count. Element volume is
+calculated from the affine map:
+\[
+  \abs{K}
+    =
+    \abs{\widehat K}\abs{\det J_K},
+  \qquad
+  \abs{\widehat K}=\frac{4}{3}.
+\]
+Each MPI rank sums only its owned element volumes. An
+\code{MPI.Allreduce(...,+,...)} produces the global volume and global element
+count.
+
+\paragraph{Important distinction.}
+The convergence-rate denominator uses the measured, volume-derived size stored
+in \code{characteristic_h}. The requested Gmsh size is retained separately as
+\code{target_h}. On an unstructured Gmsh family the characteristic size need
+not decrease by exactly a factor of two, even though the requested target size
+does.
+
+\section{DG representation and evaluation at cubature points}
+
+\subsection{Nodal polynomial field}
+
+On each tetrahedron \(K\), every scalar component is represented by a
+degree-\(N\) nodal polynomial:
+\[
+  u_h|_K(\vect x)
+    =
+    \sum_{j=1}^{N_p}u_{K,j}\,
+    \ell_j\!\left(F_K^{-1}(\vect x)\right),
+\]
+with
+\[
+  N_p=\frac{(N+1)(N+2)(N+3)}{6}.
+\]
+The six component arrays are
+\[
+  E_x,\ E_y,\ E_z,\ H_x,\ H_y,\ H_z
+  \in \R^{N_p\times N_{\mathrm{local}}}.
+\]
+
+\subsection{Reference tetrahedron and physical map}
+
+The reference tetrahedron has vertices
+\[
+  (-1,-1,-1),\quad
+  (1,-1,-1),\quad
+  (-1,1,-1),\quad
+  (-1,-1,1).
+\]
+For reference coordinates \((r,s,t)\), the affine shape functions are
+\begin{align}
+  \phi_1 &= -\frac{r+s+t+1}{2},&
+  \phi_2 &=  \frac{r+1}{2},\\
+  \phi_3 &=  \frac{s+1}{2},&
+  \phi_4 &=  \frac{t+1}{2}.
+\end{align}
+The physical point is
+\[
+  \vect x=F_K(r,s,t)
+    =\sum_{a=1}^{4}\phi_a(r,s,t)\vect x_a.
+\]
+The Jacobian is constant on each affine tetrahedron:
+\[
+  J_K=
+  \begin{bmatrix}
+    (\vect x_2-\vect x_1)/2 &
+    (\vect x_3-\vect x_1)/2 &
+    (\vect x_4-\vect x_1)/2
+  \end{bmatrix}.
+\]
+Consequently,
+\[
+  d\vect x=\abs{\det J_K}\,d\vect \xi.
+\]
+
+\subsection{Interpolation matrix}
+
+The solution is stored at DG interpolation nodes, while errors are evaluated
+at volume cubature points. The code constructs
+\[
+  I_q=V_qV^{-1},
+\]
+where \(V\) is the nodal Vandermonde matrix and \(V_q\) evaluates the same
+orthonormal modal basis at cubature points. If
+\(\vect u_K=(u_{K,1},\ldots,u_{K,N_p})^T\), then
+\[
+  u_h(\vect x_{K,q})=(I_q)_{q,:}\vect u_K.
+\]
+This interpolation is performed independently for all six field components.
+
+\section{Volume cubature}
+
+For DG order \(N\), the convergence driver selects the
+Jaskowiec--Sukumar cubature order
+\[
+  p_q=\max(2,\,2N+4).
+\]
+Let \(\{(\vect \xi_q,w_q)\}_{q=1}^{N_q}\) be the resulting rule on
+\(\widehat K\). A physical-domain integral is approximated by
+\[
+  \int_K f(\vect x)\,d\vect x
+  \approx
+  \sum_{q=1}^{N_q}
+    \abs{\det J_K}\,w_q\,f(F_K(\vect \xi_q)).
+\]
+The implementation calls
+\[
+  W_{K,q}=\abs{\det J_K}\,w_q
+\]
+the \emph{physical weight}.
+
+The cubature rule exactly integrates polynomials up to its supported degree.
+However, the analytical wave contains sine functions. Therefore,
+quantities such as
+\((u_h-u^{\mathrm{ex}})^2\) are not polynomials, and the reported norm is a
+high-order quadrature approximation to the continuous norm rather than a
+symbolically exact integral. The choice \(2N+4\) deliberately exceeds the
+degree needed for the square of a degree-\(N\) polynomial and reduces
+quadrature contamination from the trigonometric analytical field.
+
+\section{\texorpdfstring{Component-wise \(L^2\) errors}{Component-wise L2 errors}}
+
+For each scalar component \(u\in
+\{E_x,E_y,E_z,H_x,H_y,H_z\}\), define
+\[
+  e_u(\vect x,t_f)=u_h(\vect x,t_f)-u^{\mathrm{ex}}(\vect x,t_f).
+\]
+The continuous component norm is
+\[
+  \norm{e_u}_{L^2(\Omega)}
+  =
+  \left(
+    \sum_{K\in\mathcal{T}_h}
+    \int_K e_u^2\,d\vect x
+  \right)^{1/2}.
+\]
+The implemented cubature approximation is
+\[
+  \norm{e_u}_{L^2(\Omega),q}
+  =
+  \left[
+    \sum_{K\in\mathcal{T}_h}
+    \sum_{q=1}^{N_q}
+    W_{K,q}
+    \left(
+      (I_q)_{q,:}\vect u_K
+      -
+      u^{\mathrm{ex}}(\vect x_{K,q},t_f)
+    \right)^2
+  \right]^{1/2}.
+\]
+
+The corresponding CSV fields are:
+\begin{center}
+\begin{tabular}{lll}
+  \code{l2_ex_error},&
+  \code{l2_ey_error},&
+  \code{l2_ez_error},\\
+  \code{l2_hx_error},&
+  \code{l2_hy_error},&
+  \code{l2_hz_error}.
+\end{tabular}
+\end{center}
+
+\subsection{Exact-zero components}
+
+For this plane wave,
+\[
+  E_x^{\mathrm{ex}}=E_y^{\mathrm{ex}}
+  =H_x^{\mathrm{ex}}=H_z^{\mathrm{ex}}=0.
+\]
+Thus, for example,
+\[
+  \norm{e_{E_x}}_{L^2}
+  =\norm{E_{x,h}}_{L^2}.
+\]
+These norms measure spurious cross-component leakage. On an unstructured
+tetrahedral mesh, interpolating a function of \(x\) into the full
+three-dimensional degree-\(N\) polynomial space does not generally produce a
+polynomial that depends on \(x\) alone. Its transverse derivatives can
+therefore generate nonzero inactive field components during evolution. Those
+components can converge one order more slowly than the active components and
+can eventually dominate an aggregate vector norm. Their observed rates can
+also become unstable once their magnitudes approach floating-point roundoff.
+The physically active component errors
+\(\norm{e_{E_z}}_{L^2}\) and \(\norm{e_{H_y}}_{L^2}\) are generally the most
+direct component-level measures of plane-wave accuracy.
+
+\section{Aggregate electric, magnetic, and total errors}
+
+At a point, the vector errors are
+\[
+  \vect e_E=\Eh-\Eex,\qquad
+  \vect e_H=\Hh-\Hex.
+\]
+Their squared Euclidean magnitudes are
+\begin{align}
+  \abs{\vect e_E}^2
+    &=
+    e_{E_x}^2+e_{E_y}^2+e_{E_z}^2,\\
+  \abs{\vect e_H}^2
+    &=
+    e_{H_x}^2+e_{H_y}^2+e_{H_z}^2.
+\end{align}
+The aggregate errors are
+\begin{align}
+  \mathcal{E}_E
+    &=\norm{\Eh-\Eex}_{L^2(\Omega)},\\
+  \mathcal{E}_H
+    &=\norm{\Hh-\Hex}_{L^2(\Omega)},\\
+  \mathcal{E}_{EH}
+    &=
+    \left(
+      \mathcal{E}_E^2+\mathcal{E}_H^2
+    \right)^{1/2}.
+\end{align}
+Because all terms use the same quadrature,
+\begin{align}
+  \mathcal{E}_E^2
+    &=
+    \norm{e_{E_x}}_{L^2,q}^2+
+    \norm{e_{E_y}}_{L^2,q}^2+
+    \norm{e_{E_z}}_{L^2,q}^2,\\
+  \mathcal{E}_H^2
+    &=
+    \norm{e_{H_x}}_{L^2,q}^2+
+    \norm{e_{H_y}}_{L^2,q}^2+
+    \norm{e_{H_z}}_{L^2,q}^2.
+\end{align}
+
+The CSV names are:
+\[
+  \mcode{l2_electric_error}=\mathcal{E}_E,\qquad
+  \mcode{l2_magnetic_error}=\mathcal{E}_H,\qquad
+  \mcode{l2_total_error}=\mathcal{E}_{EH}.
+\]
+
+\section{Relative total field error}
+
+The analytical combined field norm is
+\[
+  \mathcal{N}_{EH}^{\mathrm{ex}}
+  =
+  \left(
+    \norm{\Eex}_{L^2,q}^2+
+    \norm{\Hex}_{L^2,q}^2
+  \right)^{1/2}.
+\]
+The CSV quantity \code{relative_total_error} is
+\[
+  \mathcal{E}_{EH,\mathrm{rel}}
+  =
+  \frac{\mathcal{E}_{EH}}
+       {\max(\mathcal{N}_{EH}^{\mathrm{ex}},
+             \epsilon_{\mathrm{mach}})}.
+\]
+The machine-epsilon guard prevents division by zero. For the nontrivial plane
+wave the denominator is not close to zero.
+
+\section{\texorpdfstring{Quadrature-sampled \(L^\infty\) errors}
+       {Quadrature-sampled Linfinity errors}}
+
+The code also computes
+\begin{align}
+  \mathcal{E}_{E,\infty}^{(q)}
+    &=
+    \max_{K,q}
+    \abs{\vect e_E(\vect x_{K,q},t_f)},\\
+  \mathcal{E}_{H,\infty}^{(q)}
+    &=
+    \max_{K,q}
+    \abs{\vect e_H(\vect x_{K,q},t_f)},\\
+  \mathcal{E}_{EH,\infty}^{(q)}
+    &=
+    \max_{K,q}
+    \sqrt{
+      \abs{\vect e_E(\vect x_{K,q},t_f)}^2+
+      \abs{\vect e_H(\vect x_{K,q},t_f)}^2
+    }.
+\end{align}
+Each rank computes local maxima over owned elements. An MPI maximum reduction
+produces the global result.
+
+The CSV fields are
+\[
+  \mcode{linf_electric_error},\quad
+  \mcode{linf_magnetic_error},\quad
+  \mcode{linf_total_error}.
+\]
+
+\paragraph{Interpretation.}
+These are not exact continuous \(L^\infty\) norms because extrema between
+cubature points are not searched. A more precise name would be
+``cubature-point maximum error.'' The values become more representative as
+the mesh and sampling rule are refined, but they should not be presented as
+rigorous suprema.
+
+\section{Energy diagnostics}
+
+\subsection{Analytical and numerical energy at final time}
+
+The electromagnetic energy density is
+\[
+  w(\vect x,t)
+  =
+  \frac{1}{2}\varepsilon\abs{\vect E}^2+
+  \frac{1}{2}\mu\abs{\vect H}^2.
+\]
+The quadrature diagnostic computes
+\begin{align}
+  \mathcal{H}_h(t_f)
+    &\approx
+    \sum_{K,q}W_{K,q}
+    \left[
+      \frac{1}{2}\varepsilon\abs{\Eh(\vect x_{K,q},t_f)}^2+
+      \frac{1}{2}\mu\abs{\Hh(\vect x_{K,q},t_f)}^2
+    \right],\\
+  \mathcal{H}^{\mathrm{ex}}(t_f)
+    &\approx
+    \sum_{K,q}W_{K,q}
+    \left[
+      \frac{1}{2}\varepsilon\abs{\Eex(\vect x_{K,q},t_f)}^2+
+      \frac{1}{2}\mu\abs{\Hex(\vect x_{K,q},t_f)}^2
+    \right].
+\end{align}
+The CSV field \code{energy_error} is the signed difference
+\[
+  \mcode{energy_error}
+  =
+  \mathcal{H}_h(t_f)-\mathcal{H}^{\mathrm{ex}}(t_f).
+\]
+It is not an absolute value and is not normalized.
+
+\subsection{Discrete energy drift}
+
+The convergence driver separately evaluates the numerical energy with the DG
+mass matrix:
+\[
+  \mathcal{H}_{M,h}
+  =
+  \frac{1}{2}
+  \sum_{K}
+  \abs{\det J_K}
+  \left[
+    \varepsilon
+    \sum_{\alpha=x,y,z}
+      \vect E_{\alpha,K}^{\,T}M\vect E_{\alpha,K}
+    +
+    \mu
+    \sum_{\alpha=x,y,z}
+      \vect H_{\alpha,K}^{\,T}M\vect H_{\alpha,K}
+  \right].
+\]
+The CSV field \code{relative_energy_error} is
+\[
+  \mcode{relative_energy_error}
+  =
+  \frac{
+    \mathcal{H}_{M,h}(t_f)-\mathcal{H}_{M,h}(0)
+  }{
+    \max(\mathcal{H}_{M,h}(0),\epsilon_{\mathrm{mach}})
+  }.
+\]
+It measures conservation of the numerical Hamiltonian. It is not the
+relative version of \code{energy_error}. The current CSV naming should be
+interpreted with this distinction in mind.
+
+\section{Charge diagnostics}
+
+The source-free exact solution has zero electric and magnetic charge. The
+code evaluates the DG polynomial divergences and integrates
+\begin{align}
+  Q_E
+    &=
+    \int_\Omega
+      \varepsilon\,\nabla\cdot\Eh\,d\vect x,\\
+  Q_H
+    &=
+    \int_\Omega
+      \mu\,\nabla\cdot\Hh\,d\vect x.
+\end{align}
+The quadrature approximations are written as
+\code{electric_charge} and \code{magnetic_charge}. These are global signed
+integrals, not \(L^2\) norms of divergence. Positive and negative local
+divergence errors can cancel.
+
+\section{MPI ownership and reductions}
+
+Every volume loop is restricted to
+\code{distributed_mesh.partition.owned}. Ghost elements are excluded from
+integration. This prevents interface halo copies from being counted more
+than once.
+
+The reduction pattern is:
+\begin{itemize}[leftmargin=*]
+  \item squared-error integrals, energies, volume, element counts, and charges:
+        \code{MPI.Allreduce(local,+,comm)};
+  \item sampled \(L^\infty\) values:
+        \code{MPI.Allreduce(local,max,comm)};
+  \item stable time-step estimate:
+        \code{MPI.Allreduce(local_dt,min,comm)};
+  \item measured elapsed time:
+        \code{MPI.Allreduce(local_elapsed,max,comm)}.
+\end{itemize}
+
+All ranks therefore obtain the same global diagnostics. The CSV is written
+only by rank zero.
+
+\section{Time integration and its effect on measured error}
+
+For polynomial order \(N\), the convergence test uses an H-first explicit
+symplectic partitioned Runge--Kutta scheme of order
+\[
+  p_t=N+1.
+\]
+Each rank estimates a stable local step. The global estimate is the minimum
+over ranks. The final number of steps and actual step are
+\[
+  n_{\mathrm{step}}
+    =
+    \max\left(
+      1,\,
+      \left\lceil
+        \frac{T}{\Delta t_{\mathrm{est}}}
+      \right\rceil
+    \right),
+  \qquad
+  \Delta t=\frac{T}{n_{\mathrm{step}}}.
+\]
+This guarantees that the numerical solution lands exactly at the requested
+final time \(T\).
+
+The measured field error is the combined result of:
+\begin{enumerate}[leftmargin=*]
+  \item spatial DG discretization error;
+  \item time-integration error;
+  \item volume-cubature error in the reported norm;
+  \item floating-point and MPI reduction error.
+\end{enumerate}
+The choice \(p_t=N+1\) and a mesh-dependent CFL step is intended to prevent a
+low-order temporal method from dominating the spatial study. Nevertheless,
+a strict spatial-convergence investigation should repeat selected cases with
+a smaller CFL and verify that rates and errors are insensitive to further
+time-step reduction.
+
+\section{Observed convergence rates}
+
+\subsection{Rate formula}
+
+For two consecutive mesh levels, let \(e_c\) be the coarse error and \(e_f\)
+the fine error. The code computes
+\[
+  p_{\mathrm{obs}}
+  =
+  \frac{
+    \log(e_c/e_f)
+  }{
+    \log(h_c/h_f)
+  }.
+\]
+Here
+\[
+  h_c=\mcode{characteristic_h}_{c},
+  \qquad
+  h_f=\mcode{characteristic_h}_{f}.
+\]
+The measured ratio \(h_c/h_f\) is read from the two result rows. It is not
+assumed to equal two, because an independently generated unstructured Gmsh
+family generally follows the requested target sizes only approximately.
+
+The first mesh level has no preceding level, so its rate is stored as missing
+and written as an empty CSV field. If either error is nonpositive, the helper
+also returns missing. In normal finite-precision calculations the norms are
+nonnegative and are positive unless the error is represented as exactly zero.
+
+\subsection{Rates stored in the CSV}
+
+The aggregate rates are:
+\[
+  \mcode{rate_electric},\qquad
+  \mcode{rate_magnetic},\qquad
+  \mcode{rate_total}.
+\]
+The component rates are:
+\begin{center}
+\begin{tabular}{lll}
+  \code{rate_ex},&
+  \code{rate_ey},&
+  \code{rate_ez},\\
+  \code{rate_hx},&
+  \code{rate_hy},&
+  \code{rate_hz}.
+\end{tabular}
+\end{center}
+Every rate is computed independently from the corresponding error column.
+
+\subsection{Meaning of rates for zero exact components}
+
+Rates for \(E_x,E_y,H_x,H_z\) describe how rapidly spurious components decay.
+While the leakage is resolved, these rates may be closer to \(N\) than to
+\(N+1\) and can lower the aggregate field rate. If the errors reach roundoff,
+their ratios can instead become erratic, extremely large, negative, or
+missing. The console prints \(E_z\), \(H_y\), and transverse-leakage
+diagnostics so that these regimes can be distinguished.
+
+\section{PASS/FAIL criterion}
+
+For each DG order \(N\), the verdict uses only the final rate from the finest
+two mesh levels:
+\[
+  p_E^{\mathrm{final}}
+  =\mcode{rate_electric}\text{ on the finest row},
+\]
+\[
+  p_H^{\mathrm{final}}
+  =\mcode{rate_magnetic}\text{ on the finest row}.
+\]
+The strict target rates encoded in the driver are
+\[
+  p_E^{\mathrm{expected}}=N+1,
+  \qquad
+  p_H^{\mathrm{expected}}=N.
+\]
+With the configured tolerance \(0.5\), an order passes if
+\begin{align}
+  p_E^{\mathrm{final}}&\ge N+1-0.5,\\
+  p_H^{\mathrm{final}}&\ge N-0.5.
+\end{align}
+Both values must be present and finite. The global verdict is PASS only if
+both tests pass for every requested DG order.
+
+The \(E=N+1\) check is an enhanced aggregate-field target inherited from the
+aligned Poisson-bracket convergence experiment. It is not a generic theorem
+for every independently generated unstructured tetrahedral family. In
+particular, order-\(N\) transverse polarization leakage can make the full
+electric vector converge more slowly even when the active \(E_z\) component
+converges at order \(N+1\). A failed strict verdict must therefore be
+interpreted together with the component table rather than as evidence that
+the error integration is incorrect.
+
+The following quantities do \emph{not} currently affect PASS/FAIL:
+\begin{itemize}[leftmargin=*]
+  \item \code{rate_total};
+  \item all six component rates;
+  \item monotonicity at every intermediate level;
+  \item relative field error;
+  \item \(L^\infty\) diagnostics;
+  \item energy discrepancy or energy drift;
+  \item charge diagnostics.
+\end{itemize}
+
+\section{CSV data dictionary}
+
+\small
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.29\textwidth}
+                  >{\raggedright\arraybackslash}p{0.65\textwidth}}
+\toprule
+Column & Definition \\
+\midrule
+\endhead
+\code{mpi_ranks} & Number of MPI ranks in the run. \\
+\code{boundary_condition} & Always \code{periodic} for this driver. \\
+\code{order} & DG polynomial degree \(N\). \\
+\code{esprk_order} & Time-integrator order \(N+1\). \\
+\code{cubature_order} & Jaskowiec--Sukumar order \(\max(2,2N+4)\). \\
+\code{mesh_level} & Zero-based refinement level \(\ell\). \\
+\code{nx_target} & Gmsh \code{NxTarget} value \(N_{x,\ell}\). \\
+\code{target_h} & \(L_x/N_{x,\ell}\); requested Gmsh target size. \\
+\code{nelements} & Global tetrahedron count. \\
+\code{min_owned_elements} & Minimum owned-element count over ranks. \\
+\code{max_owned_elements} & Maximum owned-element count over ranks. \\
+\code{characteristic_h} &
+\((\abs{\Omega}/N_{\mathrm{el}})^{1/3}\); measured size used for rates.
+\\
+\code{dt} & Actual step \(T/n_{\mathrm{step}}\). \\
+\code{nsteps} & Number of time steps. \\
+\code{elapsed_seconds} & Maximum time-integration wall time over ranks. \\
+\code{l2_electric_error} & \(\norm{\Eh-\Eex}_{L^2,q}\). \\
+\code{l2_magnetic_error} & \(\norm{\Hh-\Hex}_{L^2,q}\). \\
+\code{l2_total_error} &
+\(\sqrt{\mathcal{E}_E^2+\mathcal{E}_H^2}\).
+\\
+\code{l2_ex_error} & \(\norm{E_{x,h}-E_x^{\mathrm{ex}}}_{L^2,q}\). \\
+\code{l2_ey_error} & \(\norm{E_{y,h}-E_y^{\mathrm{ex}}}_{L^2,q}\). \\
+\code{l2_ez_error} & \(\norm{E_{z,h}-E_z^{\mathrm{ex}}}_{L^2,q}\). \\
+\code{l2_hx_error} & \(\norm{H_{x,h}-H_x^{\mathrm{ex}}}_{L^2,q}\). \\
+\code{l2_hy_error} & \(\norm{H_{y,h}-H_y^{\mathrm{ex}}}_{L^2,q}\). \\
+\code{l2_hz_error} & \(\norm{H_{z,h}-H_z^{\mathrm{ex}}}_{L^2,q}\). \\
+\code{relative_total_error} &
+\(\mathcal E_{EH}/\mathcal N_{EH}^{\mathrm{ex}}\), with an epsilon guard.
+\\
+\code{linf_electric_error} & Maximum electric vector error at cubature points. \\
+\code{linf_magnetic_error} & Maximum magnetic vector error at cubature points. \\
+\code{linf_total_error} & Maximum combined six-component error at cubature points. \\
+\code{energy_error} &
+Signed final quadrature energy difference
+\(\mathcal H_h(t_f)-\mathcal H^{\mathrm{ex}}(t_f)\).
+\\
+\code{relative_energy_error} &
+Relative mass-matrix energy drift from \(t=0\) to \(t_f\).
+\\
+\code{electric_charge} &
+\(\int_\Omega\varepsilon\nabla\cdot\Eh\,d\vect x\), by cubature.
+\\
+\code{magnetic_charge} &
+\(\int_\Omega\mu\nabla\cdot\Hh\,d\vect x\), by cubature.
+\\
+\code{rate_electric} & Consecutive-level rate of \code{l2_electric_error}. \\
+\code{rate_magnetic} & Consecutive-level rate of \code{l2_magnetic_error}. \\
+\code{rate_total} & Consecutive-level rate of \code{l2_total_error}. \\
+\code{rate_ex}, \code{rate_ey}, \code{rate_ez} &
+Consecutive-level rates of the three electric component errors.
+\\
+\code{rate_hx}, \code{rate_hy}, \code{rate_hz} &
+Consecutive-level rates of the three magnetic component errors.
+\\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Consistency identities useful for auditing results}
+
+The following identities should hold up to floating-point summation error:
+\begin{align}
+  \mcode{l2_electric_error}^2
+  &\approx
+  \mcode{l2_ex_error}^2+
+  \mcode{l2_ey_error}^2+
+  \mcode{l2_ez_error}^2,\\
+  \mcode{l2_magnetic_error}^2
+  &\approx
+  \mcode{l2_hx_error}^2+
+  \mcode{l2_hy_error}^2+
+  \mcode{l2_hz_error}^2,\\
+  \mcode{l2_total_error}^2
+  &\approx
+  \mcode{l2_electric_error}^2+
+  \mcode{l2_magnetic_error}^2.
+\end{align}
+These are particularly useful for detecting component ordering mistakes or
+inconsistent analytical fields.
+
+For the specified wave, one also expects:
+\begin{itemize}[leftmargin=*]
+  \item \(E_z\) and \(H_y\) dominate the field and error norms;
+  \item \(E_x,E_y,H_x,H_z\) remain small;
+  \item electric and magnetic aggregate errors are often similar because the
+        exact wave has equal electric and magnetic energy for
+        \(\varepsilon=\mu=1\);
+  \item electric and magnetic charge integrals remain close to zero;
+  \item relative energy drift remains small for the symplectic method.
+\end{itemize}
+
+\section{Recommended execution and interpretation workflow}
+
+\subsection{Run the convergence study}
+
+\begin{lstlisting}[style=shell]
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl \
+  --nx-target=2 \
+  --levels=4 \
+  --orders=2,3,4 \
+  --periods=1 \
+  --cfl=0.05 \
+  --output=output/convergence_distributed_periodic_poisson_bracket.csv
+\end{lstlisting}
+
+\subsection{Interpretation order}
+
+For each DG order:
+\begin{enumerate}[leftmargin=*]
+  \item verify that \code{target_h} halves and that
+        \code{characteristic_h} decreases consistently at every level;
+  \item verify that aggregate and active-component errors decrease;
+  \item check the three norm-consistency identities above;
+  \item inspect \(E_z\) and \(H_y\) rates;
+  \item inspect aggregate electric and magnetic rates;
+  \item treat zero-component rates as leakage diagnostics;
+  \item verify that a smaller CFL does not materially change the finest
+        errors or rates;
+  \item inspect energy drift and charge as conservation checks;
+  \item use the automated PASS/FAIL verdict only after these checks.
+\end{enumerate}
+
+\section{Limitations and interpretation cautions}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Non-nested unstructured meshes.}
+        The Gmsh family follows a uniform target-size sequence but is not a
+        nested finite-element hierarchy. Pre-asymptotic rate variation is
+        therefore expected.
+  \item \textbf{Target size versus actual sizes.}
+        The requested value \(L_x/N_x\) is a mesher-control parameter. Rates
+        use the measured volume-based \code{characteristic_h}, avoiding the
+        false assumption that Gmsh exactly halves the realized element size.
+  \item \textbf{Space--time error coupling.}
+        The final error includes temporal error. A CFL sensitivity check is
+        necessary before attributing all observed behavior to spatial order.
+  \item \textbf{Quadrature approximation.}
+        Trigonometric analytical fields make the norm integrands
+        non-polynomial. The selected high-order cubature is accurate but not
+        algebraically exact.
+  \item \textbf{Sampled \(L^\infty\).}
+        The maximum is taken only at volume cubature points.
+  \item \textbf{Charge cancellation.}
+        Integrated signed charge can be small even when local divergence
+        errors are not.
+  \item \textbf{Zero-component rates.}
+        Exact-zero components can contain order-\(N\) polarization leakage
+        before eventually becoming roundoff-dominated. They contribute to the
+        aggregate vector norms.
+  \item \textbf{Energy column naming.}
+        \code{energy_error} and \code{relative_energy_error} use different
+        energy comparisons, as documented above.
+  \item \textbf{Verdict coverage.}
+        PASS/FAIL checks only the finest aggregate electric and magnetic
+        rates against a strict enhanced-order target. It does not certify all
+        columns or all mesh transitions, and the electric target is not
+        guaranteed on a generic unstructured tetrahedral family.
+\end{enumerate}
+
+\section{Summary}
+
+The convergence driver evaluates the degree-\(N\) DG solution at
+Jaskowiec--Sukumar volume cubature points, maps those points to each physical
+tetrahedron, compares all six numerical components with the analytical plane
+wave, and integrates squared errors using
+\(\abs{\det J_K}w_q\). MPI sums owned-element contributions globally.
+
+Component norms are combined by Euclidean sums to produce electric, magnetic,
+and total field norms. Consecutive-level rates use the measured
+characteristic-size ratio and are written for aggregate and component errors.
+The automated verdict uses only the finest aggregate electric and magnetic
+rates, requiring at least \(N+1-0.5\) and \(N-0.5\), respectively. The console
+also reports the active \(E_z\) and \(H_y\) errors and transverse leakage,
+because the strict aggregate electric target can be reduced by order-\(N\)
+polarization leakage on unstructured tetrahedra.
+
+The methodology is suitable for distributed \(h\)-convergence assessment
+provided that users also check temporal sensitivity, quadrature adequacy,
+pre-asymptotic mesh behavior, and the special interpretation required for
+exact-zero field components.
+
+\end{document}

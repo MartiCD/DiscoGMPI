@@ -1,14 +1,11 @@
 #!/usr/bin/env julia
 
-# Distributed Maxwell cavity experiment using the Poisson-bracket formulation.
+# Distributed periodic Maxwell traveling-wave experiment using the
+# Poisson-bracket formulation.
 #
 # From the DiscoGMPI repository root:
-#   mpiexec -n 2 julia --project=. examples/distributed_poisson_bracket_maxwell.jl
-#
-# The default mesh ships with 2-rank and 4-rank METIS partitions. The legacy
-# VTK mesh was generated as a periodic box, but the distributed solver does not
-# yet support periodic boundaries. This experiment therefore derives every
-# exterior tetrahedral face and applies the selected PEC or PMC condition.
+#   mpiexec -n 2 julia --project=. \
+#     examples/distributed_periodic_poisson_bracket_maxwell.jl --partitions=2
 
 using MPI
 using DiscoGMPI
@@ -33,7 +30,8 @@ include(
     ),
 )
 
-const PEC_BOUNDARY_ID = 10
+const DEFAULT_WAVE_NUMBER = 2.0 * pi
+const MAGNETIC_AMPLITUDE = 1.0
 const TET_FACE_NODE_IDS = (
     (2, 3, 4),
     (1, 4, 3),
@@ -50,28 +48,36 @@ const REF_TET_VERTEX_COORDS = (
 struct ExperimentConfig
     mesh_path::String
     partition_path::String
+    partition_count::Int
+    repartition::Bool
     distributed_mesh_dir::String
     rebuild_distributed_mesh::Bool
     output_dir::String
     polynomial_order::Int
     esprk_order::Int
-    rk_order::Int
     final_time::Float64
     cfl::Float64
     epsilon::Float64
     mu::Float64
-    boundary_condition::Symbol
-    pml_width::Float64
-    pml_sigma_max::Float64
-    pml_degree::Int
-    pml_a::Float64
-    pml_regularization::Float64
+    wave_number::Float64
     energy_every::Int
     cubature_order::Int
     paraview_every::Int
     checkpoint_every::Int
     checkpoint_dir::String
     restart_path::String
+end
+
+struct PeriodicBox
+    lower::NTuple{3, Float64}
+    upper::NTuple{3, Float64}
+end
+
+struct PlaneWaveParameters
+    wave_number::Float64
+    angular_frequency::Float64
+    magnetic_amplitude::Float64
+    x_origin::Float64
 end
 
 struct MaxwellQuadratureDiagnostics
@@ -122,47 +128,42 @@ end
 
 function usage(io::IO = stdout)
     println(io, """
-Distributed Poisson-bracket Maxwell experiment
+Distributed periodic Poisson-bracket Maxwell experiment
 
 Usage:
   mpiexec -n <ranks> julia --project=. \\
-    examples/distributed_poisson_bracket_maxwell.jl [options]
+    examples/distributed_periodic_poisson_bracket_maxwell.jl [options]
 
 Options:
-  --mesh PATH           Legacy tetrahedral VTK mesh of the unit cube.
-                        Default: examples/meshes/tet_mesh.vtk
+  --mesh PATH           Legacy tetrahedral VTK mesh of an axis-aligned box
+                        with translationally matching opposite surfaces.
+                        Default: examples/meshes/periodic_box_2x1x1_nx4.vtk
+  --partitions N        Number of METIS partitions. It must equal the number
+                        of MPI ranks launched by mpiexec. Default: MPI ranks.
   --partition PATH      Zero-based METIS element partition.
-                        Default: <mesh stem>.mesh.epart.<MPI ranks>
+                        When omitted, rank zero creates one automatically.
+  --repartition         Regenerate the METIS partition even if it exists.
   --distributed-mesh-dir PATH
                         Rank-local mesh cache. Each rank independently loads
                         mesh_rankNNNN.bin after the cache is prepared.
                         Default: output/distributed_mesh_cache/<mesh>_ranksN
   --rebuild-distributed-mesh
                         Recreate the rank-local mesh cache from --mesh and
-                        --partition before running.
+                        the partition before running.
   --output-dir PATH     Output directory.
-                        Default: output/distributed_poisson_bracket
-  --order N             DG polynomial order (N >= 1). Default: 2
+                        Default: output/distributed_periodic_poisson_bracket
+  --order N             DG polynomial order (N >= 2). Order 1 aliases the
+                        prescribed sine wave to zero on this mesh. Default: 2
   --esprk-order N       ESPRK order in 1:6. Default: 4
-  --rk-order N          Explicit RK order in 1:5 when PML is active.
-                        Default: 4
   --final-time T        Simulation end time. Default: 0.25
   --cfl C               CFL used to estimate dt. Default: 0.05
-  --epsilon VALUE       Electric permittivity. Default: 1.0
-  --mu VALUE            Magnetic permeability. Default: 1.0
-  --boundary-condition NAME
-                        Exterior boundary condition: pec or pmc.
-                        Default: pec
-  --pml-width W         Width of a nonlinear PML layer on every side.
-                        Zero disables PML. Default: 0
-  --pml-sigma-max S     Peak nonlinear PML damping. Zero disables PML.
-                        Default: 0
-  --pml-degree N        Polynomial PML profile degree. Default: 2
-  --pml-a VALUE         Nonlinear PML weighting parameter in (0,1).
-                        Default: 0.5
-  --pml-regularization VALUE
-                        Positive PML denominator regularization.
-                        Default: 1e-12
+  --epsilon VALUE       Electric permittivity. The supplied analytical mode
+                        requires 1.0. Default: 1.0
+  --mu VALUE            Magnetic permeability. The supplied analytical mode
+                        requires 1.0. Default: 1.0
+  --wave-number VALUE   Positive x-directed wave number. It must contain an
+                        integer number of wavelengths in the mesh x extent.
+                        Default: 2*pi
   --energy-every N      Write energy every N steps. Default: 1
   --cubature-order N    Jaskowiec-Sukumar volume cubature order.
                         Default: max(2, 2 * DG order + 4)
@@ -213,25 +214,30 @@ function parse_arguments(
     nranks::Int,
     repository_root::String,
 )
-    mesh_path = joinpath(repository_root, "examples", "meshes", "tet_mesh.vtk")
+    mesh_path = joinpath(
+        repository_root,
+        "examples",
+        "meshes",
+        "periodic_box_2x1x1_nx4.vtk",
+    )
     partition_path = ""
+    partition_count = nranks
+    repartition = false
     distributed_mesh_dir = ""
     rebuild_distributed_mesh = false
     output_dir =
-        joinpath(repository_root, "output", "distributed_poisson_bracket")
+        joinpath(
+            repository_root,
+            "output",
+            "distributed_periodic_poisson_bracket",
+        )
     polynomial_order = 2
     esprk_order = 4
-    rk_order = 4
     final_time = 0.25
     cfl = 0.05
     epsilon = 1.0
     mu = 1.0
-    boundary_condition = :pec
-    pml_width = 0.0
-    pml_sigma_max = 0.0
-    pml_degree = 2
-    pml_a = 0.5
-    pml_regularization = 1e-12
+    wave_number = DEFAULT_WAVE_NUMBER
     energy_every = 1
     cubature_order = 0
     paraview_every = 10
@@ -248,9 +254,23 @@ function parse_arguments(
         elseif startswith(arg, "--mesh")
             value, i = option_value(args, i, "--mesh")
             mesh_path = abspath(value)
+        elseif startswith(arg, "--partitions")
+            value, i = option_value(args, i, "--partitions")
+            partition_count = parse(Int, value)
         elseif startswith(arg, "--partition")
             value, i = option_value(args, i, "--partition")
+            if tryparse(Int, value) !== nothing
+                throw(
+                    ArgumentError(
+                        "--partition expects a partition-file path, but got " *
+                        "'$value'. To request $value MPI partitions, use " *
+                        "--partitions=$value.",
+                    ),
+                )
+            end
             partition_path = abspath(value)
+        elseif arg == "--repartition"
+            repartition = true
         elseif startswith(arg, "--distributed-mesh-dir")
             value, i = option_value(args, i, "--distributed-mesh-dir")
             distributed_mesh_dir = abspath(value)
@@ -265,9 +285,6 @@ function parse_arguments(
         elseif startswith(arg, "--esprk-order")
             value, i = option_value(args, i, "--esprk-order")
             esprk_order = parse(Int, value)
-        elseif startswith(arg, "--rk-order")
-            value, i = option_value(args, i, "--rk-order")
-            rk_order = parse(Int, value)
         elseif startswith(arg, "--final-time")
             value, i = option_value(args, i, "--final-time")
             final_time = parse(Float64, value)
@@ -280,24 +297,9 @@ function parse_arguments(
         elseif startswith(arg, "--mu")
             value, i = option_value(args, i, "--mu")
             mu = parse(Float64, value)
-        elseif startswith(arg, "--boundary-condition")
-            value, i = option_value(args, i, "--boundary-condition")
-            boundary_condition = Symbol(lowercase(value))
-        elseif startswith(arg, "--pml-width")
-            value, i = option_value(args, i, "--pml-width")
-            pml_width = parse(Float64, value)
-        elseif startswith(arg, "--pml-sigma-max")
-            value, i = option_value(args, i, "--pml-sigma-max")
-            pml_sigma_max = parse(Float64, value)
-        elseif startswith(arg, "--pml-degree")
-            value, i = option_value(args, i, "--pml-degree")
-            pml_degree = parse(Int, value)
-        elseif startswith(arg, "--pml-a")
-            value, i = option_value(args, i, "--pml-a")
-            pml_a = parse(Float64, value)
-        elseif startswith(arg, "--pml-regularization")
-            value, i = option_value(args, i, "--pml-regularization")
-            pml_regularization = parse(Float64, value)
+        elseif startswith(arg, "--wave-number")
+            value, i = option_value(args, i, "--wave-number")
+            wave_number = parse(Float64, value)
         elseif startswith(arg, "--energy-every")
             value, i = option_value(args, i, "--energy-every")
             energy_every = parse(Int, value)
@@ -323,8 +325,23 @@ function parse_arguments(
         i += 1
     end
 
+    partition_count >= 1 ||
+        throw(ArgumentError("--partitions must be at least 1."))
+    partition_count == nranks ||
+        throw(
+            ArgumentError(
+                "--partitions=$partition_count must equal the MPI rank count " *
+                "$nranks. Launch with mpiexec -n $partition_count.",
+            ),
+        )
     if isempty(partition_path)
-        partition_path = splitext(mesh_path)[1] * ".mesh.epart.$nranks"
+        mesh_name = splitext(basename(mesh_path))[1]
+        partition_path = joinpath(
+            repository_root,
+            "output",
+            "partitions",
+            "$(mesh_name).mesh.epart.$partition_count",
+        )
     end
     if isempty(distributed_mesh_dir)
         mesh_name = splitext(basename(mesh_path))[1]
@@ -332,19 +349,22 @@ function parse_arguments(
             repository_root,
             "output",
             "distributed_mesh_cache",
-            "$(mesh_name)_ranks$nranks",
+            "$(mesh_name)_ranks$partition_count",
         )
     end
     if isempty(checkpoint_dir)
         checkpoint_dir = joinpath(output_dir, "checkpoints")
     end
 
-    polynomial_order >= 1 ||
-        throw(ArgumentError("--order must be at least 1."))
+    polynomial_order >= 2 ||
+        throw(
+            ArgumentError(
+                "--order must be at least 2: for this mesh, all order-1 DG " *
+                "nodes lie at zeros of sin(2*pi*x).",
+            ),
+        )
     1 <= esprk_order <= 6 ||
         throw(ArgumentError("--esprk-order must be in 1:6."))
-    1 <= rk_order <= 5 ||
-        throw(ArgumentError("--rk-order must be in 1:5."))
     final_time > 0.0 ||
         throw(ArgumentError("--final-time must be positive."))
     cfl > 0.0 ||
@@ -353,33 +373,12 @@ function parse_arguments(
         throw(ArgumentError("--epsilon must be positive."))
     mu > 0.0 ||
         throw(ArgumentError("--mu must be positive."))
-    boundary_condition in (:pec, :pmc) ||
-        throw(ArgumentError("--boundary-condition must be pec or pmc."))
-    pml_width >= 0.0 ||
-        throw(ArgumentError("--pml-width must be non-negative."))
-    pml_sigma_max >= 0.0 ||
-        throw(ArgumentError("--pml-sigma-max must be non-negative."))
-    pml_degree >= 1 ||
-        throw(ArgumentError("--pml-degree must be at least one."))
-    0.0 < pml_a < 1.0 ||
-        throw(ArgumentError("--pml-a must lie in (0,1)."))
-    pml_regularization > 0.0 ||
-        throw(ArgumentError("--pml-regularization must be positive."))
-    xor(pml_width > 0.0, pml_sigma_max > 0.0) &&
-        throw(
-            ArgumentError(
-                "--pml-width and --pml-sigma-max must both be positive " *
-                "to enable PML, or both be zero to disable it.",
-            ),
-        )
-    if pml_width > 0.0 &&
-       (!isapprox(epsilon, 1.0) || !isapprox(mu, 1.0))
-        throw(
-            ArgumentError(
-                "The nonlinear PML currently requires --epsilon=1 and --mu=1.",
-            ),
-        )
-    end
+    wave_number > 0.0 ||
+        throw(ArgumentError("--wave-number must be positive."))
+    isapprox(epsilon, 1.0; rtol = 0.0, atol = 1e-14) ||
+        throw(ArgumentError("The prescribed analytical solution requires epsilon=1."))
+    isapprox(mu, 1.0; rtol = 0.0, atol = 1e-14) ||
+        throw(ArgumentError("The prescribed analytical solution requires mu=1."))
     energy_every >= 1 ||
         throw(ArgumentError("--energy-every must be at least 1."))
     cubature_order == 0 || 2 <= cubature_order <= 20 ||
@@ -392,22 +391,18 @@ function parse_arguments(
     return ExperimentConfig(
         mesh_path,
         partition_path,
+        partition_count,
+        repartition,
         distributed_mesh_dir,
         rebuild_distributed_mesh,
         output_dir,
         polynomial_order,
         esprk_order,
-        rk_order,
         final_time,
         cfl,
         epsilon,
         mu,
-        boundary_condition,
-        pml_width,
-        pml_sigma_max,
-        pml_degree,
-        pml_a,
-        pml_regularization,
+        wave_number,
         energy_every,
         cubature_order,
         paraview_every,
@@ -451,26 +446,57 @@ function build_boundary_tris(tets::Matrix{Int})
     return reduce(hcat, collect.(boundary_faces))
 end
 
-function load_pec_mesh(mesh_path::String)
+function periodic_boundary_id(
+    points::Matrix{Float64},
+    triangle::AbstractVector{Int};
+    box::PeriodicBox,
+    tolerance::Float64 = 1e-10,
+)
+    centroid = (
+        sum(@view points[1, triangle]) / 3.0,
+        sum(@view points[2, triangle]) / 3.0,
+        sum(@view points[3, triangle]) / 3.0,
+    )
+    abs(centroid[1] - box.lower[1]) <= tolerance && return 1
+    abs(centroid[1] - box.upper[1]) <= tolerance && return 2
+    abs(centroid[2] - box.lower[2]) <= tolerance && return 3
+    abs(centroid[2] - box.upper[2]) <= tolerance && return 4
+    abs(centroid[3] - box.lower[3]) <= tolerance && return 5
+    abs(centroid[3] - box.upper[3]) <= tolerance && return 6
+
+    error(
+        "Boundary triangle $(collect(triangle)) at centroid $centroid is not " *
+        "on one of the inferred box planes $(box.lower) to $(box.upper). " *
+        "The periodic driver requires an axis-aligned box mesh.",
+    )
+end
+
+function periodic_box(points::Matrix{Float64})
+    size(points, 2) > 0 || error("Cannot infer bounds from an empty mesh.")
+    lower_values = vec(minimum(points; dims = 2))
+    upper_values = vec(maximum(points; dims = 2))
+    lower = Tuple(lower_values)
+    upper = Tuple(upper_values)
+    lengths = ntuple(dimension -> upper[dimension] - lower[dimension], 3)
+    all(>(0.0), lengths) ||
+        error("The periodic mesh has degenerate coordinate bounds $lower to $upper.")
+    return PeriodicBox(lower, upper)
+end
+
+function periodic_box_lengths(box::PeriodicBox)
+    return ntuple(
+        dimension -> box.upper[dimension] - box.lower[dimension],
+        3,
+    )
+end
+
+function load_periodic_mesh(mesh_path::String)
     points, tets = read_mesh_file_tet_vtk(mesh_path)
     size(tets, 2) > 0 ||
         error("The mesh '$mesh_path' contains no tetrahedra.")
 
-    tolerance = 1e-10
-    bounds = [
-        (minimum(@view points[dimension, :]),
-         maximum(@view points[dimension, :]))
-        for dimension in 1:3
-    ]
-    all(
-        bound -> abs(bound[1]) <= tolerance &&
-                 abs(bound[2] - 1.0) <= tolerance,
-        bounds,
-    ) ||
-        error(
-            "The analytical cavity mode requires a [0,1]^3 mesh; " *
-            "coordinate bounds are $bounds.",
-        )
+    box = periodic_box(points)
+    tolerance = max(1e-10, 1e-10 * maximum(periodic_box_lengths(box)))
 
     tris = build_boundary_tris(tets)
     ntets = size(tets, 2)
@@ -478,7 +504,15 @@ function load_pec_mesh(mesh_path::String)
     tet_cell_ids = collect(1:ntets)
     tri_cell_ids = collect((ntets + 1):(ntets + ntris))
     boundary_ids = zeros(Int, ntets + ntris)
-    boundary_ids[tri_cell_ids] .= PEC_BOUNDARY_ID
+    for triangle in axes(tris, 2)
+        boundary_ids[ntets + triangle] =
+            periodic_boundary_id(
+                points,
+                @view(tris[:, triangle]);
+                box = box,
+                tolerance = tolerance,
+            )
+    end
 
     mesh = RawVTUMesh(
         points,
@@ -492,113 +526,54 @@ function load_pec_mesh(mesh_path::String)
     return mesh
 end
 
-function exact_cavity_mode_functions(
+function exact_periodic_wave_functions(
     time::Float64;
     epsilon::Float64,
     mu::Float64,
-    boundary_condition::Symbol = :pec,
+    wave::PlaneWaveParameters,
 )
-    omega = sqrt(3.0) * pi / sqrt(epsilon * mu)
-    electric_time_factor = cos(omega * time)
-    magnetic_time_factor = sin(omega * time)
-    magnetic_scale = pi / (mu * omega)
+    electric_scale =
+        -wave.wave_number * wave.magnetic_amplitude /
+        (wave.angular_frequency * epsilon)
+    phase = (x, time_value) ->
+        wave.wave_number * (x - wave.x_origin) -
+        wave.angular_frequency * time_value
 
-    electric = function (x, y, z)
-        return (
-            -cos(pi * x) * sin(pi * y) * sin(pi * z) *
-            electric_time_factor,
-            0.0,
-            sin(pi * x) * sin(pi * y) * cos(pi * z) *
-            electric_time_factor,
-        )
-    end
+    electric = (x, y, z) ->
+        (0.0, 0.0, electric_scale * sin(phase(x, time)))
+    magnetic = (x, y, z) ->
+        (0.0, wave.magnetic_amplitude * sin(phase(x, time)), 0.0)
 
-    magnetic = function (x, y, z)
-        return (
-            -magnetic_scale * sin(pi * x) * cos(pi * y) * cos(pi * z) *
-            magnetic_time_factor,
-            2.0 * magnetic_scale * cos(pi * x) * sin(pi * y) *
-            cos(pi * z) * magnetic_time_factor,
-            -magnetic_scale * cos(pi * x) * cos(pi * y) * sin(pi * z) *
-            magnetic_time_factor,
-        )
-    end
-
-    if boundary_condition == :pec
-        return electric, magnetic
-    elseif boundary_condition == :pmc
-        impedance = sqrt(mu / epsilon)
-        dual_electric = function (x, y, z)
-            Hx, Hy, Hz = magnetic(x, y, z)
-            return (
-                impedance * Hx,
-                impedance * Hy,
-                impedance * Hz,
-            )
-        end
-        dual_magnetic = function (x, y, z)
-            Ex, Ey, Ez = electric(x, y, z)
-            return (
-                -Ex / impedance,
-                -Ey / impedance,
-                -Ez / impedance,
-            )
-        end
-        return dual_electric, dual_magnetic
-    end
-
-    throw(ArgumentError("Unsupported cavity boundary condition $boundary_condition."))
+    return electric, magnetic
 end
 
-function exact_cavity_mode_curl_functions(
+function exact_periodic_wave_curl_functions(
     time::Float64;
     epsilon::Float64,
     mu::Float64,
-    boundary_condition::Symbol = :pec,
+    wave::PlaneWaveParameters,
 )
-    omega = sqrt(3.0) * pi / sqrt(epsilon * mu)
-    electric_time_factor = cos(omega * time)
-    magnetic_time_factor = sin(omega * time)
-    magnetic_scale = pi / (mu * omega)
+    electric_scale =
+        -wave.wave_number * wave.magnetic_amplitude /
+        (wave.angular_frequency * epsilon)
+    phase = (x, time_value) ->
+        wave.wave_number * (x - wave.x_origin) -
+        wave.angular_frequency * time_value
 
-    curl_electric = function (x, y, z)
-        return (
-            pi * sin(pi * x) * cos(pi * y) * cos(pi * z) *
-            electric_time_factor,
-            -2.0 * pi * cos(pi * x) * sin(pi * y) * cos(pi * z) *
-            electric_time_factor,
-            pi * cos(pi * x) * cos(pi * y) * sin(pi * z) *
-            electric_time_factor,
-        )
-    end
-
-    curl_magnetic = function (x, y, z)
-        scale = 3.0 * pi * magnetic_scale
-        return (
-            scale * cos(pi * x) * sin(pi * y) * sin(pi * z) *
-            magnetic_time_factor,
+    curl_electric = (x, y, z) ->
+        (
             0.0,
-            -scale * sin(pi * x) * sin(pi * y) * cos(pi * z) *
-            magnetic_time_factor,
+            -electric_scale * wave.wave_number * cos(phase(x, time)),
+            0.0,
         )
-    end
+    curl_magnetic = (x, y, z) ->
+        (
+            0.0,
+            0.0,
+            wave.wave_number * wave.magnetic_amplitude * cos(phase(x, time)),
+        )
 
-    if boundary_condition == :pec
-        return curl_electric, curl_magnetic
-    elseif boundary_condition == :pmc
-        impedance = sqrt(mu / epsilon)
-        dual_curl_electric = (x, y, z) -> begin
-            cHx, cHy, cHz = curl_magnetic(x, y, z)
-            (impedance * cHx, impedance * cHy, impedance * cHz)
-        end
-        dual_curl_magnetic = (x, y, z) -> begin
-            cEx, cEy, cEz = curl_electric(x, y, z)
-            (-cEx / impedance, -cEy / impedance, -cEz / impedance)
-        end
-        return dual_curl_electric, dual_curl_magnetic
-    end
-
-    throw(ArgumentError("Unsupported cavity boundary condition $boundary_condition."))
+    return curl_electric, curl_magnetic
 end
 
 function optical_chirality_density(
@@ -615,80 +590,70 @@ function optical_chirality_density(
     )
 end
 
-pml_enabled(config::ExperimentConfig) =
-    config.pml_width > 0.0 && config.pml_sigma_max > 0.0
-
-function configured_boundary_kind(config::ExperimentConfig)
-    if config.boundary_condition == :pec
-        return MaxwellBC_PEC
-    elseif config.boundary_condition == :pmc
-        return MaxwellBC_PMC
-    end
-    throw(
-        ArgumentError(
-            "Unsupported boundary condition $(config.boundary_condition).",
+function periodic_boundary_specs(box::PeriodicBox)
+    Lx, Ly, Lz = periodic_box_lengths(box)
+    return (
+        DiscoGMPI.PeriodicBoundarySpec(
+            1,
+            2,
+            (-Lx, 0.0, 0.0),
+            :x_periodic,
+        ),
+        DiscoGMPI.PeriodicBoundarySpec(
+            3,
+            4,
+            (0.0, -Ly, 0.0),
+            :y_periodic,
+        ),
+        DiscoGMPI.PeriodicBoundarySpec(
+            5,
+            6,
+            (0.0, 0.0, -Lz),
+            :z_periodic,
         ),
     )
 end
 
-function distributed_mesh_bounds(
+function distributed_periodic_box(
     distributed_dg::DistributedDGDiscretization,
 )
     points = distributed_dg.dg.mesh.points
-    local_minimum = vec(minimum(points; dims = 2))
-    local_maximum = vec(maximum(points; dims = 2))
-    global_minimum =
-        MPI.Allreduce(local_minimum, min, distributed_dg.comm)
-    global_maximum =
-        MPI.Allreduce(local_maximum, max, distributed_dg.comm)
-    return global_minimum, global_maximum
+    local_lower = vec(minimum(points; dims = 2))
+    local_upper = vec(maximum(points; dims = 2))
+    global_lower =
+        MPI.Allreduce(local_lower, min, distributed_dg.comm)
+    global_upper =
+        MPI.Allreduce(local_upper, max, distributed_dg.comm)
+    return PeriodicBox(Tuple(global_lower), Tuple(global_upper))
 end
 
-function build_configured_nonlinear_pml(
-    distributed_dg::DistributedDGDiscretization,
+function configured_plane_wave(
     config::ExperimentConfig,
+    box::PeriodicBox,
 )
-    pml_enabled(config) || return nothing
-    lower, upper = distributed_mesh_bounds(distributed_dg)
-    lengths = upper .- lower
-    minimum(lengths) > 0.0 ||
-        throw(ArgumentError("The distributed mesh bounds are degenerate."))
-    2.0 * config.pml_width < minimum(lengths) ||
+    Lx = periodic_box_lengths(box)[1]
+    periods = config.wave_number * Lx / (2.0 * pi)
+    nearest_periods = round(Int, periods)
+    isapprox(periods, nearest_periods; rtol = 1e-10, atol = 1e-10) ||
         throw(
             ArgumentError(
-                "--pml-width=$(config.pml_width) must be smaller than " *
-                "half the shortest domain extent $(minimum(lengths)).",
+                "--wave-number=$(config.wave_number) gives $periods periods " *
+                "over the inferred x extent $Lx. A periodic analytical wave " *
+                "requires an integer number of periods. For one period use " *
+                "--wave-number=$(2.0 * pi / Lx); multiply that value by an " *
+                "integer for additional periods.",
             ),
         )
+    nearest_periods >= 1 ||
+        throw(ArgumentError("The periodic wave must contain at least one x period."))
 
-    directional_profile = function (coordinate, direction)
-        left_interface = lower[direction] + config.pml_width
-        right_interface = upper[direction] - config.pml_width
-        return max(
-            polynomial_pml_sigma(
-                coordinate,
-                left_interface,
-                lower[direction];
-                sigma_max = config.pml_sigma_max,
-                degree = config.pml_degree,
-            ),
-            polynomial_pml_sigma(
-                coordinate,
-                right_interface,
-                upper[direction];
-                sigma_max = config.pml_sigma_max,
-                degree = config.pml_degree,
-            ),
-        )
-    end
-
-    return build_maxwell_nonlinear_pml(
-        distributed_dg;
-        sigma_x = (x, y, z) -> directional_profile(x, 1),
-        sigma_y = (x, y, z) -> directional_profile(y, 2),
-        sigma_z = (x, y, z) -> directional_profile(z, 3),
-        a = config.pml_a,
-        regularization = config.pml_regularization,
+    angular_frequency =
+        config.wave_number / sqrt(config.epsilon * config.mu)
+    return PlaneWaveParameters(
+        config.wave_number,
+        angular_frequency,
+        MAGNETIC_AMPLITUDE,
+        box.lower[1],
     )
 end
 
@@ -723,24 +688,24 @@ function distributed_quadrature_diagnostics(
     cubature_order::Int;
     epsilon::Float64,
     mu::Float64,
-    boundary_condition::Symbol = :pec,
+    wave::PlaneWaveParameters,
 )
     cubature_points, cubature_weights, number_cubature_points =
         get_JaskowiecSukumar_cubature(cubature_order)
     interpolation =
         reference_interpolation_matrix(distributed_dg.dg.ref, cubature_points)
-    exact_electric, exact_magnetic = exact_cavity_mode_functions(
+    exact_electric, exact_magnetic = exact_periodic_wave_functions(
         time;
         epsilon = epsilon,
         mu = mu,
-        boundary_condition = boundary_condition,
+        wave = wave,
     )
     exact_curl_electric, exact_curl_magnetic =
-        exact_cavity_mode_curl_functions(
+        exact_periodic_wave_curl_functions(
             time;
             epsilon = epsilon,
             mu = mu,
-            boundary_condition = boundary_condition,
+            wave = wave,
         )
 
     mesh = distributed_dg.dg.mesh
@@ -1280,7 +1245,7 @@ function write_parallel_fields(
     time::Float64,
     epsilon::Float64,
     mu::Float64,
-    boundary_condition::Symbol,
+    wave::PlaneWaveParameters,
 )
     rank = MPI.Comm_rank(distributed_dg.comm)
     nranks = MPI.Comm_size(distributed_dg.comm)
@@ -1299,11 +1264,11 @@ function write_parallel_fields(
     exact_magnetic_values = similar(magnetic)
     cells = Vector{MeshCell}(undef, nowned)
     global_element_ids = Vector{Int}(undef, nowned)
-    exact_electric, exact_magnetic = exact_cavity_mode_functions(
+    exact_electric, exact_magnetic = exact_periodic_wave_functions(
         time;
         epsilon = epsilon,
         mu = mu,
-        boundary_condition = boundary_condition,
+        wave = wave,
     )
 
     for (owned_index, local_elem) in enumerate(owned)
@@ -1493,10 +1458,10 @@ function write_paraview_snapshot!(
     distributed_dg::DistributedDGDiscretization,
     U::MaxwellField,
     step::Int,
-    time::Float64;
+    time::Float64,
+    wave::PlaneWaveParameters;
     epsilon::Float64,
     mu::Float64,
-    boundary_condition::Symbol,
 )
     rank = MPI.Comm_rank(distributed_dg.comm)
     fields_dir = joinpath(output_dir, "fields")
@@ -1521,7 +1486,7 @@ function write_paraview_snapshot!(
             time = time,
             epsilon = epsilon,
             mu = mu,
-            boundary_condition = boundary_condition,
+            wave = wave,
         )
     end
     MPI.Barrier(distributed_dg.comm)
@@ -1660,7 +1625,7 @@ function write_final_integration_points(
     cubature_order::Int;
     epsilon::Float64,
     mu::Float64,
-    boundary_condition::Symbol = :pec,
+    wave::PlaneWaveParameters,
 )
     rank = MPI.Comm_rank(distributed_dg.comm)
     rank_label = lpad(string(rank), 4, '0')
@@ -1670,18 +1635,18 @@ function write_final_integration_points(
         get_JaskowiecSukumar_cubature(cubature_order)
     interpolation =
         reference_interpolation_matrix(distributed_dg.dg.ref, cubature_points)
-    exact_electric, exact_magnetic = exact_cavity_mode_functions(
+    exact_electric, exact_magnetic = exact_periodic_wave_functions(
         time;
         epsilon = epsilon,
         mu = mu,
-        boundary_condition = boundary_condition,
+        wave = wave,
     )
     exact_curl_electric, exact_curl_magnetic =
-        exact_cavity_mode_curl_functions(
+        exact_periodic_wave_curl_functions(
             time;
             epsilon = epsilon,
             mu = mu,
-            boundary_condition = boundary_condition,
+            wave = wave,
         )
 
     mesh = distributed_dg.dg.mesh
@@ -1789,21 +1754,13 @@ function write_final_integration_points(
                         (exact_Hx^2 + exact_Hy^2 + exact_Hz^2)
                     numerical_optical_chirality =
                         optical_chirality_density(
-                            (
-                                numerical_Ex,
-                                numerical_Ey,
-                                numerical_Ez,
-                            ),
+                            (numerical_Ex, numerical_Ey, numerical_Ez),
                             (
                                 dot(row, curl_electric_x),
                                 dot(row, curl_electric_y),
                                 dot(row, curl_electric_z),
                             ),
-                            (
-                                numerical_Hx,
-                                numerical_Hy,
-                                numerical_Hz,
-                            ),
+                            (numerical_Hx, numerical_Hy, numerical_Hz),
                             (
                                 dot(row, curl_magnetic_x),
                                 dot(row, curl_magnetic_y),
@@ -1920,6 +1877,41 @@ function write_final_integration_points(
     return output_path
 end
 
+function generate_metis_partition(config::ExperimentConfig)
+    mkpath(dirname(config.partition_path))
+    if config.partition_count == 1
+        _, tetrahedra = read_mesh_file_tet_vtk(config.mesh_path)
+        open(config.partition_path, "w") do io
+            foreach(_ -> println(io, 0), axes(tetrahedra, 2))
+        end
+        return config.partition_path
+    end
+
+    mesh_name = splitext(basename(config.mesh_path))[1]
+    metis_mesh_path =
+        joinpath(dirname(config.partition_path), "$mesh_name.mesh")
+    write_metis_mesh_from_vtk(config.mesh_path, metis_mesh_path)
+
+    mpmetis = Sys.which("mpmetis")
+    mpmetis === nothing &&
+        error(
+            "Automatic partitioning requires the 'mpmetis' executable. " *
+            "Install METIS or pass --partition PATH.",
+        )
+
+    command = `$mpmetis $metis_mesh_path $(config.partition_count)`
+    run(command)
+    generated_path =
+        "$metis_mesh_path.epart.$(config.partition_count)"
+    isfile(generated_path) ||
+        error("mpmetis did not create the expected file $generated_path.")
+
+    if abspath(generated_path) != abspath(config.partition_path)
+        cp(generated_path, config.partition_path; force = true)
+    end
+    return config.partition_path
+end
+
 function load_root_inputs(
     config::ExperimentConfig,
     rank::Int,
@@ -1934,23 +1926,26 @@ function load_root_inputs(
         try
             isfile(config.mesh_path) ||
                 error("Mesh file not found: $(config.mesh_path)")
-            isfile(config.partition_path) ||
-                error(
-                    "Partition file not found: $(config.partition_path). " *
-                    "Use 2 or 4 MPI ranks with the shipped mesh, or pass " *
-                    "--partition PATH.",
-                )
 
-            mesh = load_pec_mesh(config.mesh_path)
+            mesh = load_periodic_mesh(config.mesh_path)
+            if config.repartition || !isfile(config.partition_path)
+                generate_metis_partition(config)
+            end
             partition = read_metis_epart(config.partition_path)
             length(partition) == size(mesh.tets, 2) ||
                 error(
-                    "Partition has $(length(partition)) entries but the mesh " *
-                    "has $(size(mesh.tets, 2)) tetrahedra.",
+                    "Partition file $(config.partition_path) has " *
+                    "$(length(partition)) entries, but mesh " *
+                    "$(config.mesh_path) has $(size(mesh.tets, 2)) " *
+                    "tetrahedra. Use a partition generated for this mesh, " *
+                    "or regenerate it with --repartition.",
                 )
-            all(part -> 0 <= part < nranks, partition) ||
+            all(part -> 0 <= part < config.partition_count, partition) ||
                 error("Partition entries must be zero-based ranks in 0:$(nranks - 1).")
-            all(part -> any(==(part), partition), 0:(nranks - 1)) ||
+            all(
+                part -> any(==(part), partition),
+                0:(config.partition_count - 1),
+            ) ||
                 error("Every MPI rank must own at least one tetrahedron.")
         catch error
             load_error = sprint(showerror, error)
@@ -1973,7 +1968,8 @@ function load_or_prepare_distributed_dg(
     use_existing = MPI.bcast(
         rank == 0 &&
         isfile(manifest_path) &&
-        !config.rebuild_distributed_mesh,
+        !config.rebuild_distributed_mesh &&
+        !config.repartition,
         comm;
         root = 0,
     )
@@ -1996,7 +1992,8 @@ function load_or_prepare_distributed_dg(
         metadata = Dict(
             "source_mesh" => config.mesh_path,
             "source_partition" => config.partition_path,
-            "boundary_condition" => uppercase(string(config.boundary_condition)),
+            "partition_count" => config.partition_count,
+            "boundary_condition" => "periodic",
         ),
     )
     return build_distributed_dg_from_partition(
@@ -2010,27 +2007,26 @@ function experiment_configuration(
     config::ExperimentConfig,
     mesh_load_mode::String,
     cubature_order::Int,
+    box::PeriodicBox,
+    wave::PlaneWaveParameters,
 )
     return Dict{String, Any}(
         "mesh_path" => config.mesh_path,
         "partition_path" => config.partition_path,
+        "partition_count" => config.partition_count,
+        "repartition" => config.repartition,
         "distributed_mesh_dir" => config.distributed_mesh_dir,
         "mesh_load_mode" => mesh_load_mode,
         "output_dir" => config.output_dir,
         "polynomial_order" => config.polynomial_order,
         "esprk_order" => config.esprk_order,
-        "rk_order" => config.rk_order,
         "final_time" => config.final_time,
         "cfl" => config.cfl,
         "epsilon" => config.epsilon,
         "mu" => config.mu,
-        "boundary_condition" => string(config.boundary_condition),
-        "pml_enabled" => pml_enabled(config),
-        "pml_width" => config.pml_width,
-        "pml_sigma_max" => config.pml_sigma_max,
-        "pml_degree" => config.pml_degree,
-        "pml_a" => config.pml_a,
-        "pml_regularization" => config.pml_regularization,
+        "domain_lower" => collect(box.lower),
+        "domain_upper" => collect(box.upper),
+        "domain_lengths" => collect(periodic_box_lengths(box)),
         "energy_every" => config.energy_every,
         "cubature_order" => cubature_order,
         "paraview_every" => config.paraview_every,
@@ -2039,30 +2035,16 @@ function experiment_configuration(
         "restart_path" => config.restart_path,
         "formulation" => "PoissonBracketFormulation",
         "flux" => "centered",
-        "time_integrator" => (
-            pml_enabled(config) ? "explicit RK" : "H-first ESPRK"
-        ),
-        "analytical_solution" => (
-            "unit-cube $(uppercase(string(config.boundary_condition))) eigenmode"
-        ),
+        "boundary_condition" => "periodic in x, y, and z",
+        "periodic_pairs" => "1<->2, 3<->4, 5<->6",
+        "analytical_solution" => "traveling wave along +x",
         "optical_chirality_definition" =>
             "0.5*(epsilon*E dot curl(E) + mu*H dot curl(H))",
-        "paraview_point_data" => [
-            "ElectricField",
-            "MagneticField",
-            "ExactElectricField",
-            "ExactMagneticField",
-            "ElectricFieldError",
-            "MagneticFieldError",
-            "ElectricFieldMagnitude",
-            "MagneticFieldMagnitude",
-        ],
-        "paraview_cell_data" => [
-            "GlobalElementId",
-            "OwnerRank",
-            "PolynomialOrder",
-        ],
-        "paraview_field_data" => ["TimeValue"],
+        "exact_optical_chirality" => 0.0,
+        "wave_number" => wave.wave_number,
+        "angular_frequency" => wave.angular_frequency,
+        "magnetic_amplitude" => wave.magnetic_amplitude,
+        "wave_x_origin" => wave.x_origin,
     )
 end
 
@@ -2070,22 +2052,21 @@ function checkpoint_metadata(
     config::ExperimentConfig,
     initial_energy_total::Float64,
     mesh_load_mode::String,
+    box::PeriodicBox,
+    wave::PlaneWaveParameters,
 )
     return Dict{String, Any}(
         "initial_energy_total" => initial_energy_total,
         "target_final_time" => config.final_time,
         "epsilon" => config.epsilon,
         "mu" => config.mu,
+        "wave_number" => wave.wave_number,
+        "angular_frequency" => wave.angular_frequency,
+        "wave_x_origin" => wave.x_origin,
+        "domain_lower" => collect(box.lower),
+        "domain_upper" => collect(box.upper),
         "esprk_order" => config.esprk_order,
-        "rk_order" => config.rk_order,
-        "first_partition" => pml_enabled(config) ? "none" : "H",
-        "boundary_condition" => string(config.boundary_condition),
-        "pml_enabled" => pml_enabled(config),
-        "pml_width" => config.pml_width,
-        "pml_sigma_max" => config.pml_sigma_max,
-        "pml_degree" => config.pml_degree,
-        "pml_a" => config.pml_a,
-        "pml_regularization" => config.pml_regularization,
+        "first_partition" => "H",
         "distributed_mesh_dir" => config.distributed_mesh_dir,
         "mesh_load_mode" => mesh_load_mode,
     )
@@ -2120,6 +2101,8 @@ function validate_restart_configuration(
     for (name, expected) in (
         ("epsilon", config.epsilon),
         ("mu", config.mu),
+        ("wave_number", config.wave_number),
+        ("esprk_order", Float64(config.esprk_order)),
     )
         stored = restart_metadata_number(state, name)
         stored === nothing && continue
@@ -2132,54 +2115,15 @@ function validate_restart_configuration(
             )
     end
 
-    for (name, expected) in (
-        ("boundary_condition", string(config.boundary_condition)),
-        ("pml_enabled", string(pml_enabled(config))),
-        ("pml_degree", string(config.pml_degree)),
-    )
-        haskey(state.metadata, name) || continue
-        string(state.metadata[name]) == expected ||
-            throw(
-                ArgumentError(
-                    "Checkpoint $name=$(state.metadata[name]) does not " *
-                    "match the requested value $expected.",
-                ),
-            )
-    end
-
-    numeric_configuration = if pml_enabled(config)
-        (
-            ("rk_order", Float64(config.rk_order)),
-            ("pml_width", config.pml_width),
-            ("pml_sigma_max", config.pml_sigma_max),
-            ("pml_a", config.pml_a),
-            ("pml_regularization", config.pml_regularization),
+    first_partition =
+        get(state.metadata, "first_partition", "H")
+    string(first_partition) == "H" ||
+        throw(
+            ArgumentError(
+                "The checkpoint does not use the required H-first " *
+                "Poisson-bracket integrator.",
+            ),
         )
-    else
-        (("esprk_order", Float64(config.esprk_order)),)
-    end
-    for (name, expected) in numeric_configuration
-        stored = restart_metadata_number(state, name)
-        stored === nothing && continue
-        isapprox(stored, expected; rtol = 0.0, atol = 1e-14) ||
-            throw(
-                ArgumentError(
-                    "Checkpoint $name=$stored does not match the requested " *
-                    "value $expected.",
-                ),
-            )
-    end
-
-    if !pml_enabled(config)
-        first_partition = get(state.metadata, "first_partition", "H")
-        string(first_partition) == "H" ||
-            throw(
-                ArgumentError(
-                    "The checkpoint does not use the required H-first " *
-                    "Poisson-bracket integrator.",
-                ),
-            )
-    end
     return nothing
 end
 
@@ -2210,6 +2154,8 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     nranks = MPI.Comm_size(comm)
     distributed_dg, mesh_load_mode =
         load_or_prepare_distributed_dg(config, rank, nranks, comm)
+    box = distributed_periodic_box(distributed_dg)
+    wave = configured_plane_wave(config, box)
 
     cubature_order = resolved_cubature_order(config)
     restarting = !isempty(config.restart_path)
@@ -2223,33 +2169,28 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         )
         validate_restart_configuration(restart_state, config)
     else
-        electric, magnetic = exact_cavity_mode_functions(
+        electric, magnetic = exact_periodic_wave_functions(
             0.0;
             epsilon = config.epsilon,
             mu = config.mu,
-            boundary_condition = config.boundary_condition,
+            wave = wave,
         )
         U = interpolate_maxwell_field(distributed_dg, electric, magnetic)
     end
 
     registry = MaxwellBoundaryRegistry(
-        Dict(PEC_BOUNDARY_ID => configured_boundary_kind(config)),
+        Dict(boundary_id => MaxwellBC_None for boundary_id in 1:6),
+    )
+    periodic = build_distributed_periodic_maxwell_exchange(
+        distributed_dg,
+        periodic_boundary_specs(box),
     )
     formulation = PoissonBracketFormulation()
-    pml = build_configured_nonlinear_pml(distributed_dg, config)
-    scheme = if pml === nothing
-        explicit_partitioned_symplectic_rk_scheme(
-            config.esprk_order;
-            first_partition = :H,
-        )
-    else
-        explicit_rk_scheme(config.rk_order)
-    end
-    workspace = if pml === nothing
-        MaxwellPartitionedRKWorkspace(U, scheme)
-    else
-        MaxwellRKWorkspace(U, scheme)
-    end
+    scheme = explicit_partitioned_symplectic_rk_scheme(
+        config.esprk_order;
+        first_partition = :H,
+    )
+    workspace = MaxwellPartitionedRKWorkspace(U, scheme)
 
     local_dt, local_sizes = estimate_maxwell_dt(
         distributed_dg.dg.mesh,
@@ -2261,6 +2202,11 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     )
     estimated_dt = MPI.Allreduce(local_dt, min, comm)
     global_hmin = MPI.Allreduce(local_sizes.hmin, min, comm)
+    directed_periodic_faces = MPI.Allreduce(
+        length(periodic.faces),
+        +,
+        comm,
+    )
     start_step = restarting ? restart_state.step : 0
     start_time = restarting ? restart_state.time : 0.0
     dt, remaining_steps = if restarting
@@ -2330,7 +2276,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         cubature_order;
         epsilon = config.epsilon,
         mu = config.mu,
-        boundary_condition = config.boundary_condition,
+        wave = wave,
     )
 
     collective_root_action(
@@ -2384,37 +2330,28 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     end
 
     if rank == 0
-        println("Distributed Poisson-bracket Maxwell experiment")
-        println("----------------------------------------------")
+        println("Distributed periodic Poisson-bracket Maxwell experiment")
+        println("-------------------------------------------------------")
         println("MPI ranks:            ", nranks)
         println("mesh:                 ", config.mesh_path)
         println("partition:            ", config.partition_path)
+        println("partitions:           ", config.partition_count)
         println("distributed mesh:     ", config.distributed_mesh_dir)
         println("mesh load mode:       ", mesh_load_mode)
         println("DG order:             ", config.polynomial_order)
         println("time integrator:      ", scheme.name)
         println("cubature order:       ", cubature_order)
-        println(
-            "boundary condition:   ",
-            uppercase(string(config.boundary_condition)),
-            " on all exterior faces",
-        )
-        println(
-            "analytical solution:  unit-cube ",
-            uppercase(string(config.boundary_condition)),
-            " eigenmode",
-        )
-        println("nonlinear PML:        ", pml === nothing ? "disabled" : "enabled")
-        if pml !== nothing
-            println("PML width:            ", config.pml_width)
-            println("PML sigma max:        ", config.pml_sigma_max)
-            println("PML degree:           ", config.pml_degree)
-            println("PML a:                ", config.pml_a)
-            println("PML regularization:   ", config.pml_regularization)
-            println(
-                "reference errors:     undamped cavity mode; diagnostic only",
-            )
-        end
+        println("boundary condition:   periodic pairs 1<->2, 3<->4, 5<->6")
+        println("periodic face pairs:  ", div(directed_periodic_faces, 2))
+        println("domain lower:         ", box.lower)
+        println("domain upper:         ", box.upper)
+        println("wave number:          ", wave.wave_number)
+        println("angular frequency:    ", wave.angular_frequency)
+        println("wave x origin:        ", wave.x_origin)
+        println("analytical solution:  x_phase = x - wave_x_origin")
+        println("                      E_z = -k*H0/(omega*epsilon)")
+        println("                            * sin(k*x_phase-omega*t)")
+        println("                      H_y = H0*sin(k*x_phase-omega*t)")
         println("optical chirality:    0.5*(epsilon E.curl(E) + mu H.curl(H))")
         println("electric charge:      integral of div(epsilon E)")
         println("magnetic charge:      integral of div(mu H)")
@@ -2437,7 +2374,13 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     end
 
     configuration =
-        experiment_configuration(config, mesh_load_mode, cubature_order)
+        experiment_configuration(
+            config,
+            mesh_load_mode,
+            cubature_order,
+            box,
+            wave,
+        )
     write_distributed_run_metadata(
         config.output_dir,
         distributed_dg;
@@ -2485,10 +2428,10 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             distributed_dg,
             U,
             start_step,
-            start_time;
+            start_time,
+            wave;
             epsilon = config.epsilon,
             mu = config.mu,
-            boundary_condition = config.boundary_condition,
         )
     end
 
@@ -2496,6 +2439,8 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         config,
         initial_energy_total,
         mesh_load_mode,
+        box,
+        wave,
     )
     local_elapsed = 0.0
     final_checkpoint_path = ""
@@ -2510,30 +2455,18 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                    start_time + local_step * dt
 
             local_elapsed += @elapsed begin
-                if pml === nothing
-                    distributed_partitioned_symplectic_rk_step!(
-                        U,
-                        workspace,
-                        scheme,
-                        dt,
-                        distributed_dg,
-                        registry,
-                        formulation;
-                        ε = config.epsilon,
-                        μ = config.mu,
-                    )
-                else
-                    distributed_maxwell_nonlinear_pml_rk_step!(
-                        U,
-                        workspace,
-                        scheme,
-                        dt,
-                        distributed_dg,
-                        registry,
-                        formulation,
-                        pml,
-                    )
-                end
+                distributed_periodic_partitioned_symplectic_rk_step!(
+                    U,
+                    workspace,
+                    scheme,
+                    dt,
+                    distributed_dg,
+                    periodic,
+                    registry,
+                    formulation;
+                    ε = config.epsilon,
+                    μ = config.mu,
+                )
             end
 
             if step % config.energy_every == 0 || step == final_step
@@ -2550,7 +2483,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                     cubature_order;
                     epsilon = config.epsilon,
                     mu = config.mu,
-                    boundary_condition = config.boundary_condition,
+                    wave = wave,
                 )
                 collective_root_action(
                     comm,
@@ -2595,10 +2528,10 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                     distributed_dg,
                     U,
                     step,
-                    time;
+                    time,
+                    wave;
                     epsilon = config.epsilon,
                     mu = config.mu,
-                    boundary_condition = config.boundary_condition,
                 )
             end
 
@@ -2653,7 +2586,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             cubature_order;
             epsilon = config.epsilon,
             mu = config.mu,
-            boundary_condition = config.boundary_condition,
+            wave = wave,
         )
     end
     MPI.Barrier(comm)

@@ -3,3 +3,10 @@ output/
 benchmark/solver/*.csv
 benchmark/solver/*.txt
 benchmark/solver/*.png
+
+docs/*.aux
+docs/*.log
+docs/*.lot
+docs/*.out
+docs/*.pdf
+docs/*.toc

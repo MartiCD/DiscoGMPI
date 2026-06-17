@@ -15,6 +15,53 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedFormatter, FixedLocator, NullLocator
 
 
+params = {
+    "text.usetex": True,
+    "font.family": "serif",
+    "font.serif": ["TeX Gyre Schola"],
+    "font.size": 16,
+    "axes.labelsize": 18,
+    "axes.titlesize": 18,
+    "legend.fontsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+
+    "axes.linewidth": 1.0,
+    "axes.grid": True,
+    "axes.grid.which": "both",
+    "grid.color": "0.85",
+    "grid.linestyle": "--",
+    "grid.linewidth": 0.8,
+    "axes.axisbelow": True,
+
+    "lines.linewidth": 2.0,
+    "lines.markersize": 6,
+    "lines.markeredgewidth": 0.8,
+
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.major.size": 6,
+    "ytick.major.size": 6,
+    "xtick.minor.size": 3,
+    "ytick.minor.size": 3,
+    "xtick.major.width": 1.0,
+    "ytick.major.width": 1.0,
+    "xtick.minor.width": 0.8,
+    "ytick.minor.width": 0.8,
+
+    "legend.frameon": True,
+    "legend.handlelength": 2.5,
+    "legend.handletextpad": 0.4,
+
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.03,
+}
+
+plt.rcParams.update(params)
+# warnings.filterwarnings("ignore")
+
+
 REQUIRED_COLUMNS = {
     "mpi_ranks",
     "order",
@@ -60,6 +107,7 @@ INTEGER_COLUMNS = {
 
 TABLE_COLUMNS = (
     "mpi_ranks",
+    "boundary_condition",
     "order",
     "esprk_order",
     "mesh_level",
@@ -88,7 +136,7 @@ TABLE_COLUMNS = (
 
 @dataclass(frozen=True)
 class Result:
-    values: dict[str, float | int | None]
+    values: dict[str, float | int | str | None]
 
     def integer(self, name: str) -> int:
         value = self.values[name]
@@ -104,6 +152,11 @@ class Result:
         value = self.values[name]
         assert value is None or isinstance(value, (int, float))
         return None if value is None else float(value)
+
+    def text(self, name: str) -> str:
+        value = self.values[name]
+        assert isinstance(value, str)
+        return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -175,7 +228,7 @@ def parse_value(name: str, text: str, path: Path, row_number: int):
 
 
 def read_results(paths: Iterable[Path]) -> list[Result]:
-    merged: dict[tuple[int, int, int, int], Result] = {}
+    merged: dict[tuple[str, int, int, int, int], Result] = {}
 
     for path in paths:
         if not path.is_file():
@@ -196,8 +249,20 @@ def read_results(paths: Iterable[Path]) -> list[Result]:
                     name: parse_value(name, row[name], path, row_number)
                     for name in REQUIRED_COLUMNS
                 }
+                boundary_condition = row.get(
+                    "boundary_condition",
+                    "pec",
+                ).strip().lower()
+                if boundary_condition not in {"pec", "pmc", "periodic"}:
+                    raise ValueError(
+                        "Invalid boundary_condition in "
+                        f"{path} at row {row_number}: "
+                        f"{boundary_condition!r}"
+                    )
+                values["boundary_condition"] = boundary_condition
                 result = Result(values)
                 key = (
+                    result.text("boundary_condition"),
                     result.integer("mpi_ranks"),
                     result.integer("order"),
                     result.integer("mesh_level"),
@@ -217,6 +282,7 @@ def read_results(paths: Iterable[Path]) -> list[Result]:
     results = sorted(
         merged.values(),
         key=lambda result: (
+            result.text("boundary_condition"),
             result.integer("mpi_ranks"),
             result.integer("order"),
             result.integer("mesh_level"),
@@ -233,6 +299,14 @@ def validate_results(results: list[Result]) -> None:
         raise ValueError(
             "All input results must use the same MPI rank count; found "
             f"{sorted(rank_counts)}"
+        )
+    boundary_conditions = {
+        result.text("boundary_condition") for result in results
+    }
+    if len(boundary_conditions) != 1:
+        raise ValueError(
+            "All input results must use the same boundary condition; found "
+            f"{sorted(boundary_conditions)}"
         )
 
     for order, group in groups.items():
@@ -262,9 +336,14 @@ def group_results(results: list[Result]) -> dict[int, list[Result]]:
     return dict(sorted(groups.items()))
 
 
-def format_csv_value(name: str, value: float | int | None) -> str:
+def format_csv_value(
+    name: str,
+    value: float | int | str | None,
+) -> str:
     if value is None:
         return ""
+    if name == "boundary_condition":
+        return str(value)
     if name in INTEGER_COLUMNS:
         return str(int(value))
     if name.startswith("rate_"):
@@ -324,6 +403,7 @@ def write_latex_table(
 ) -> None:
     groups = group_results(results)
     rank_count = results[0].integer("mpi_ranks")
+    boundary_condition = results[0].text("boundary_condition").upper()
     lines = [
         "% Requires \\usepackage{amsmath,booktabs}",
         r"\begin{table}[htbp]",
@@ -376,7 +456,8 @@ def write_latex_table(
             (
                 "  \\caption{"
                 + latex_escape(caption)
-                + f" using {rank_count} MPI ranks."
+                + f" using {rank_count} MPI ranks and "
+                + f"{boundary_condition} boundaries."
                 + "}"
             ),
             r"  \label{tab:distributed-maxwell-convergence}",

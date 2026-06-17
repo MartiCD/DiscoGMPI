@@ -114,12 +114,12 @@ overwrite the original DiscoG3D source tree.
 
 \paragraph{Scope.}
 The principal production path documented here is the source-free,
-three-dimensional Maxwell system on affine tetrahedral meshes, with
-perfect-electric-conductor (PEC) boundaries and explicit time integration.
-The serial and threaded solver also contains periodic-boundary infrastructure.
-The MPI Maxwell driver currently exchanges inter-rank face traces and supports
-PEC boundaries, but distributed periodic boundaries, sources, perfectly
-matched layers (PML), and heterogeneous material jumps remain future work.
+three-dimensional Maxwell system on affine tetrahedral meshes, with explicit
+time integration. The MPI path supports piecewise-constant isotropic material
+properties, PEC, PMC, first-order absorbing, and translational periodic
+boundaries. It also supports the six-field nonlinear PML of Abarbanel,
+Gottlieb, and Hesthaven for dimensionless homogeneous vacuum problems.
+Impressed sources remain future work.
 
 \paragraph{Notation.}
 Superscripts $-$ and $+$ denote the local and neighboring traces at a face.
@@ -151,6 +151,7 @@ $N_p$, and the number of nodes per triangular face by $N_{fp}$.
   \item owned-element and one-layer face-halo mesh construction;
   \item MPI face orientation and nodal permutation handling;
   \item nonblocking exchange of the six Maxwell traces;
+  \item six-field nonlinear PML damping without auxiliary variables;
   \item distributed energy reductions and distributed time integration;
   \item partition visualization, regression tests, convergence cases, and
         backend benchmarks.
@@ -170,13 +171,16 @@ face adjacency, and neighbor communication tables. \\
 \api{src/DistributedDG.jl} & Rank-local DG construction, root-only mesh
 distribution, Maxwell trace exchange, distributed right-hand side, energy,
 and time integration. \\
+\api{src/NonlinearPML.jl} & Nonlinear PML profiles, local source terms, and
+serial/distributed explicit RK wrappers. \\
 \api{src/TraceMaps.jl} & General MPI trace maps and face-node permutation support. \\
 \api{src/MetisIO.jl} & Legacy VTK tetrahedral reader and METIS mesh writer. \\
 \api{src/PartitionVTK.jl} & Legacy VTK partition visualization writers. \\
 \api{examples/solver/} & Serial and threaded Maxwell examples and convergence
 drivers inherited from DiscoG3D. \\
 \api{examples/distributed_maxwell.jl} & End-to-end MPI Maxwell demonstration. \\
-\api{examples/meshes/} & Small sample mesh and METIS partition files. \\
+\api{examples/meshes/} & Sample VTK meshes, METIS partition files, and
+parameterized Gmsh geometries for structured and unstructured studies. \\
 \api{benchmark/solver/} & Serial-versus-threaded right-hand-side benchmarks and
 plotting scripts. \\
 \api{test/} & Package tests and explicitly launched MPI tests. \\
@@ -208,21 +212,21 @@ plotting scripts. \\
 
 \section{Source-free Maxwell equations}
 
-For scalar, positive, spatially uniform permittivity $\varepsilon$ and
-permeability $\mu$, \pkg{} advances
+For scalar, positive, elementwise-constant permittivity $\varepsilon_K$ and
+permeability $\mu_K$, \pkg{} advances on each tetrahedron $K$
 \begin{align}
-  \varepsilon \frac{\partial \vect E}{\partial t}
+  \varepsilon_K \frac{\partial \vect E}{\partial t}
     &= \nabla \times \vect H, \label{eq:maxwell-e}\\
-  \mu \frac{\partial \vect H}{\partial t}
+  \mu_K \frac{\partial \vect H}{\partial t}
     &= -\nabla \times \vect E. \label{eq:maxwell-h}
 \end{align}
-The wave speed, impedance, and admittance are
+The element wave speed, impedance, and admittance are
 \begin{equation}
-  c = \frac{1}{\sqrt{\varepsilon\mu}},
+  c_K = \frac{1}{\sqrt{\varepsilon_K\mu_K}},
   \qquad
-  Z = \sqrt{\frac{\mu}{\varepsilon}},
+  Z_K = \sqrt{\frac{\mu_K}{\varepsilon_K}},
   \qquad
-  Y = \frac{1}{Z}.
+  Y_K = \frac{1}{Z_K}.
 \end{equation}
 
 The divergence constraints
@@ -287,6 +291,152 @@ registry = MaxwellBoundaryRegistry(
 
 An unregistered boundary tag maps to \code{MaxwellBC\_None}; it does not
 silently become PEC.
+
+\section{PMC and absorbing boundary conditions}
+
+The perfect-magnetic-conductor state reflects the tangential magnetic field
+and retains the electric trace. It is selected with
+\code{MaxwellBC\_PMC}. The \code{MaxwellBC\_Absorbing} state is a first-order,
+impedance-matched characteristic condition: the incoming tangential
+characteristic is set to zero using the adjacent element impedance. It is not
+a PML and is most accurate for locally normally incident waves.
+
+PMC reflection is supported by both the Hesthaven--Warburton and
+Poisson-bracket surface operators, including distributed faces. For a PMC
+cavity validation, the production driver uses electromagnetic duality:
+\[
+  \vect E_{\mathrm{PMC}}=Z\vect H_{\mathrm{PEC}},\qquad
+  \vect H_{\mathrm{PMC}}=-\frac{1}{Z}\vect E_{\mathrm{PEC}},
+  \qquad Z=\sqrt{\mu/\varepsilon}.
+\]
+
+\begin{lstlisting}
+registry = MaxwellBoundaryRegistry(Dict(
+    10 => MaxwellBC_PEC,
+    20 => MaxwellBC_PMC,
+    30 => MaxwellBC_Absorbing,
+))
+\end{lstlisting}
+
+\section{Six-field nonlinear PML}
+\label{sec:nonlinear-pml}
+
+\pkg{} implements the primary nonlinear PML proposed by Abarbanel, Gottlieb,
+and Hesthaven for time-dependent electromagnetics in three dimensions. The
+implementation modifies the six physical Maxwell fields directly and
+introduces no auxiliary unknowns. In its current dimensionless homogeneous
+vacuum form,
+\begin{align}
+  \frac{\partial \vect E}{\partial t}
+    &= \nabla\times\vect H
+       + (\vect\sigma\odot\vect P_H)\times\vect H,
+       \label{eq:nonlinear-pml-e}\\
+  \frac{\partial \vect H}{\partial t}
+    &= -\nabla\times\vect E
+       + (\vect\sigma\odot\vect P_E)\times\vect E,
+       \label{eq:nonlinear-pml-h}
+\end{align}
+where $\odot$ denotes componentwise multiplication,
+\begin{align}
+  \vect P_H
+    &=
+    \frac{\vect E\times\vect H}
+    {a|\vect H|^2+(1-a)|\vect E|^2+\delta},\\
+  \vect P_E
+    &=
+    -\frac{\vect E\times\vect H}
+    {a|\vect E|^2+(1-a)|\vect H|^2+\delta}.
+\end{align}
+The recommended and default parameter is $a=1/2$. The positive
+regularization $\delta$, whose default is $10^{-12}$, prevents division by
+zero where both fields vanish. Users should verify that the selected value is
+small relative to the squared field scale of their problem.
+
+For nonnegative damping coefficients
+$\vect\sigma=(\sigma_x,\sigma_y,\sigma_z)$, the regularized PML contribution
+to the pointwise energy balance is
+\begin{equation}
+  \frac{1}{2}\frac{\partial}{\partial t}
+  \left(|\vect E|^2+|\vect H|^2\right)
+  =
+  -\nabla\cdot(\vect E\times\vect H)
+  -
+  \sum_{i=1}^{3}
+    \sigma_i(\vect E\times\vect H)_i^2
+    \left(\frac{1}{D_H}+\frac{1}{D_E}\right),
+\end{equation}
+with
+\[
+  D_H=a|\vect H|^2+(1-a)|\vect E|^2+\delta,\qquad
+  D_E=a|\vect E|^2+(1-a)|\vect H|^2+\delta.
+\]
+The local PML term is therefore nonpositive.
+
+\paragraph{Sign convention.}
+The magnetic source in \cref{eq:nonlinear-pml-h} follows Appendix A and the
+energy identity in the 2006 paper. The sign printed in its vector equation
+(2.10) is inconsistent with both. This choice is covered by a component-level
+regression test and a discrete energy-decay test.
+
+\paragraph{Reference.}
+S.~Abarbanel, D.~Gottlieb, and J.~S.~Hesthaven,
+``Non-Linear PML Equations for Time Dependent Electromagnetics in Three
+Dimensions,'' \emph{Journal of Scientific Computing}, vol.~28, nos.~2--3,
+2006, DOI:
+\href{https://doi.org/10.1007/s10915-006-9072-1}
+{10.1007/s10915-006-9072-1}.
+
+\paragraph{Damping profiles.}
+\code{polynomial\_pml\_sigma} constructs a one-sided profile that is zero at
+the interior interface and rises to \code{sigma\_max} at the outer boundary:
+\[
+  \sigma(\xi)
+  =
+  \sigma_{\max}
+  \left[
+    \operatorname{clamp}
+    \left(
+      \frac{\xi-\xi_{\mathrm{interface}}}
+           {\xi_{\mathrm{outer}}-\xi_{\mathrm{interface}}},
+      0,1
+    \right)
+  \right]^m.
+\]
+Reversing the interface and outer-boundary coordinates produces a layer on
+the opposite side. Independent functions may be supplied for
+$\sigma_x$, $\sigma_y$, and $\sigma_z$.
+
+\begin{lstlisting}
+pml = build_maxwell_nonlinear_pml(
+    distributed_dg;
+    sigma_x = (x, y, z) -> polynomial_pml_sigma(
+        x, 1.5, 2.0; sigma_max=12.0, degree=2
+    ),
+    a = 0.5,
+    regularization = 1e-12,
+)
+
+scheme = explicit_rk_scheme(4)
+work = MaxwellRKWorkspace(U, scheme)
+distributed_maxwell_nonlinear_pml_rk_step!(
+    U, work, scheme, dt, distributed_dg, registry,
+    HesthavenWarburtonFormulation(:upwind), pml,
+)
+\end{lstlisting}
+
+The periodic wrapper is
+\code{distributed\_periodic\_maxwell\_nonlinear\_pml\_rk\_step!}. On MPI
+ranks, PML sources are added only to owned elements and ghost residuals remain
+zero. Because no additional state variables or traces are introduced, the
+existing six-component halo exchange is sufficient.
+
+The nonlinear PML is dissipative and is therefore advanced with the explicit
+RK family. For \code{PoissonBracketFormulation}, use
+\code{run\_maxwell\_nonlinear\_pml\_time\_steps!} or its distributed
+counterpart rather than the conservative ESPRK driver. The current PML
+wrapper fixes
+$\varepsilon=\mu=1$; coupling this formulation consistently to heterogeneous
+materials is future work.
 
 \chapter{Tetrahedral DG Discretization}
 
@@ -753,9 +903,44 @@ boundary_tag_name = "boundary_id"
 material_tag_name = "region_id"
 \end{lstlisting}
 
-Material IDs are preserved in the distributed topology. The current Maxwell
-operator nevertheless uses scalar run-wide values of $\varepsilon$ and $\mu$;
-element-dependent material jumps are not yet implemented.
+Material IDs are preserved in the distributed topology and can be converted
+to element coefficients:
+
+\begin{lstlisting}
+materials = maxwell_element_materials(
+    distributed_dg,
+    Dict(
+        1 => MaxwellMaterial(1.0, 1.0),
+        2 => MaxwellMaterial(4.0, 2.0),
+    ),
+)
+\end{lstlisting}
+
+The material-aware Maxwell overloads accept \code{materials} as a positional
+argument. Central fluxes use the coefficient of the updated element. The
+Hesthaven--Warburton upwind interface solver uses side-dependent impedance and
+admittance. Coefficients are currently isotropic and constant inside each
+tetrahedron.
+
+\section{Distributed periodic boundaries}
+
+\code{build\_distributed\_periodic\_maxwell\_exchange} gathers only owned
+periodic boundary descriptors, pairs shifted centroids and DG face nodes, and
+constructs directed rank-local faces. Remote periodic traces use a separate
+nonblocking MPI exchange; same-rank partners are read directly.
+
+\begin{lstlisting}
+periodic = build_distributed_periodic_maxwell_exchange(
+    distributed_dg,
+    default_unit_box_periodic_specs();
+    materials = materials,
+)
+\end{lstlisting}
+
+Periodic boundary tags must map to \code{MaxwellBC\_None} in the ordinary
+boundary registry. When material-aware periodic fluxes are used, pass
+\code{materials} while constructing the exchange so remote partner
+coefficients are recorded.
 
 \section{Inspect a VTU mesh}
 
@@ -1010,6 +1195,31 @@ run_distributed_maxwell_partitioned_symplectic_time_steps!(
 )
 \end{lstlisting}
 
+\subsection{Poisson-bracket run with nonlinear PML}
+
+The nonlinear source couples the electric and magnetic partitions, so this
+case uses ordinary explicit RK:
+\begin{lstlisting}
+pml = build_maxwell_nonlinear_pml(
+    ddg;
+    sigma_x = (x, y, z) -> polynomial_pml_sigma(
+        x, 0.8, 1.0; sigma_max=12.0, degree=2
+    ),
+)
+
+run_distributed_maxwell_nonlinear_pml_time_steps!(
+    U,
+    ddg,
+    registry,
+    PoissonBracketFormulation(),
+    pml;
+    rk_order = 4,
+    dt = 1e-4,
+    nsteps = 100,
+    energy_every = 10,
+)
+\end{lstlisting}
+
 \section{Energy diagnostics}
 
 \begin{lstlisting}
@@ -1063,6 +1273,353 @@ The script:
   \item advances two RK3 steps;
   \item reports ownership, neighbors, and global energy.
 \end{itemize}
+
+\section{Distributed PEC, PMC, and nonlinear-PML cavity driver}
+
+The production driver
+\code{examples/distributed\_poisson\_bracket\_maxwell.jl} uses PEC boundaries
+by default. Select PMC walls with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --boundary-condition=pmc
+\end{lstlisting}
+Without PML, the driver uses the requested H-first ESPRK method and compares
+against the corresponding PEC or dual PMC cavity eigenmode.
+
+Add a polynomial nonlinear PML at all six coordinate bounds with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --boundary-condition=pmc \
+  --pml-width=0.2 \
+  --pml-sigma-max=12 \
+  --pml-degree=2 \
+  --rk-order=4
+\end{lstlisting}
+Both \code{--pml-width} and \code{--pml-sigma-max} must be positive to enable
+the PML, or both zero to disable it. The width must be smaller than half the
+shortest global domain extent. PML runs require
+\code{--epsilon=1 --mu=1} and switch from ESPRK to ordinary explicit RK.
+The cavity mode remains in the output as an undamped reference; it is not an
+exact solution of the damped problem.
+
+\subsection{Diagnostics and production output}
+
+The default output directory is
+\code{output/distributed\_poisson\_bracket/}. The driver writes the same
+production artifact family as the periodic driver:
+\begin{itemize}[leftmargin=*]
+  \item \code{energy.csv}: DG mass-matrix electric, magnetic, and total
+        energy;
+  \item \code{quadrature\_diagnostics.csv}: independent-cubature field and
+        energy errors, optical chirality, electric and magnetic charge, and
+        linear and angular momentum;
+  \item \code{fields.pvd} and parallel VTU pieces: ParaView time series;
+  \item \code{integration\_points\_rankNNNN.csv}: final integration-point
+        numerical and analytical values, including pointwise chirality;
+  \item \code{run\_metadata.toml} and \code{partition\_metadata.csv};
+  \item \code{checkpoints/stepNNNNNNNN/}: checksummed rank-local restart data.
+\end{itemize}
+
+At every cubature point, the driver evaluates
+\[
+  \chi =
+  \frac{1}{2}\left(
+    \varepsilon\,\vect E\cdot\nabla\times\vect E
+    +\mu\,\vect H\cdot\nabla\times\vect H
+  \right).
+\]
+The numerical curls use the physical element derivative operators. The exact
+cavity curls are evaluated analytically for both PEC and dual PMC modes. In
+PML runs the same undamped cavity field remains the diagnostic reference, so
+field, energy, and chirality errors should be interpreted as reference
+errors, not as exact damped-solution errors.
+
+The ParaView output writes each owned DG element as a VTK Lagrange tetrahedron
+containing every DG node. The rank-local VTU pieces include
+\code{ElectricField}, \code{MagneticField}, \code{ExactElectricField},
+\code{ExactMagneticField}, \code{ElectricFieldError}, and
+\code{MagneticFieldError}, plus field magnitudes, global element IDs, owner
+rank, polynomial order, and physical time.
+
+\section{Distributed periodic Poisson-bracket traveling wave}
+
+The production periodic driver is:
+\begin{lstlisting}[language=bash]
+examples/distributed_periodic_poisson_bracket_maxwell.jl
+\end{lstlisting}
+By default it uses the legacy VTK mesh
+\code{examples/meshes/periodic\_box\_2x1x1\_nx4.vtk}, whose domain is
+\[
+  \Omega=[0,2]\times[0,1]\times[0,1].
+\]
+The mesh contains four structured hexahedral intervals in the $x$ direction,
+each divided into six conforming tetrahedra, for a total of 24 tetrahedra.
+The periodic physical-surface tags are
+\begin{center}
+\begin{tabular}{ccc}
+\toprule
+Direction & Minus tag & Plus tag \\
+\midrule
+$x$ & 1 & 2 \\
+$y$ & 3 & 4 \\
+$z$ & 5 & 6 \\
+\bottomrule
+\end{tabular}
+\end{center}
+The corresponding plus-to-minus translations are
+$(-2,0,0)$, $(0,-1,0)$, and $(0,0,-1)$. These tags must map to
+\code{MaxwellBC\_None} in the ordinary boundary registry because the periodic
+surface operator handles them separately.
+
+The domain dimensions are not hard-coded requirements. For a conforming
+tetrahedral mesh of an axis-aligned box whose opposite surface triangulations
+match under translation, the driver infers
+\[
+  (x_{\min},y_{\min},z_{\min}),\qquad
+  (x_{\max},y_{\max},z_{\max})
+\]
+from the mesh coordinates. It reconstructs boundary tags 1 through 6 from the
+six coordinate planes and derives the periodic translations from
+$L_x=x_{\max}-x_{\min}$, $L_y=y_{\max}-y_{\min}$, and
+$L_z=z_{\max}-z_{\min}$. A separate domain-bounds command-line option is
+intentionally unnecessary because the mesh is the authoritative geometry
+description.
+
+\subsection{Generating meshes with a configurable x resolution}
+
+The generator
+\code{examples/meshes/generate\_periodic\_box\_2x1x1\_nx4.jl} accepts the
+number of structured cells in the $x$ direction through \code{--nx}. Each
+cell is decomposed into six tetrahedra. For example:
+\begin{lstlisting}[language=bash]
+julia --project=. \
+  examples/meshes/generate_periodic_box_2x1x1.jl \
+  --nx=8
+\end{lstlisting}
+This creates
+\code{examples/meshes/periodic\_box\_2x1x1\_nx8.vtk}, with 36 points and
+48 tetrahedra. The boundary tags remain $1/2$, $3/4$, and $5/6$ for the
+$x$, $y$, and $z$ periodic pairs. The general mesh sizes are
+\[
+  N_{\mathrm{points}}=4(n_x+1),\qquad
+  N_{\mathrm{tet}}=6n_x.
+\]
+An explicit output path may be selected with \code{--output=PATH}. If
+\code{--nx} is omitted, the default value is four and the generated VTK file
+is identical to the supplied \code{nx4} mesh.
+
+The analytical solution is
+\begin{align}
+  \vect E(\vect x,t)
+    &= \left(0,0,-\frac{kH_0}{\omega\varepsilon_0}\right)
+       \sin(kx-\omega t),\\
+  \vect H(\vect x,t)
+    &= (0,H_0,0)\sin(kx-\omega t),
+\end{align}
+with
+\[
+  k=\omega=2\pi,\qquad
+  H_0=1,\qquad
+  \varepsilon_0=\mu_0=1.
+\]
+Thus the implemented fields are
+\[
+  \vect E=(0,0,-\sin(2\pi x-2\pi t)),\qquad
+  \vect H=(0,\sin(2\pi x-2\pi t),0).
+\]
+On a translated box, the phase uses $x-x_{\min}$. The wave number can be
+selected with \code{--wave-number=K}; the angular frequency is
+$\omega=K/\sqrt{\varepsilon_0\mu_0}$. The driver requires
+\[
+  \frac{K L_x}{2\pi}\in\mathbb{N},
+\]
+which ensures that the analytical field is periodic across the inferred
+x-boundaries. The default remains $K=2\pi$.
+
+Run two MPI partitions with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --partitions=2
+\end{lstlisting}
+
+The value of \code{--partitions} must equal the number of MPI ranks.
+\code{--partitions=N} specifies a count, while \code{--partition=PATH}
+selects an existing METIS element-partition file. In particular,
+\code{--partition=2} means ``read the file named \code{2}''; it does not
+request two partitions.
+
+The generated \code{nx8} mesh can be run on two ranks with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --partitions=2 \
+  --mesh=examples/meshes/periodic_box_2x1x1_nx8.vtk \
+  --repartition \
+  --rebuild-distributed-mesh \
+  --order=2 \
+  --esprk-order=3 \
+  --final-time=10.0 \
+  --cfl=0.5
+\end{lstlisting}
+The default partition path and distributed-mesh cache contain the source mesh
+basename, so \code{nx4} and \code{nx8} artifacts do not collide. The
+\code{--repartition} and \code{--rebuild-distributed-mesh} options are
+required when replacing a mesh while retaining the same filename.
+
+For example, an unstructured mesh with bounds
+$[0,1]\times[0,0.25]\times[0,0.25]$ can be run directly:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --mesh=examples/meshes/periodic_box_unstructured.vtk \
+  --partitions=2 \
+  --repartition \
+  --rebuild-distributed-mesh \
+  --order=4 \
+  --esprk-order=5 \
+  --cfl=0.8 \
+  --final-time=1.0
+\end{lstlisting}
+Here the default $K=2\pi$ gives one wavelength across the unit x extent.
+
+A four-way partition is generated and run with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 4 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --partitions=4 --repartition
+\end{lstlisting}
+
+\subsection{Automatic METIS partitioning}
+
+When \code{--partition} is omitted, rank zero:
+\begin{enumerate}[leftmargin=*]
+  \item reads the legacy VTK tetrahedra;
+  \item calls \code{write\_metis\_mesh\_from\_vtk};
+  \item runs the installed \code{mpmetis} executable for the requested number
+        of partitions;
+  \item validates the zero-based element partition;
+  \item prepares the rank-local owned-plus-halo mesh cache.
+\end{enumerate}
+Generated partitions are stored under \code{output/partitions/}. Use
+\code{--repartition} to replace an existing partition and
+\code{--rebuild-distributed-mesh} to recreate the rank-local cache. An
+existing partition may be selected explicitly:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --partitions=2 \
+  --partition=output/partitions/periodic_box_2x1x1_nx4.mesh.epart.2
+\end{lstlisting}
+
+\subsection{Polynomial-order requirement}
+
+This driver requires DG order $N\geq2$. For $N=1$ on the default
+\code{nx4} mesh, all DG nodes have $x\in\{0,0.5,1,1.5,2\}$, where
+$\sin(2\pi x)=0$. Nodal interpolation would therefore produce an identically
+zero initial field even though the continuous analytical wave is nonzero
+inside each interval. The driver rejects \code{--order=1}.
+
+\subsection{Diagnostics and production output}
+
+The default output directory is
+\code{output/distributed\_periodic\_poisson\_bracket/}. The driver preserves
+the production I/O behavior of the PEC Poisson-bracket case:
+\begin{itemize}[leftmargin=*]
+  \item \code{energy.csv}: DG mass-matrix electric, magnetic, and total energy;
+  \item \code{quadrature\_diagnostics.csv}: independent-cubature field and
+        energy errors, optical chirality, electric and magnetic charge, and
+        linear and angular momentum;
+  \item \code{fields.pvd} and parallel VTU pieces: ParaView time series;
+  \item \code{integration\_points\_rankNNNN.csv}: final integration-point
+        numerical and analytical values;
+  \item \code{run\_metadata.toml} and \code{partition\_metadata.csv};
+  \item \code{checkpoints/stepNNNNNNNN/}: checksummed rank-local restart data.
+\end{itemize}
+
+At every cubature point, the driver evaluates the optical chirality density
+\[
+  \chi =
+  \frac{1}{2}\left(
+    \varepsilon\,\vect E\cdot\nabla\times\vect E
+    +\mu\,\vect H\cdot\nabla\times\vect H
+  \right).
+\]
+The curls are formed with the physical element derivative operators. The
+diagnostics file stores the distributed integral of $\chi$, its analytical
+value and error, and the numerical, analytical, and error $L^2$ norms of its
+density. The rank-local integration-point files store the corresponding
+pointwise densities. For the linearly polarized traveling wave used here,
+the analytical optical chirality is identically zero.
+
+Restart requires the same rank count, partition, and DG order:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --partitions=2 \
+  --restart=output/distributed_periodic_poisson_bracket/checkpoints/step00000100 \
+  --final-time=0.5
+\end{lstlisting}
+
+The implementation has been exercised with automatic two-way and four-way
+METIS partitions. In the short regression runs, the centered
+Poisson-bracket/ESPRK discretization preserved discrete total energy to
+roundoff and the integrated electric and magnetic charges remained near
+machine precision.
+
+\section{Distributed nonlinear PML pulse}
+
+The executable example
+\code{examples/distributed\_nonlinear\_pml\_maxwell.jl} demonstrates the
+formulation from \cref{sec:nonlinear-pml}. It generates
+$[0,2]\times[0,1]\times[0,1]$ in memory, partitions its $6n_x$ tetrahedra by
+$x$ slab, uses periodic boundaries in $y$ and $z$, and places polynomial
+nonlinear PML layers at both $x$ ends. The initial condition is a
+right-traveling, linearly polarized Gaussian pulse:
+\[
+  \vect E=(0,0,g(x)),\qquad
+  \vect H=(0,-g(x),0).
+\]
+The default Hesthaven--Warburton upwind flux supplies a robust outer
+termination beyond the PML.
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_nonlinear_pml_maxwell.jl \
+  --nx=8 --order=2 --rk-order=4 \
+  --final-time=1.3 --cfl=0.15 \
+  --pml-width=0.5 --sigma-max=12 \
+  --sigma-degree=2
+\end{lstlisting}
+
+Important options are:
+\begin{description}[style=nextline]
+  \item[\code{--nx}]
+  Number of structured $x$ cells; there are six tetrahedra per cell.
+  It must be at least the MPI rank count.
+
+  \item[\code{--pml-width}]
+  Width of each $x$-directed layer. It must lie in $(0,1)$ so the two
+  layers do not overlap.
+
+  \item[\code{--sigma-max} and \code{--sigma-degree}]
+  Peak damping and polynomial profile degree.
+
+  \item[\code{--regularization}]
+  Positive $\delta$ added to both nonlinear denominators.
+
+  \item[\code{--energy-every}]
+  Number of time steps between global-energy samples.
+\end{description}
+
+Rank zero writes
+\code{output/distributed\_nonlinear\_pml/energy.csv}, containing the time,
+step, electric energy, magnetic energy, total energy, and total-to-initial
+energy ratio. A representative two-rank run with the command above reduced
+the ratio to approximately $1.25\times10^{-2}$ by $t=1.3$, with no increase
+between sampled energy values.
 
 \section{Stationary PEC cube}
 
@@ -1160,6 +1717,156 @@ For this validation, the ESPRK order is fixed to spatial order plus one. A
 second CSV file with \code{\_3dec} inserted before the extension is also
 written.
 
+\section{Distributed Poisson-bracket convergence study}
+
+The MPI convergence driver uses PEC boundaries by default:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_poisson_bracket_maxwell.jl \
+  --cells=2,3,4,5 --orders=1,2,3
+\end{lstlisting}
+This default path uses in-memory structured unit-cube meshes. Each cube cell
+is split into six tetrahedra, and interior grid nodes are jittered by
+\code{--jitter} times the structured mesh spacing. Boundary nodes remain on
+the exact cube faces. The run uses a deterministic seed selected by
+\code{--seed}.
+
+Select PMC boundaries and the electromagnetic-dual PMC cavity eigenmode with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_poisson_bracket_maxwell.jl \
+  --boundary-condition=pmc \
+  --cells=2,3,4,5 --orders=1,2,3 \
+  --output=output/convergence_distributed_poisson_bracket_pmc.csv
+\end{lstlisting}
+The accepted values are \code{pec} and \code{pmc}, case-insensitively, with
+\code{pec} as the default. The output CSV records the selection in its
+\code{boundary\_condition} column.
+
+The same driver can generate an unstructured Gmsh mesh family on the unit
+cube:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_poisson_bracket_maxwell.jl \
+  --mesh-family=unstructured \
+  --nx-targets=2,4,8,16 \
+  --orders=2,3,4 \
+  --periods=1 \
+  --output=output/convergence_distributed_poisson_bracket_unstructured.csv
+\end{lstlisting}
+Rank zero invokes Gmsh on
+\code{examples/meshes/unit\_cube\_unstructured.geo}, writes VTK meshes under
+\code{--mesh-dir}, and then uses the same root-distribution and spatial
+partitioning path as the structured study. If \code{--mesh-dir} is omitted,
+the directory is named \code{convergence\_unstructured\_meshes} beside the
+output CSV directory.
+The convenience options are:
+\begin{itemize}[leftmargin=*]
+  \item \code{--mesh-family=structured|unstructured};
+  \item \code{--nx-target=N --levels=L}, which generates
+        \(N,2N,4N,\ldots\);
+  \item \code{--nx-targets=a,b,c}, which selects an explicit unstructured
+        family and overrides the base target and level count;
+  \item \code{--geo=PATH}, to select another parameterized Gmsh geometry;
+  \item \code{--mesh-dir=PATH}, to preserve generated VTK files in a chosen
+        directory.
+\end{itemize}
+For unstructured runs, the values printed as levels are Gmsh
+\code{NxTarget} values. They request \(h_{\mathrm{target}}=L_x/N_x\), but the
+rate calculation uses the measured volume-based
+\[
+  h_{\mathrm{char}}=
+  \left(\frac{|\Omega|}{N_{\mathrm{el}}}\right)^{1/3}.
+\]
+The CSV records \code{mesh\_family} in addition to
+\code{boundary\_condition}, so structured and unstructured cavity results are
+distinguishable in post-processing. The post-processing script also accepts
+older PEC CSV files without these newer columns.
+
+\section{Distributed periodic plane-wave convergence study}
+
+The periodic convergence driver uses the traveling plane wave from the
+distributed periodic experiment:
+\[
+  E=(0,0,-\sin(2\pi x-2\pi t)),\qquad
+  H=(0,\sin(2\pi x-2\pi t),0).
+\]
+Run one complete wave period with:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl \
+  --nx-targets=4,8,16 \
+  --orders=2,3,4 \
+  --periods=1 \
+  --output=output/convergence_distributed_periodic_poisson_bracket.csv
+\end{lstlisting}
+
+Rank zero invokes Gmsh on
+\code{examples/meshes/periodic\_box\_unstructured.geo}. The default
+\code{--nx-target=2 --levels=4} generates
+\[
+  N_x=2,4,8,16,\qquad
+  h_\ell=\frac{L_x}{N_x}
+        =h_0\,2^{-\ell},\quad \ell=0,1,2,3.
+\]
+Equivalently, \code{--nx-targets=4,8,16} selects an explicit family and is a
+better starting point for production convergence checks on the current
+unstructured geometry. The result is an unstructured periodic tetrahedral
+mesh family with uniformly halved requested mesh size. Boundary tags
+\(1\leftrightarrow2\), \(3\leftrightarrow4\), and \(5\leftrightarrow6\) are
+paired by the production distributed periodic exchange.
+
+The driver records two different mesh-size measures:
+\[
+  h_{\mathrm{target}}=\frac{L_x}{N_x},
+  \qquad
+  h_{\mathrm{char}}=
+  \left(\frac{|\Omega|}{N_{\mathrm{el}}}\right)^{1/3}.
+\]
+The first quantity is stored as \code{target\_h} and is the Gmsh request. The
+second quantity is stored as \code{characteristic\_h} and is measured from the
+generated distributed mesh. Observed rates are computed from
+\code{characteristic\_h}:
+\[
+  p =
+  \frac{\log(e_{\mathrm{coarse}}/e_{\mathrm{fine}})}
+       {\log(h_{\mathrm{char,coarse}}/h_{\mathrm{char,fine}})}.
+\]
+This is deliberate. Independently generated unstructured Gmsh meshes are not
+nested, and doubling \code{NxTarget} does not guarantee that the realized
+tetrahedral volume scale is exactly halved. The console therefore also prints
+the ratios of \code{target\_h} and \code{characteristic\_h}. CSV files
+generated before this convention should be regenerated before rate
+comparisons.
+
+The CSV schema matches the cavity convergence driver and records
+\code{periodic} in the \code{boundary\_condition} column. It additionally
+records \(L^2\) errors and rates for every component
+\(E_x,E_y,E_z,H_x,H_y,H_z\), aggregate electric, magnetic, and total errors,
+\code{h\_min}, \code{h\_max}, energy error, charge diagnostics, and sampled
+\(L^\infty\) errors. For this analytical wave, the active components are
+\(E_z\) and \(H_y\). The exact components
+\(E_x,E_y,H_x,H_z\) are zero, so their norms measure transverse
+polarization leakage. The console reports the combined leakage measures
+\[
+  \left(\left\lVert E_x\right\rVert_{L^2}^2+
+        \left\lVert E_y\right\rVert_{L^2}^2\right)^{1/2},
+  \qquad
+  \left(\left\lVert H_x\right\rVert_{L^2}^2+
+        \left\lVert H_z\right\rVert_{L^2}^2\right)^{1/2}.
+\]
+
+The finest refinement pair is checked against strict aggregate targets:
+electric rate \(N+1\) and magnetic rate \(N\), with the same half-order
+acceptance tolerance as the cavity study. This is a regression target, not a
+generic theorem for every unstructured tetrahedral family. On general
+unstructured meshes the exact-zero components can converge closer to order
+\(N\); if those leakage components dominate the vector norm, the aggregate
+electric rate can fail the strict \(N+1\) target even when the active
+\(E_z\) and \(H_y\) plane-wave components converge at the expected rate.
+Inspect the component table, leakage table, and mesh-size-ratio table before
+interpreting a failed strict verdict.
+
 \chapter{Testing}
 
 \section{Package tests}
@@ -1209,17 +1916,36 @@ The two-rank test compares distributed and serial results for:
   \item Hesthaven--Warburton central flux;
   \item Hesthaven--Warburton upwind flux;
   \item Poisson-bracket formulation;
+  \item PEC and PMC physical boundaries;
   \item exchanged ghost traces;
   \item zero ghost residuals;
   \item global energy;
   \item one explicit RK3 step;
   \item one partitioned symplectic RK2 step.
+  \item rank-local mesh persistence and reload;
+  \item checkpoint/restart field round trips;
+  \item run and partition metadata generation.
 \end{itemize}
 
 The four-rank chain test exercises ranks with two neighbors and verifies
 upwind right-hand sides, traces, ghost residuals, and RK3 stepping. The file
 also verifies that root input errors propagate collectively without an MPI
 deadlock.
+
+\section{Nonlinear PML tests}
+
+The package test suite checks the nonlinear source against the component
+equations in Appendix A of the paper, verifies the nonpositive pointwise
+energy contribution, exercises zero-field regularization, and confirms that a
+zero damping profile reproduces the ordinary Maxwell right-hand side.
+
+The distributed test is:
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. test/test_mpi_nonlinear_pml.jl
+\end{lstlisting}
+It verifies the Poisson-bracket PML source on owned elements, zero ghost
+residuals, and agreement between serial and distributed RK4 updates. The
+serial test also verifies nonlinear-PML energy decay.
 
 \section{Recommended pre-commit sequence}
 
@@ -1230,6 +1956,7 @@ mpiexec -n 2 julia --project=. test/test_mpi_metis_partition.jl
 mpiexec -n 4 julia --project=. test/test_mpi_metis_partition.jl
 mpiexec -n 2 julia --project=. test/test_mpi_distributed_maxwell.jl
 mpiexec -n 4 julia --project=. test/test_mpi_distributed_maxwell.jl
+mpiexec -n 2 julia --project=. test/test_mpi_nonlinear_pml.jl
 mpiexec -n 2 julia --project=. examples/distributed_maxwell.jl
 \end{lstlisting}
 
@@ -1324,19 +2051,88 @@ array. \api{write_partition_piece_vtks} writes one owned-element mesh per
 partition. These are mesh visualization utilities; they do not write the
 distributed Maxwell solution.
 
-\section{Distributed solution output}
+\section{Distributed mesh files}
 
-A general MPI solution gather or parallel VTK writer is not yet part of the
-public API. A case-specific writer should:
+The first production run may prepare one owned-plus-halo mesh shard per MPI
+rank:
 
-\begin{enumerate}[leftmargin=*]
-  \item write owned elements only;
-  \item preserve global element IDs;
-  \item avoid writing ghost elements as physical duplicates;
-  \item generate one file per rank or use a parallel VTK metadata file;
-  \item represent DG discontinuities explicitly, normally by duplicating
-        element-local points.
-\end{enumerate}
+\begin{lstlisting}[language=julia]
+prepare_distributed_mesh_partition(
+    root_mesh,
+    root_partition,
+    "mesh_cache";
+    comm = MPI.COMM_WORLD,
+)
+\end{lstlisting}
+
+Later runs bypass global mesh loading and root distribution:
+
+\begin{lstlisting}[language=julia]
+distributed_dg = build_distributed_dg_from_partition(
+    "mesh_cache",
+    order;
+    comm = MPI.COMM_WORLD,
+)
+\end{lstlisting}
+
+The directory contains \code{mesh\_manifest.toml} and one checksummed binary
+piece per rank. All ranks must use the same shared filesystem and MPI rank
+count used when the cache was prepared.
+
+\section{Checkpoint and restart}
+
+\begin{lstlisting}[language=julia]
+write_distributed_checkpoint(
+    "checkpoints/step00000100",
+    U,
+    distributed_dg;
+    step = 100,
+    time = 0.1,
+    dt = 1.0e-3,
+)
+
+U, state = load_distributed_checkpoint(
+    "checkpoints/step00000100",
+    distributed_dg,
+)
+\end{lstlisting}
+
+Each rank writes only its owned Maxwell degrees of freedom. The manifest is
+published atomically after every piece succeeds. Loading validates checksums,
+rank count, DG order, and owned global element IDs before refreshing ghost face
+traces. Restart currently requires the same rank count and partition.
+
+\section{ParaView time series}
+
+The distributed Poisson-bracket experiment writes owned elements only,
+preserves global element IDs and owner ranks, and represents DG discontinuities
+with element-local points. Use:
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --paraview-every=10
+\end{lstlisting}
+
+Open \code{fields.pvd} in ParaView. It indexes
+\code{fields/fields\_stepNNNNNNNN.pvtu}. The periodic driver writes each
+element as a VTK Lagrange tetrahedron containing every DG node, so orders
+\(N>1\) are not reduced to a four-corner linear visualization. Its rank-local
+VTU pieces contain the numerical, exact, and error vectors for \(E\) and
+\(H\), their magnitudes, global element IDs, owner rank, polynomial order, and
+physical time.
+
+\section{Run and partition metadata}
+
+Every production experiment writes:
+
+\begin{itemize}[leftmargin=*]
+  \item \code{run\_metadata.toml}: configuration, Julia version, MPI size,
+        time-step data, elapsed solve time, and final checkpoint;
+  \item \code{partition\_metadata.csv}: owned and ghost elements, local nodes,
+        neighbor ranks, interface-face counts, and global element ranges;
+  \item \code{paraview\_series.csv}: step, time, and PVTU dataset index.
+\end{itemize}
 
 \chapter{Diagnostics and Troubleshooting}
 
@@ -1347,6 +2143,10 @@ public API. A case-specific writer should:
         integration sequence.
   \item Confirm the launch rank count matches the partition file.
   \item Confirm MPI.jl and \code{mpiexec} use compatible MPI libraries.
+        Inspect the configured backend with
+        \code{julia --project=. -e 'using MPI; MPI.versioninfo()'} and use
+        \code{mpiexecjl} when the system launcher targets a different MPI
+        implementation.
   \item Do not let only rank zero call \code{distributed\_maxwell\_energy};
         it contains an \code{Allreduce}.
   \item Ensure all ranks use the same communication tag for a given exchange.
@@ -1373,6 +2173,26 @@ public API. A case-specific writer should:
   \item Register every physical PEC tag explicitly.
   \item Remember that tag 10 is a convention in the examples, not a hard
         requirement of the solver.
+  \item For the periodic box driver, verify tags $1\leftrightarrow2$,
+        $3\leftrightarrow4$, and $5\leftrightarrow6$ and matching translated
+        triangulations.
+  \item Periodic tags belong in the periodic exchange and should map to
+        \code{MaxwellBC\_None} in the physical-boundary registry.
+\end{itemize}
+
+\section{Periodic driver fails during partitioning}
+
+\begin{itemize}[leftmargin=*]
+  \item Confirm \code{mpmetis} is installed and visible in \code{PATH}.
+  \item Confirm \code{--partitions} equals the \code{mpiexec -n} rank count.
+  \item Use \code{--partitions=N} for the rank count. The singular option
+        \code{--partition=PATH} is only for an existing partition file.
+  \item If a partition contains a different number of entries than the mesh
+        has tetrahedra, regenerate it for that mesh with
+        \code{--repartition}.
+  \item Use \code{--repartition} after replacing the source mesh.
+  \item Use \code{--rebuild-distributed-mesh} after changing the partition.
+  \item Use DG order two or higher for the supplied traveling wave.
 \end{itemize}
 
 \section{Unstable time integration}
@@ -1410,13 +2230,13 @@ public API. A case-specific writer should:
 \section{Memory use is larger than expected}
 
 \begin{itemize}[leftmargin=*]
-  \item Use \code{build\_distributed\_dg\_from\_root}, not the replicated
-        constructor.
+  \item Use \code{build\_distributed\_dg\_from\_partition} for repeated runs,
+        or \code{build\_distributed\_dg\_from\_root} during preparation.
   \item Remember that each rank stores owned elements plus one face halo.
   \item Higher polynomial order increases storage in proportion to $N_p$.
   \item Explicit RK methods store several complete right-hand sides.
-  \item Root temporarily retains the complete global mesh and partition during
-        distribution.
+  \item Root temporarily retains the complete global mesh and partition only
+        while preparing rank-local mesh files.
 \end{itemize}
 
 \chapter{Current Limitations and Roadmap}
@@ -1427,17 +2247,21 @@ public API. A case-specific writer should:
   \item Three-dimensional tetrahedral meshes only.
   \item Affine straight-sided tetrahedral geometry.
   \item Source-free Maxwell equations.
-  \item Scalar, run-wide $\varepsilon$ and $\mu$ in the Maxwell operator.
-  \item PEC is the implemented physical boundary condition for the MPI
-        Maxwell path.
-  \item Distributed periodic boundaries are not implemented.
-  \item No PML.
-  \item No material-interface Riemann solver for discontinuous impedance.
+  \item Material coefficients are isotropic and piecewise constant per
+        tetrahedron; curved or nodally varying tensors are not implemented.
+  \item The characteristic absorbing boundary is first order. It is separate
+        from the nonlinear PML and remains useful as an outer termination.
+  \item The nonlinear PML currently supports only the dimensionless
+        homogeneous-vacuum system with $\varepsilon=\mu=1$; heterogeneous
+        material coupling and anisotropic damping tensors are not implemented.
+  \item The nonlinear PML path supports explicit RK integration, not ESPRK,
+        because damping breaks the conservative Poisson-bracket structure.
   \item No adaptive mesh refinement.
   \item No distributed mesh repartitioning during a run.
-  \item No general parallel field-output layer.
-  \item Root-only loading removes global mesh replication from workers but
-        root still reads and partitions the complete mesh.
+  \item Checkpoint restart requires the same MPI rank count and partition.
+  \item Rank-local mesh files currently require a shared filesystem.
+  \item Initial mesh-cache preparation still reads and partitions the complete
+        mesh on root; subsequent runs are rank-local.
   \item Communication is nonblocking, but currently completed before local DG
         evaluation; volume work is not yet overlapped with trace exchange.
   \item Stored ghost elements currently pass through local volume evaluation
@@ -1447,18 +2271,18 @@ public API. A case-specific writer should:
 \section{Recommended next development stages}
 
 \begin{enumerate}[leftmargin=*]
-  \item Add distributed periodic face pairing.
-  \item Add sources and spatially varying materials.
-  \item Add material-jump fluxes using side-dependent impedance and
-        admittance.
-  \item Add PML.
+  \item Add impressed electric and magnetic sources.
+  \item Add anisotropic and within-element varying material tensors.
+  \item Extend the nonlinear PML to heterogeneous materials and validate
+        reflection errors for oblique incidence and corner layers.
+  \item Add alternative higher-order absorbing boundary conditions.
   \item Split the right-hand side into owned volume work and interface surface
         work, then overlap communication.
   \item Skip ghost volume computation.
-  \item Add parallel solution output.
   \item Add MPI strong- and weak-scaling benchmarks.
-  \item Replace root assembly with direct per-rank partition-file loading for
-        meshes too large for one rank.
+  \item Add repartitioning restart and portable long-term checkpoint formats.
+  \item Add direct parallel ingestion from partition-aware mesh formats so
+        cache preparation also avoids root assembly.
 \end{enumerate}
 
 \appendix
@@ -1481,6 +2305,28 @@ upwind flux. \\
 \api{PoissonBracketFormulation()} & Partitioned weak Maxwell operator with central
 flux. \\
 \api{MaxwellBoundaryRegistry(dict)} & Map integer boundary tags to boundary kinds. \\
+\api{MaxwellMaterial(epsilon,mu)} & Define one positive isotropic material. \\
+\api{maxwell\_element\_materials(...)} & Map mesh material IDs to element
+permittivity and permeability arrays. \\
+\api{MaxwellNonlinearPML(...)} & Store nodal directional damping, nonlinear
+parameter $a$, and denominator regularization. \\
+\api{polynomial\_pml\_sigma(...)} & Evaluate a one-sided polynomial damping
+profile. \\
+\api{build\_maxwell\_nonlinear\_pml(...)} & Sample three damping functions at
+the local DG nodes. \\
+\api{nonlinear\_pml\_source(...)} & Evaluate the six nonlinear PML source
+components at one point. \\
+\api{maxwell\_nonlinear\_pml\_rhs!(...)} & Assemble ordinary Maxwell terms and
+the serial or distributed nonlinear PML source. \\
+\api{distributed\_maxwell\_nonlinear\_pml\_rk\_step!(...)} & Advance one
+distributed explicit RK step with nonperiodic PML boundaries. \\
+\api{distributed\_periodic\_maxwell\_nonlinear\_pml\_rk\_step!(...)} & Advance
+one distributed explicit RK step with periodic face pairs and nonlinear PML. \\
+\api{run\_maxwell\_nonlinear\_pml\_time\_steps!(...)} & Advance a serial
+Poisson-bracket nonlinear-PML problem with explicit RK. \\
+\api{run\_distributed\_maxwell\_nonlinear\_pml\_time\_steps!(...)} & Advance a
+distributed Poisson-bracket nonlinear-PML problem with explicit RK and global
+energy reporting. \\
 \api{interpolate_maxwell_field(...)} & Sample analytic electric and magnetic
 functions at DG nodes. \\
 \api{estimate_maxwell_dt(...)} & Compute the volume-to-surface CFL estimate. \\
@@ -1496,6 +2342,20 @@ global arrays. \\
 replicated. \\
 \api{build_distributed_dg_from_root(...)} & Distribute rank-local DG meshes from
 a root-owned global mesh or root-read files. \\
+\api{build\_distributed\_periodic\_maxwell\_exchange(...)} & Pair periodic
+boundary faces and allocate periodic trace communication. \\
+\api{distributed\_maxwell\_invariants(...)} & Reduce energy, charge, linear
+momentum, and angular momentum over owned elements. \\
+\api{prepare_distributed_mesh_partition(...)} & Write one checksummed
+owned-plus-halo mesh piece per rank. \\
+\api{build_distributed_dg_from_partition(...)} & Build DG by independently
+loading one prepared mesh piece per rank. \\
+\api{write_distributed_checkpoint(...)} & Atomically write owned Maxwell fields
+and restart metadata. \\
+\api{load_distributed_checkpoint(...)} & Validate and restore a same-partition
+Maxwell checkpoint. \\
+\api{write_distributed_run_metadata(...)} & Write TOML run metadata and CSV
+partition metadata. \\
 \api{exchange_maxwell_ghost_traces!(...)} & Exchange six Maxwell face traces. \\
 \api{distributed_maxwell_energy(...)} & Compute owned-only local energy followed
 by a global sum. \\
@@ -1522,12 +2382,56 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 # Distributed Maxwell demo
 mpiexec -n 2 julia --project=. examples/distributed_maxwell.jl
 
+# Distributed nonlinear PML pulse
+mpiexec -n 2 julia --project=. \
+  examples/distributed_nonlinear_pml_maxwell.jl \
+  --nx=8 --order=2 --final-time=1.3 \
+  --pml-width=0.5 --sigma-max=12
+
+# Production Poisson-bracket run with time-series output and checkpoints
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --paraview-every=10 --checkpoint-every=50
+
+# PMC Poisson-bracket cavity
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --boundary-condition=pmc
+
+# Poisson-bracket cavity with six-sided nonlinear PML
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --boundary-condition=pmc \
+  --pml-width=0.2 --pml-sigma-max=12 --rk-order=4
+
+# Distributed PMC convergence study
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_poisson_bracket_maxwell.jl \
+  --boundary-condition=pmc \
+  --output=output/convergence_distributed_poisson_bracket_pmc.csv
+
+# Distributed unstructured cavity convergence study
+mpiexec -n 2 julia --project=. \
+  examples/convergence_distributed_poisson_bracket_maxwell.jl \
+  --mesh-family=unstructured \
+  --nx-targets=2,4,8,16 \
+  --orders=2,3,4 \
+  --periods=1 \
+  --output=output/convergence_distributed_poisson_bracket_unstructured.csv
+
+# Restart to an absolute target time
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --restart=output/distributed_poisson_bracket/checkpoints/step00000050 \
+  --final-time=0.5
+
 # MPI tests
 mpiexec -n 2 julia --project=. test/test_mpi_face_permutation.jl
 mpiexec -n 2 julia --project=. test/test_mpi_metis_partition.jl
 mpiexec -n 4 julia --project=. test/test_mpi_metis_partition.jl
 mpiexec -n 2 julia --project=. test/test_mpi_distributed_maxwell.jl
 mpiexec -n 4 julia --project=. test/test_mpi_distributed_maxwell.jl
+mpiexec -n 2 julia --project=. test/test_mpi_nonlinear_pml.jl
 
 # Mesh inspection
 julia --project=. examples/solver/read_vtu_mesh.jl mesh.vtu
@@ -1577,6 +2481,8 @@ Record the following information with every reported result:
   \item formulation and flux;
   \item RK or ESPRK order and partition order;
   \item $\varepsilon$, $\mu$, CFL, $\Delta t$, and number of steps;
+  \item PML interface locations, $\sigma_{\max}$, profile degree, $a$, and
+        denominator regularization when nonlinear PML damping is active;
   \item initial condition and boundary registry;
   \item initial/final energy and error norms;
   \item output and benchmark methodology.

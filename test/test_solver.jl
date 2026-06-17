@@ -1,4 +1,5 @@
 using Test
+using LinearAlgebra
 using DiscoGMPI
 
 @testset "DiscoGMPI loads" begin
@@ -689,4 +690,321 @@ end
     )
 
     @test DiscoGMPI.max_abs_maxwell_field(U6) <= 1e-14
+end
+
+@testset "Spatial Maxwell materials" begin
+    @test_throws ArgumentError MaxwellMaterial(0.0, 1.0)
+    @test_throws ArgumentError MaxwellElementMaterials([1.0], [1.0, 2.0])
+
+    mesh = two_tet_boundary_mesh()
+    dg = DGDiscretization(mesh, 1)
+    registry = empty_maxwell_boundary_registry()
+    formulation = PoissonBracketFormulation()
+    Efun = (x, y, z) -> (y + z, z + x, x + y)
+    Hfun = (x, y, z) -> (y - z, z - x, x - y)
+    U = interpolate_maxwell_field(mesh, dg.ref, Efun, Hfun)
+    scalar_rhs = DiscoGMPI.similar_maxwell_rhs(U)
+    material_rhs = DiscoGMPI.similar_maxwell_rhs(U)
+    materials = homogeneous_maxwell_materials(2)
+
+    maxwell_rhs!(
+        scalar_rhs,
+        U,
+        dg,
+        registry,
+        formulation;
+        ε = 1.0,
+        μ = 1.0,
+    )
+    maxwell_rhs!(
+        material_rhs,
+        U,
+        dg,
+        registry,
+        formulation,
+        materials,
+    )
+    @test max_abs_rhs_difference(scalar_rhs, material_rhs) < 1e-12
+
+    material_table = Dict(
+        1 => MaxwellMaterial(2.0, 3.0),
+        2 => MaxwellMaterial(4.0, 5.0),
+    )
+    heterogeneous = maxwell_element_materials([1, 2], material_table)
+    zero = interpolate_maxwell_field(
+        mesh,
+        dg.ref,
+        (x, y, z) -> (0.0, 0.0, 0.0),
+        (x, y, z) -> (0.0, 0.0, 0.0),
+    )
+    zero_rhs = DiscoGMPI.similar_maxwell_rhs(zero)
+    maxwell_rhs!(
+        zero_rhs,
+        zero,
+        dg,
+        registry,
+        formulation,
+        heterogeneous,
+    )
+    @test max_abs_rhs_offset(zero_rhs, 0.0) < 1e-14
+
+    invariants = maxwell_invariants(U, dg, heterogeneous)
+    @test invariants.energy.total > 0.0
+    @test all(isfinite, invariants.linear_momentum)
+    @test all(isfinite, invariants.angular_momentum)
+end
+
+@testset "PMC and absorbing Maxwell boundary states" begin
+    minus = (
+        Ex = [1.0],
+        Ey = [2.0],
+        Ez = [3.0],
+        Hx = [4.0],
+        Hy = [5.0],
+        Hz = [6.0],
+    )
+    normal = (1.0, 0.0, 0.0)
+
+    pmc = DiscoGMPI.maxwell_boundary_plus_trace(
+        minus,
+        normal,
+        MaxwellBC_PMC,
+    )
+    @test pmc.Ex == minus.Ex
+    @test pmc.Hx == [4.0]
+    @test pmc.Hy == [-5.0]
+    @test pmc.Hz == [-6.0]
+
+    absorbing = DiscoGMPI.maxwell_boundary_plus_trace(
+        minus,
+        normal,
+        MaxwellBC_Absorbing;
+        ε = 1.0,
+        μ = 4.0,
+    )
+    @test absorbing.Ex == [1.0]
+    @test absorbing.Ey == [12.0]
+    @test absorbing.Ez == [-10.0]
+    @test absorbing.Hx == [4.0]
+    @test absorbing.Hy == [-1.5]
+    @test absorbing.Hz == [1.0]
+
+    mesh = single_tet_boundary_mesh()
+    dg = DGDiscretization(mesh, 1)
+    zero = interpolate_maxwell_field(
+        mesh,
+        dg.ref,
+        (x, y, z) -> (0.0, 0.0, 0.0),
+        (x, y, z) -> (0.0, 0.0, 0.0),
+    )
+    for kind in (MaxwellBC_PMC, MaxwellBC_Absorbing)
+        for formulation in (
+            HesthavenWarburtonFormulation(),
+            PoissonBracketFormulation(),
+        )
+            rhs = DiscoGMPI.similar_maxwell_rhs(zero)
+            registry = MaxwellBoundaryRegistry(Dict(10 => kind))
+            maxwell_rhs!(
+                rhs,
+                zero,
+                dg,
+                registry,
+                formulation;
+                ε = 2.0,
+                μ = 3.0,
+            )
+            @test max_abs_rhs_offset(rhs, 0.0) < 1e-14
+        end
+    end
+end
+
+@testset "Abarbanel-Gottlieb-Hesthaven nonlinear PML" begin
+    electric = (1.2, -0.7, 0.9)
+    magnetic = (-0.4, 1.1, 0.3)
+    sigma = (0.2, 0.5, 0.8)
+    regularization = 1e-12
+    source = nonlinear_pml_source(
+        electric,
+        magnetic,
+        sigma;
+        a = 0.5,
+        regularization = regularization,
+    )
+
+    Ex, Ey, Ez = electric
+    Hx, Hy, Hz = magnetic
+    sigma_x, sigma_y, sigma_z = sigma
+    cross_x = Ey * Hz - Ez * Hy
+    cross_y = Ez * Hx - Ex * Hz
+    cross_z = Ex * Hy - Ey * Hx
+    denominator =
+        0.5 * (
+            Ex^2 + Ey^2 + Ez^2 +
+            Hx^2 + Hy^2 + Hz^2
+        ) + regularization
+
+    appendix_electric = (
+        (sigma_y * cross_y * Hz - sigma_z * cross_z * Hy) /
+        denominator,
+        (sigma_z * cross_z * Hx - sigma_x * cross_x * Hz) /
+        denominator,
+        (sigma_x * cross_x * Hy - sigma_y * cross_y * Hx) /
+        denominator,
+    )
+    appendix_magnetic = (
+        (-sigma_y * cross_y * Ez + sigma_z * cross_z * Ey) /
+        denominator,
+        (-sigma_z * cross_z * Ex + sigma_x * cross_x * Ez) /
+        denominator,
+        (-sigma_x * cross_x * Ey + sigma_y * cross_y * Ex) /
+        denominator,
+    )
+
+    @test all(
+        isapprox.(source.electric, appendix_electric; atol = 1e-14),
+    )
+    @test all(
+        isapprox.(source.magnetic, appendix_magnetic; atol = 1e-14),
+    )
+
+    energy_rate =
+        dot(electric, source.electric) +
+        dot(magnetic, source.magnetic)
+    expected_rate =
+        -2.0 * (
+            sigma_x * cross_x^2 +
+            sigma_y * cross_y^2 +
+            sigma_z * cross_z^2
+        ) / denominator
+    @test energy_rate ≈ expected_rate atol = 1e-14
+    @test energy_rate < 0.0
+
+    zero_source = nonlinear_pml_source(
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+        sigma,
+    )
+    @test zero_source.electric == (0.0, 0.0, 0.0)
+    @test zero_source.magnetic == (0.0, 0.0, 0.0)
+
+    amplitude = 2.0
+    plane_wave_source = nonlinear_pml_source(
+        (0.0, 0.0, amplitude),
+        (0.0, -amplitude, 0.0),
+        (3.0, 0.0, 0.0);
+        regularization = regularization,
+    )
+    damping = 3.0 * amplitude^2 / (amplitude^2 + regularization)
+    @test plane_wave_source.electric[3] ≈ -damping * amplitude
+    @test plane_wave_source.magnetic[2] ≈ damping * amplitude
+
+    @test polynomial_pml_sigma(
+        1.0,
+        1.5,
+        2.0;
+        sigma_max = 8.0,
+    ) == 0.0
+    @test polynomial_pml_sigma(
+        1.75,
+        1.5,
+        2.0;
+        sigma_max = 8.0,
+    ) ≈ 2.0
+    @test polynomial_pml_sigma(
+        2.5,
+        1.5,
+        2.0;
+        sigma_max = 8.0,
+    ) == 8.0
+    @test polynomial_pml_sigma(
+        0.25,
+        0.5,
+        0.0;
+        sigma_max = 8.0,
+    ) ≈ 2.0
+
+    mesh = two_tet_boundary_mesh()
+    dg = DGDiscretization(mesh, 1)
+    U = interpolate_maxwell_field(
+        mesh,
+        dg.ref,
+        (x, y, z) -> (y + z, z + x, x + y),
+        (x, y, z) -> (y - z, z - x, x - y),
+    )
+    pml = build_maxwell_nonlinear_pml(dg)
+    @test size(pml.sigma_x) == size(U.Ex)
+    base_rhs = DiscoGMPI.similar_maxwell_rhs(U)
+    pml_rhs = DiscoGMPI.similar_maxwell_rhs(U)
+    registry = empty_maxwell_boundary_registry()
+    formulation = HesthavenWarburtonFormulation()
+    maxwell_rhs!(
+        base_rhs,
+        U,
+        dg,
+        registry,
+        formulation,
+    )
+    maxwell_nonlinear_pml_rhs!(
+        pml_rhs,
+        U,
+        dg,
+        registry,
+        formulation,
+        pml,
+    )
+    @test max_abs_rhs_difference(base_rhs, pml_rhs) < 1e-14
+
+    poisson_bracket = PoissonBracketFormulation()
+    maxwell_rhs!(
+        base_rhs,
+        U,
+        dg,
+        registry,
+        poisson_bracket,
+    )
+    maxwell_nonlinear_pml_rhs!(
+        pml_rhs,
+        U,
+        dg,
+        registry,
+        poisson_bracket,
+        pml,
+    )
+    @test max_abs_rhs_difference(base_rhs, pml_rhs) < 1e-14
+
+    damped = interpolate_maxwell_field(
+        mesh,
+        dg.ref,
+        (x, y, z) -> (0.0, 0.0, 2.0),
+        (x, y, z) -> (0.0, -2.0, 0.0),
+    )
+    damped_pml = build_maxwell_nonlinear_pml(
+        dg;
+        sigma_x = (x, y, z) -> 10.0,
+    )
+    energy_before = maxwell_energy(damped, dg.ref, dg.mappings).total
+    run_maxwell_nonlinear_pml_time_steps!(
+        damped,
+        dg,
+        empty_maxwell_boundary_registry(),
+        poisson_bracket,
+        damped_pml;
+        rk_order = 4,
+        dt = 1e-4,
+        nsteps = 1,
+        energy_every = 1,
+    )
+    energy_after = maxwell_energy(damped, dg.ref, dg.mappings).total
+    @test energy_after < energy_before
+
+    @test_throws ArgumentError MaxwellNonlinearPML(
+        zeros(1, 1),
+        zeros(1, 2),
+        zeros(1, 1),
+    )
+    @test_throws ArgumentError MaxwellNonlinearPML(
+        fill(-1.0, 1, 1),
+        zeros(1, 1),
+        zeros(1, 1),
+    )
 end

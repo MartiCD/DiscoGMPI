@@ -92,6 +92,120 @@ function pec_boundary_plus_trace(
     )
 end
 
+function pmc_boundary_plus_trace(
+    minus_trace,
+    n::NTuple{3, Float64},
+)
+    Nfp = length(minus_trace.Hx)
+
+    ExP = copy(minus_trace.Ex)
+    EyP = copy(minus_trace.Ey)
+    EzP = copy(minus_trace.Ez)
+
+    HxP = similar(minus_trace.Hx)
+    HyP = similar(minus_trace.Hy)
+    HzP = similar(minus_trace.Hz)
+
+    for q in 1:Nfp
+        HxP[q], HyP[q], HzP[q] = reflect_pec_E(
+            minus_trace.Hx[q],
+            minus_trace.Hy[q],
+            minus_trace.Hz[q],
+            n,
+        )
+    end
+
+    return (
+        Ex = ExP,
+        Ey = EyP,
+        Ez = EzP,
+        Hx = HxP,
+        Hy = HyP,
+        Hz = HzP,
+    )
+end
+
+function absorbing_boundary_plus_trace(
+    minus_trace,
+    n::NTuple{3, Float64};
+    ε::Float64,
+    μ::Float64,
+)
+    Z = maxwell_impedance(; ε = ε, μ = μ)
+    Nfp = length(minus_trace.Ex)
+
+    ExP = similar(minus_trace.Ex)
+    EyP = similar(minus_trace.Ey)
+    EzP = similar(minus_trace.Ez)
+    HxP = similar(minus_trace.Hx)
+    HyP = similar(minus_trace.Hy)
+    HzP = similar(minus_trace.Hz)
+
+    for q in 1:Nfp
+        Ex = minus_trace.Ex[q]
+        Ey = minus_trace.Ey[q]
+        Ez = minus_trace.Ez[q]
+        Hx = minus_trace.Hx[q]
+        Hy = minus_trace.Hy[q]
+        Hz = minus_trace.Hz[q]
+
+        ndotE = n[1] * Ex + n[2] * Ey + n[3] * Ez
+        ndotH = n[1] * Hx + n[2] * Hy + n[3] * Hz
+
+        nxH = (
+            n[2] * Hz - n[3] * Hy,
+            n[3] * Hx - n[1] * Hz,
+            n[1] * Hy - n[2] * Hx,
+        )
+        nxE = (
+            n[2] * Ez - n[3] * Ey,
+            n[3] * Ex - n[1] * Ez,
+            n[1] * Ey - n[2] * Ex,
+        )
+
+        # Zero incoming characteristic while retaining normal components.
+        ExP[q] = ndotE * n[1] - Z * nxH[1]
+        EyP[q] = ndotE * n[2] - Z * nxH[2]
+        EzP[q] = ndotE * n[3] - Z * nxH[3]
+
+        HxP[q] = ndotH * n[1] + nxE[1] / Z
+        HyP[q] = ndotH * n[2] + nxE[2] / Z
+        HzP[q] = ndotH * n[3] + nxE[3] / Z
+    end
+
+    return (
+        Ex = ExP,
+        Ey = EyP,
+        Ez = EzP,
+        Hx = HxP,
+        Hy = HyP,
+        Hz = HzP,
+    )
+end
+
+function maxwell_boundary_plus_trace(
+    minus_trace,
+    normal::NTuple{3, Float64},
+    kind::MaxwellBoundaryKind;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    if kind == MaxwellBC_PEC
+        return pec_boundary_plus_trace(minus_trace, normal)
+    elseif kind == MaxwellBC_PMC
+        return pmc_boundary_plus_trace(minus_trace, normal)
+    elseif kind == MaxwellBC_Absorbing
+        return absorbing_boundary_plus_trace(
+            minus_trace,
+            normal;
+            ε = ε,
+            μ = μ,
+        )
+    end
+
+    throw(ArgumentError("Boundary kind $kind does not define an exterior trace."))
+end
+
 function interpolate_maxwell_field(
     mesh::RawVTUMesh,
     ref::ReferenceTet,

@@ -557,12 +557,18 @@ function maxwell_boundary_surface_rhs!(
         if kind == MaxwellBC_None
             continue
 
-        elseif kind == MaxwellBC_PEC
+        elseif kind in (MaxwellBC_PEC, MaxwellBC_PMC, MaxwellBC_Absorbing)
             tr = ff.trace
             n = ff.normal
 
             minus = maxwell_boundary_minus_trace(U, tr)
-            plus = pec_boundary_plus_trace(minus, n)
+            plus = maxwell_boundary_plus_trace(
+                minus,
+                n,
+                kind;
+                ε = ε,
+                μ = μ,
+            )
 
             flux = maxwell_surface_flux_values(
                 minus,
@@ -1172,12 +1178,18 @@ function maxwell_boundary_surface_face_rhs!(
     if kind == MaxwellBC_None
         return rhs
 
-    elseif kind == MaxwellBC_PEC
+    elseif kind in (MaxwellBC_PEC, MaxwellBC_PMC, MaxwellBC_Absorbing)
         tr = ff.trace
         n = ff.normal
 
         minus = maxwell_boundary_minus_trace(U, tr)
-        plus = pec_boundary_plus_trace(minus, n)
+        plus = maxwell_boundary_plus_trace(
+            minus,
+            n,
+            kind;
+            ε = ε,
+            μ = μ,
+        )
 
         flux = maxwell_surface_flux_values(
             minus,
@@ -1312,12 +1324,18 @@ function maxwell_boundary_surface_face_rhs!(
     if kind == MaxwellBC_None
         return rhs
 
-    elseif kind == MaxwellBC_PEC
+    elseif kind in (MaxwellBC_PEC, MaxwellBC_PMC, MaxwellBC_Absorbing)
         tr = ff.trace
         n = ff.normal
 
         minus = maxwell_boundary_minus_trace(U, tr)
-        plus = pec_boundary_plus_trace(minus, n)
+        plus = maxwell_boundary_plus_trace(
+            minus,
+            n,
+            kind;
+            ε = ε,
+            μ = μ,
+        )
 
         flux = maxwell_poisson_bracket_surface_flux_values(
             minus,

@@ -12,6 +12,53 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+params = {
+    "text.usetex": True,
+    "font.family": "serif",
+    "font.serif": ["TeX Gyre Schola"],
+    "font.size": 16,
+    "axes.labelsize": 18,
+    "axes.titlesize": 18,
+    "legend.fontsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+
+    "axes.linewidth": 1.0,
+    "axes.grid": True,
+    "axes.grid.which": "both",
+    "grid.color": "0.85",
+    "grid.linestyle": "--",
+    "grid.linewidth": 0.8,
+    "axes.axisbelow": True,
+
+    "lines.linewidth": 2.0,
+    "lines.markersize": 6,
+    "lines.markeredgewidth": 0.8,
+
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.major.size": 6,
+    "ytick.major.size": 6,
+    "xtick.minor.size": 3,
+    "ytick.minor.size": 3,
+    "xtick.major.width": 1.0,
+    "ytick.major.width": 1.0,
+    "xtick.minor.width": 0.8,
+    "ytick.minor.width": 0.8,
+
+    "legend.frameon": True,
+    "legend.handlelength": 2.5,
+    "legend.handletextpad": 0.4,
+
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.03,
+}
+
+plt.rcParams.update(params)
+# warnings.filterwarnings("ignore")
+
+
 REQUIRED_COLUMNS = {
     "time",
     "cubature_order",
@@ -55,12 +102,21 @@ REQUIRED_COLUMNS = {
     "exact_angular_momentum_z",
 }
 
+OPTICAL_CHIRALITY_COLUMNS = {
+    "optical_chirality",
+    "exact_optical_chirality",
+    "optical_chirality_error",
+    "optical_chirality_density_l2",
+    "exact_optical_chirality_density_l2",
+    "optical_chirality_density_error_l2",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot energy, analytical L2, charge, and momentum diagnostics from "
-            "quadrature_diagnostics.csv."
+            "Plot energy, analytical L2, optical chirality, charge, and "
+            "momentum diagnostics from quadrature_diagnostics.csv."
         )
     )
     parser.add_argument(
@@ -93,6 +149,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--chirality-output",
+        type=Path,
+        help=(
+            "Optical-chirality image path "
+            "(default: optical_chirality_diagnostics.png beside the CSV)"
+        ),
+    )
+    parser.add_argument(
         "--dpi",
         type=int,
         default=180,
@@ -111,7 +175,22 @@ def read_diagnostics(path: Path) -> dict[str, list[float]]:
                 f"{path} is missing required columns: {', '.join(missing)}"
             )
 
-        diagnostics = {name: [] for name in REQUIRED_COLUMNS}
+        present_chirality_columns = OPTICAL_CHIRALITY_COLUMNS & available
+        if present_chirality_columns and (
+            present_chirality_columns != OPTICAL_CHIRALITY_COLUMNS
+        ):
+            missing_chirality = sorted(
+                OPTICAL_CHIRALITY_COLUMNS - available
+            )
+            raise ValueError(
+                f"{path} has an incomplete optical-chirality schema; "
+                f"missing columns: {', '.join(missing_chirality)}"
+            )
+
+        columns = set(REQUIRED_COLUMNS)
+        if present_chirality_columns:
+            columns.update(OPTICAL_CHIRALITY_COLUMNS)
+        diagnostics = {name: [] for name in columns}
         for row_number, row in enumerate(reader, start=2):
             try:
                 for name in diagnostics:
@@ -570,6 +649,120 @@ def plot_charge_and_momentum_diagnostics(
     plt.close(figure)
 
 
+def plot_optical_chirality_diagnostics(
+    diagnostics: dict[str, list[float]],
+    output: Path,
+    dpi: int,
+) -> None:
+    time = diagnostics["time"]
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=(14, 9),
+        sharex=True,
+        constrained_layout=True,
+    )
+    (
+        chirality_axis,
+        chirality_error_axis,
+        density_norm_axis,
+        density_error_axis,
+    ) = axes.flat
+
+    chirality_axis.plot(
+        time,
+        diagnostics["optical_chirality"],
+        label=r"$\mathcal{X}_h$",
+    )
+    chirality_axis.plot(
+        time,
+        diagnostics["exact_optical_chirality"],
+        "--",
+        label=r"$\mathcal{X}$ exact",
+    )
+    chirality_axis.axhline(0.0, color="black", linewidth=0.8)
+    configure_axis(
+        chirality_axis,
+        "Integrated Optical Chirality",
+        r"$\mathcal{X}=\int_\Omega \chi\,dV$",
+    )
+    chirality_axis.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    chirality_axis.legend(fontsize="small")
+
+    chirality_error_axis.plot(
+        time,
+        diagnostics["optical_chirality_error"],
+        label=r"$\mathcal{X}_h-\mathcal{X}$",
+    )
+    chirality_error_axis.axhline(0.0, color="black", linewidth=0.8)
+    configure_axis(
+        chirality_error_axis,
+        "Integrated-Chirality Error",
+        "Chirality error",
+    )
+    chirality_error_axis.ticklabel_format(
+        axis="y",
+        style="sci",
+        scilimits=(0, 0),
+    )
+    chirality_error_axis.legend(fontsize="small")
+
+    density_norm_axis.plot(
+        time,
+        diagnostics["optical_chirality_density_l2"],
+        label=r"$\|\chi_h\|_{L^2}$",
+    )
+    density_norm_axis.plot(
+        time,
+        diagnostics["exact_optical_chirality_density_l2"],
+        "--",
+        label=r"$\|\chi\|_{L^2}$ exact",
+    )
+    configure_axis(
+        density_norm_axis,
+        "Optical-Chirality Density L2 Norm",
+        "L2 norm",
+    )
+    density_norm_axis.ticklabel_format(
+        axis="y",
+        style="sci",
+        scilimits=(0, 0),
+    )
+    density_norm_axis.legend(fontsize="small")
+
+    density_error_axis.plot(
+        time,
+        positive_magnitudes(
+            diagnostics["optical_chirality_density_error_l2"]
+        ),
+        label=r"$\|\chi_h-\chi\|_{L^2}$",
+    )
+    configure_axis(
+        density_error_axis,
+        "Optical-Chirality Density Error",
+        "L2 error",
+    )
+    density_error_axis.set_yscale("log")
+    density_error_axis.legend(fontsize="small")
+
+    for axis in axes[-1, :]:
+        axis.set_xlabel("Time")
+
+    cubature_orders = sorted(set(diagnostics["cubature_order"]))
+    cubature_label = ", ".join(f"{order:g}" for order in cubature_orders)
+    figure.suptitle(
+        "DiscoGMPI Optical-Chirality Diagnostics\n"
+        r"$\chi=\frac{1}{2}\left(\varepsilon E\cdot\nabla\times E"
+        r"+\mu H\cdot\nabla\times H\right)$; "
+        f"cubature order: {cubature_label}",
+        fontsize=15,
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=dpi)
+    plt.close(figure)
+
+
 def main() -> None:
     args = parse_args()
     output = args.output or args.csv_path.with_name(
@@ -578,6 +771,10 @@ def main() -> None:
     charge_momentum_output = (
         args.charge_momentum_output
         or args.csv_path.with_name("charge_momentum_diagnostics.png")
+    )
+    chirality_output = (
+        args.chirality_output
+        or args.csv_path.with_name("optical_chirality_diagnostics.png")
     )
     diagnostics = read_diagnostics(args.csv_path)
     plot_diagnostics(diagnostics, output, args.dpi)
@@ -588,6 +785,13 @@ def main() -> None:
     )
     print(output)
     print(charge_momentum_output)
+    if OPTICAL_CHIRALITY_COLUMNS <= diagnostics.keys():
+        plot_optical_chirality_diagnostics(
+            diagnostics,
+            chirality_output,
+            args.dpi,
+        )
+        print(chirality_output)
 
 
 if __name__ == "__main__":

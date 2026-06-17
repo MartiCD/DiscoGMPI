@@ -197,6 +197,24 @@ function owned_field_error(global_field, local_field, distributed_dg)
     return error
 end
 
+function local_owned_field_error(left, right, distributed_dg)
+    error = 0.0
+    owned = distributed_dg.distributed_mesh.partition.owned
+    for (left_component, right_component) in
+        zip(field_components(left), field_components(right))
+        error = max(
+            error,
+            maximum(
+                abs.(
+                    left_component[:, owned] .-
+                    right_component[:, owned]
+                ),
+            ),
+        )
+    end
+    return error
+end
+
 function max_ghost_rhs(rhs, distributed_dg)
     value = 0.0
 
@@ -327,6 +345,83 @@ if NPROCS == 2
         @test length(distributed_dg.exchange.faces[1 - RANK]) == 1
     end
 
+    @testset "Distributed mesh and checkpoint I/O" begin
+        io_root = MPI.bcast(
+            RANK == 0 ? mktempdir() : "",
+            COMM;
+            root = 0,
+        )
+        mesh_dir = joinpath(io_root, "mesh")
+        checkpoint_dir = joinpath(io_root, "checkpoint")
+        metadata_dir = joinpath(io_root, "metadata")
+
+        prepared_mesh = prepare_distributed_mesh_partition(
+            RANK == 0 ? mesh : nothing,
+            RANK == 0 ? [0, 1] : nothing,
+            mesh_dir;
+            comm = COMM,
+            metadata = Dict("test_case" => "two_tet_pec"),
+        )
+        cached_dg = build_distributed_dg_from_partition(
+            mesh_dir,
+            order;
+            comm = COMM,
+        )
+
+        @test prepared_mesh.elements.global_ids ==
+              cached_dg.distributed_mesh.elements.global_ids
+        @test prepared_mesh.nodes.global_ids ==
+              cached_dg.distributed_mesh.nodes.global_ids
+        @test cached_dg.exchange.neighbors == [1 - RANK]
+
+        checkpoint_U = localize_maxwell_field(global_U, cached_dg)
+        write_distributed_checkpoint(
+            checkpoint_dir,
+            checkpoint_U,
+            cached_dg;
+            step = 7,
+            time = 0.125,
+            dt = 0.005,
+            metadata = Dict("initial_energy_total" => 3.25),
+        )
+        restored_U, state =
+            load_distributed_checkpoint(checkpoint_dir, cached_dg)
+        restore_error = MPI.Allreduce(
+            local_owned_field_error(
+                checkpoint_U,
+                restored_U,
+                cached_dg,
+            ),
+            max,
+            COMM,
+        )
+
+        @test restore_error == 0.0
+        @test state.step == 7
+        @test state.time == 0.125
+        @test state.dt == 0.005
+        @test state.metadata["initial_energy_total"] == 3.25
+
+        write_distributed_run_metadata(
+            metadata_dir,
+            cached_dg;
+            configuration = Dict("case" => "I/O regression"),
+            runtime = Dict("status" => "complete"),
+        )
+        metadata_exists = MPI.bcast(
+            RANK == 0 &&
+            isfile(joinpath(metadata_dir, "run_metadata.toml")) &&
+            isfile(joinpath(metadata_dir, "partition_metadata.csv")),
+            COMM;
+            root = 0,
+        )
+        @test metadata_exists
+
+        MPI.Barrier(COMM)
+        RANK == 0 && rm(io_root; recursive = true, force = true)
+        MPI.Barrier(COMM)
+    end
+
     @testset "Distributed Maxwell RHS matches serial" begin
         formulations = (
             HesthavenWarburtonFormulation(MaxwellFlux_Central),
@@ -340,6 +435,28 @@ if NPROCS == 2
                 global_dg,
                 distributed_dg,
                 registry,
+                formulation,
+            )
+
+            @test error <= 1e-10
+            @test ghost_rhs == 0.0
+            @test trace_error <= 1e-12
+        end
+    end
+
+    @testset "Distributed PMC Maxwell RHS matches serial" begin
+        pmc_registry = MaxwellBoundaryRegistry(
+            Dict(10 => DiscoGMPI.MaxwellBC_PMC),
+        )
+        for formulation in (
+            HesthavenWarburtonFormulation(MaxwellFlux_Central),
+            PoissonBracketFormulation(),
+        )
+            error, ghost_rhs, trace_error = compare_rhs(
+                global_U,
+                global_dg,
+                distributed_dg,
+                pmc_registry,
                 formulation,
             )
 
