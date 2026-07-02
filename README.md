@@ -203,6 +203,7 @@ pair is still checked against the strict aggregate targets `E=N+1` and `H=N`,
 but the component and leakage diagnostics should be inspected when the strict
 electric aggregate check fails.
 
+<<<<<<< HEAD
 ### Strict periodic space-time isoresolution study
 
 The strict isoresolution driver uses the fixed periodic domain
@@ -267,6 +268,8 @@ reported separately, with the latter checking finite and monotonically
 decreasing active-component errors and finest-pair `Ez`/`Hy` rates for both
 temporal norms. The machine-readable summary is `<output-stem>_verdict.toml`.
 
+=======
+>>>>>>> origin/main
 Run the distributed validation matrix to collect these checks across one rank
 and multiple ranks:
 

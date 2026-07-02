@@ -3,7 +3,10 @@ using Test
 include("test_solver.jl")
 include("test_metis_distributed_mesh.jl")
 include("test_validation_matrix.jl")
+<<<<<<< HEAD
 include("test_periodic_isoresolution.jl")
+=======
+>>>>>>> origin/main
 
 # MPI tests should be launched explicitly with mpiexec, for example:
 #   mpiexec -n 2 julia --project=test test/test_mpi_face_permutation.jl
