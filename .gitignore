@@ -1,5 +1,7 @@
 output/
 
+./julia_depot/
+
 benchmark/solver/*.csv
 benchmark/solver/*.txt
 benchmark/solver/*.png
@@ -28,7 +30,10 @@ docs/numerics/*.toc
 
 
 examples/meshes/*.vtk
+!examples/meshes/metallic_sphere_scattering_validation.vtk
+!examples/meshes/metallic_sphere_scattering_epw4.vtk
 examples/meshes/*.geo
+!examples/meshes/metallic_sphere_scattering.geo
 examples/meshes/*.sh
 examples/meshes/*.msh
 examples/__pycache__/
