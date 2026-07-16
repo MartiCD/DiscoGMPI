@@ -145,6 +145,134 @@ function maxwell_material_surface_flux_values(
     )
 end
 
+function maxwell_material_surface_flux_values!(
+    flux::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    plus::MaxwellFaceWorkspace,
+    n::NTuple{3, Float64};
+    flux_kind::MaxwellFluxKind,
+    minus_epsilon::Float64,
+    minus_permeability::Float64,
+    plus_epsilon::Float64,
+    plus_permeability::Float64,
+)
+    if flux_kind == MaxwellFlux_Central
+        @inbounds for q in eachindex(minus.Ex)
+            dEx = plus.Ex[q] - minus.Ex[q]
+            dEy = plus.Ey[q] - minus.Ey[q]
+            dEz = plus.Ez[q] - minus.Ez[q]
+            dHx = plus.Hx[q] - minus.Hx[q]
+            dHy = plus.Hy[q] - minus.Hy[q]
+            dHz = plus.Hz[q] - minus.Hz[q]
+
+            nx_dH = cross_n_components(n, dHx, dHy, dHz)
+            nx_dE = cross_n_components(n, dEx, dEy, dEz)
+
+            flux.Ex[q] = 0.5 * nx_dH[1] / minus_epsilon
+            flux.Ey[q] = 0.5 * nx_dH[2] / minus_epsilon
+            flux.Ez[q] = 0.5 * nx_dH[3] / minus_epsilon
+            flux.Hx[q] = -0.5 * nx_dE[1] / minus_permeability
+            flux.Hy[q] = -0.5 * nx_dE[2] / minus_permeability
+            flux.Hz[q] = -0.5 * nx_dE[3] / minus_permeability
+        end
+    elseif flux_kind == MaxwellFlux_Upwind
+        Zminus = maxwell_impedance(
+            ε = minus_epsilon,
+            μ = minus_permeability,
+        )
+        Zplus = maxwell_impedance(
+            ε = plus_epsilon,
+            μ = plus_permeability,
+        )
+        Yminus = 1.0 / Zminus
+        Yplus = 1.0 / Zplus
+
+        @inbounds for q in eachindex(minus.Ex)
+            dEx = plus.Ex[q] - minus.Ex[q]
+            dEy = plus.Ey[q] - minus.Ey[q]
+            dEz = plus.Ez[q] - minus.Ez[q]
+            dHx = plus.Hx[q] - minus.Hx[q]
+            dHy = plus.Hy[q] - minus.Hy[q]
+            dHz = plus.Hz[q] - minus.Hz[q]
+
+            nx_dH = cross_n_components(n, dHx, dHy, dHz)
+            nx_dE = cross_n_components(n, dEx, dEy, dEz)
+            nn_dE = cross_n_components(n, nx_dE[1], nx_dE[2], nx_dE[3])
+            nn_dH = cross_n_components(n, nx_dH[1], nx_dH[2], nx_dH[3])
+
+            flux.Ex[q] =
+                (Zplus * nx_dH[1] - nn_dE[1]) /
+                (Zminus + Zplus) / minus_epsilon
+            flux.Ey[q] =
+                (Zplus * nx_dH[2] - nn_dE[2]) /
+                (Zminus + Zplus) / minus_epsilon
+            flux.Ez[q] =
+                (Zplus * nx_dH[3] - nn_dE[3]) /
+                (Zminus + Zplus) / minus_epsilon
+
+            flux.Hx[q] =
+                -(Yplus * nx_dE[1] + nn_dH[1]) /
+                (Yminus + Yplus) / minus_permeability
+            flux.Hy[q] =
+                -(Yplus * nx_dE[2] + nn_dH[2]) /
+                (Yminus + Yplus) / minus_permeability
+            flux.Hz[q] =
+                -(Yplus * nx_dE[3] + nn_dH[3]) /
+                (Yminus + Yplus) / minus_permeability
+        end
+    else
+        error("Unsupported Maxwell flux kind: $flux_kind")
+    end
+
+    return flux
+end
+
+function maxwell_material_face_flux!(
+    flux::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    plus::MaxwellFaceWorkspace,
+    normal::NTuple{3, Float64},
+    formulation::HesthavenWarburtonFormulation;
+    minus_epsilon::Float64,
+    minus_permeability::Float64,
+    plus_epsilon::Float64,
+    plus_permeability::Float64,
+)
+    return maxwell_material_surface_flux_values!(
+        flux,
+        minus,
+        plus,
+        normal;
+        flux_kind = formulation.flux_kind,
+        minus_epsilon = minus_epsilon,
+        minus_permeability = minus_permeability,
+        plus_epsilon = plus_epsilon,
+        plus_permeability = plus_permeability,
+    )
+end
+
+function maxwell_material_face_flux!(
+    flux::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    plus::MaxwellFaceWorkspace,
+    normal::NTuple{3, Float64},
+    formulation::PoissonBracketFormulation;
+    minus_epsilon::Float64,
+    minus_permeability::Float64,
+    plus_epsilon::Float64,
+    plus_permeability::Float64,
+)
+    require_poisson_bracket_surface_flux(formulation)
+    return maxwell_poisson_bracket_surface_flux_values!(
+        flux,
+        minus,
+        plus,
+        normal;
+        ε = minus_epsilon,
+        μ = minus_permeability,
+    )
+end
+
 function maxwell_volume_rhs!(
     rhs::MaxwellRHS,
     U::MaxwellField,
@@ -210,7 +338,7 @@ function maxwell_volume_rhs!(
     materials::MaxwellElementMaterials;
     reset::Bool = true,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
     reset && fill_maxwell_rhs!(rhs, 0.0)
     nelements = size(U.Ex, 2)
     validate_maxwell_materials(materials, nelements)
@@ -298,7 +426,7 @@ function maxwell_material_face_flux(
     minus_material::MaxwellMaterial,
     plus_material::MaxwellMaterial,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
     return maxwell_poisson_bracket_surface_flux_values(
         minus,
         plus,
@@ -317,79 +445,62 @@ function add_material_interior_surface_rhs!(
     flux_faces::DGFluxFaces,
     formulation::AbstractMaxwellDGFormulation,
     materials::MaxwellElementMaterials,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
+
     for ff in flux_faces.interior
         tr = ff.trace
-        minus = maxwell_minus_trace(U, tr)
-        plus = maxwell_plus_trace(U, tr)
-        minus_material = element_material(materials, tr.minus_elem)
-        plus_material = element_material(materials, tr.plus_elem)
+        minus, plus = interior_face_traces!(surface_workspace, U, tr)
+        minus_epsilon = materials.epsilon[tr.minus_elem]
+        minus_permeability = materials.permeability[tr.minus_elem]
+        plus_epsilon = materials.epsilon[tr.plus_elem]
+        plus_permeability = materials.permeability[tr.plus_elem]
 
-        flux_minus = maxwell_material_face_flux(
+        maxwell_material_face_flux!(
+            surface_workspace.flux,
             minus,
             plus,
             ff.normal,
-            formulation,
-            minus_material,
-            plus_material,
+            formulation;
+            minus_epsilon = minus_epsilon,
+            minus_permeability = minus_permeability,
+            plus_epsilon = plus_epsilon,
+            plus_permeability = plus_permeability,
         )
         add_lifted_maxwell_surface_flux!(
             rhs,
             tr.minus_elem,
-            ref,
             fops,
             mappings,
             tr.minus_face,
-            tr.minus_nodes,
-            flux_minus,
+            surface_workspace.flux,
             ff.area,
+            surface_workspace,
         )
 
         plus_normal = (-ff.normal[1], -ff.normal[2], -ff.normal[3])
-        flux_plus_aligned = maxwell_material_face_flux(
+        maxwell_material_face_flux!(
+            surface_workspace.flux,
             plus,
             minus,
             plus_normal,
-            formulation,
-            plus_material,
-            minus_material,
+            formulation;
+            minus_epsilon = plus_epsilon,
+            minus_permeability = plus_permeability,
+            plus_epsilon = minus_epsilon,
+            plus_permeability = minus_permeability,
         )
-        flux_plus = (
-            fluxEx = unpermute_plus_face_values(
-                flux_plus_aligned.fluxEx,
-                tr.plus_to_minus_perm,
-            ),
-            fluxEy = unpermute_plus_face_values(
-                flux_plus_aligned.fluxEy,
-                tr.plus_to_minus_perm,
-            ),
-            fluxEz = unpermute_plus_face_values(
-                flux_plus_aligned.fluxEz,
-                tr.plus_to_minus_perm,
-            ),
-            fluxHx = unpermute_plus_face_values(
-                flux_plus_aligned.fluxHx,
-                tr.plus_to_minus_perm,
-            ),
-            fluxHy = unpermute_plus_face_values(
-                flux_plus_aligned.fluxHy,
-                tr.plus_to_minus_perm,
-            ),
-            fluxHz = unpermute_plus_face_values(
-                flux_plus_aligned.fluxHz,
-                tr.plus_to_minus_perm,
-            ),
-        )
-        add_lifted_maxwell_surface_flux!(
+        add_lifted_permuted_maxwell_surface_flux!(
             rhs,
             tr.plus_elem,
-            ref,
             fops,
             mappings,
             tr.plus_face,
-            tr.plus_nodes,
-            flux_plus,
+            surface_workspace.flux,
+            tr.plus_to_minus_perm,
             ff.area,
+            surface_workspace,
         )
     end
 
@@ -406,39 +517,52 @@ function add_material_boundary_surface_rhs!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     materials::MaxwellElementMaterials,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing;
+    mesh::Union{Nothing, RawVTUMesh} = nothing,
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
+
     for ff in flux_faces.boundary
         kind = boundary_kind(registry, ff.boundary_id)
         kind == MaxwellBC_None && continue
 
         tr = ff.trace
-        material = element_material(materials, tr.elem)
-        minus = maxwell_boundary_minus_trace(U, tr)
-        plus = maxwell_boundary_plus_trace(
+        epsilon = materials.epsilon[tr.elem]
+        permeability = materials.permeability[tr.elem]
+        minus = boundary_face_minus_trace!(surface_workspace, U, tr)
+        plus = maxwell_boundary_plus_trace!(
+            surface_workspace.plus,
             minus,
+            mesh,
+            ref,
+            tr,
             ff.normal,
-            kind;
-            ε = material.epsilon,
-            μ = material.permeability,
+            kind,
+            boundary_data;
+            ε = epsilon,
+            μ = permeability,
         )
-        flux = maxwell_material_face_flux(
+        maxwell_material_face_flux!(
+            surface_workspace.flux,
             minus,
             plus,
             ff.normal,
-            formulation,
-            material,
-            material,
+            formulation;
+            minus_epsilon = epsilon,
+            minus_permeability = permeability,
+            plus_epsilon = epsilon,
+            plus_permeability = permeability,
         )
         add_lifted_maxwell_surface_flux!(
             rhs,
             tr.elem,
-            ref,
             fops,
             mappings,
             tr.face,
-            tr.nodes,
-            flux,
+            surface_workspace.flux,
             ff.area,
+            surface_workspace,
         )
     end
 
@@ -451,9 +575,11 @@ function maxwell_rhs!(
     dg::DGDiscretization,
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
-    materials::MaxwellElementMaterials,
+    materials::MaxwellElementMaterials;
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
 )
     fill_maxwell_rhs!(rhs, 0.0)
+    surface_workspace = maxwell_surface_workspace!(dg.backend, dg.ref, dg.fops)
     maxwell_volume_rhs!(
         rhs,
         U,
@@ -472,6 +598,7 @@ function maxwell_rhs!(
         dg.flux_faces,
         formulation,
         materials,
+        surface_workspace,
     )
     add_material_boundary_surface_rhs!(
         rhs,
@@ -483,6 +610,9 @@ function maxwell_rhs!(
         registry,
         formulation,
         materials,
+        surface_workspace,
+        mesh = dg.mesh,
+        boundary_data = boundary_data,
     )
     return rhs
 end
@@ -493,7 +623,8 @@ function maxwell_rhs!(
     distributed_dg::DistributedDGDiscretization,
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
-    materials::MaxwellElementMaterials,
+    materials::MaxwellElementMaterials;
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
 )
     exchange_maxwell_ghost_traces!(U, distributed_dg)
     maxwell_rhs!(
@@ -503,6 +634,7 @@ function maxwell_rhs!(
         registry,
         formulation,
         materials,
+        boundary_data = boundary_data,
     )
     return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
 end
@@ -512,6 +644,7 @@ function make_distributed_maxwell_rhs_function(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     materials::MaxwellElementMaterials,
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
 )
     return function rhs_function!(rhs::MaxwellRHS, U::MaxwellField)
         return maxwell_rhs!(
@@ -521,6 +654,7 @@ function make_distributed_maxwell_rhs_function(
             registry,
             formulation,
             materials,
+            boundary_data = boundary_data,
         )
     end
 end
@@ -534,12 +668,15 @@ function distributed_rk_step!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     materials::MaxwellElementMaterials,
+    ;
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
 )
     rhs_function! = make_distributed_maxwell_rhs_function(
         distributed_dg,
         registry,
         formulation,
         materials,
+        boundary_data,
     )
     return rk_step!(U, work, scheme, dt, rhs_function!)
 end
@@ -553,12 +690,15 @@ function distributed_partitioned_symplectic_rk_step!(
     registry::MaxwellBoundaryRegistry,
     formulation::PoissonBracketFormulation,
     materials::MaxwellElementMaterials,
+    ;
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
 )
     rhs_function! = make_distributed_maxwell_rhs_function(
         distributed_dg,
         registry,
         formulation,
         materials,
+        boundary_data,
     )
     return partitioned_symplectic_rk_step!(
         U,
@@ -1180,6 +1320,44 @@ function distributed_periodic_plus_trace(
     )
 end
 
+function distributed_periodic_plus_trace!(
+    dest::MaxwellFaceWorkspace,
+    U::MaxwellField,
+    periodic::DistributedPeriodicMaxwellExchange,
+    face::DistributedPeriodicFace,
+    rank::Int,
+)
+    permutation = face.partner_to_local_perm
+
+    if face.partner_rank == rank
+        @inbounds for q in eachindex(permutation)
+            node = face.partner_local_nodes[permutation[q]]
+            elem = face.partner_local_elem
+            dest.Ex[q] = U.Ex[node, elem]
+            dest.Ey[q] = U.Ey[node, elem]
+            dest.Ez[q] = U.Ez[node, elem]
+            dest.Hx[q] = U.Hx[node, elem]
+            dest.Hy[q] = U.Hy[node, elem]
+            dest.Hz[q] = U.Hz[node, elem]
+        end
+    else
+        buffer = periodic.recv_buffers[face.partner_rank]
+        nfp = length(face.local_nodes)
+
+        @inbounds for q in eachindex(permutation)
+            node = permutation[q]
+            dest.Ex[q] = buffer[face.remote_offset + node - 1]
+            dest.Ey[q] = buffer[face.remote_offset + nfp + node - 1]
+            dest.Ez[q] = buffer[face.remote_offset + 2 * nfp + node - 1]
+            dest.Hx[q] = buffer[face.remote_offset + 3 * nfp + node - 1]
+            dest.Hy[q] = buffer[face.remote_offset + 4 * nfp + node - 1]
+            dest.Hz[q] = buffer[face.remote_offset + 5 * nfp + node - 1]
+        end
+    end
+
+    return dest
+end
+
 function add_distributed_periodic_surface_rhs!(
     rhs::MaxwellRHS,
     U::MaxwellField,
@@ -1192,29 +1370,37 @@ function add_distributed_periodic_surface_rhs!(
 )
     rank = MPI.Comm_rank(distributed_dg.comm)
     dg = distributed_dg.dg
+    surface_workspace = maxwell_surface_workspace!(dg.backend, dg.ref, dg.fops)
 
     for face in periodic.faces
-        minus = (
-            Ex = U.Ex[face.local_nodes, face.local_elem],
-            Ey = U.Ey[face.local_nodes, face.local_elem],
-            Ez = U.Ez[face.local_nodes, face.local_elem],
-            Hx = U.Hx[face.local_nodes, face.local_elem],
-            Hy = U.Hy[face.local_nodes, face.local_elem],
-            Hz = U.Hz[face.local_nodes, face.local_elem],
+        minus = gather_face_values!(
+            surface_workspace.minus,
+            U,
+            face.local_nodes,
+            face.local_elem,
         )
-        plus = distributed_periodic_plus_trace(U, periodic, face, rank)
+        plus = distributed_periodic_plus_trace!(
+            surface_workspace.plus,
+            U,
+            periodic,
+            face,
+            rank,
+        )
 
-        flux = if materials === nothing
+        if materials === nothing
             if formulation isa PoissonBracketFormulation
-                maxwell_poisson_bracket_surface_flux_values(
+                maxwell_poisson_bracket_surface_flux_values!(
+                    surface_workspace.flux,
                     minus,
                     plus,
                     face.normal;
+                    flux_kind = formulation.flux_kind,
                     ε = ε,
                     μ = μ,
                 )
             else
-                maxwell_surface_flux_values(
+                maxwell_surface_flux_values!(
+                    surface_workspace.flux,
                     minus,
                     plus,
                     face.normal;
@@ -1224,7 +1410,6 @@ function add_distributed_periodic_surface_rhs!(
                 )
             end
         else
-            local_material = element_material(materials, face.local_elem)
             isfinite(face.partner_epsilon) &&
                 isfinite(face.partner_permeability) ||
                 throw(
@@ -1233,30 +1418,28 @@ function add_distributed_periodic_surface_rhs!(
                         "material metadata. Rebuild it with materials=materials.",
                     ),
                 )
-            partner_material = MaxwellMaterial(
-                face.partner_epsilon,
-                face.partner_permeability,
-            )
-            maxwell_material_face_flux(
+            maxwell_material_face_flux!(
+                surface_workspace.flux,
                 minus,
                 plus,
                 face.normal,
-                formulation,
-                local_material,
-                partner_material,
+                formulation;
+                minus_epsilon = materials.epsilon[face.local_elem],
+                minus_permeability = materials.permeability[face.local_elem],
+                plus_epsilon = face.partner_epsilon,
+                plus_permeability = face.partner_permeability,
             )
         end
 
         add_lifted_maxwell_surface_flux!(
             rhs,
             face.local_elem,
-            dg.ref,
             dg.fops,
             dg.mappings,
             face.local_face,
-            face.local_nodes,
-            flux,
+            surface_workspace.flux,
             face.area,
+            surface_workspace,
         )
     end
 

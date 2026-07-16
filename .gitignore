@@ -1,6 +1,6 @@
 output/
 
-./julia_depot/
+.julia_depot/
 
 benchmark/solver/*.csv
 benchmark/solver/*.txt
@@ -27,6 +27,13 @@ docs/numerics/*.lot
 docs/numerics/*.out
 docs/numerics/*.tex
 docs/numerics/*.toc
+
+docs/rcs/*.aux
+docs/rcs/*.log
+docs/rcs/*.lot
+docs/rcs/*.out
+docs/rcs/*.tex
+docs/rcs/*.toc
 
 
 examples/meshes/*.vtk

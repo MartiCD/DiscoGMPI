@@ -1290,7 +1290,7 @@ function run_maxwell_partitioned_symplectic_time_steps!(
     μ::Float64 = 1.0,
     energy_every::Int = 1,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
 
     if normalize_maxwell_partition(first_partition) != :H
         throw(

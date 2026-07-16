@@ -18,7 +18,7 @@
 // no Recombine. Gmsh will generate an unstructured triangular surface mesh and
 // an unstructured tetrahedral volume mesh.
 
-Lx = 1.0; //1.0; //2.0;
+Lx = 2.0; //1.0; //2.0;
 Ly = 1.0; //0.25; //1.0;
 Lz = 1.0; //0.25; //1.0;
 

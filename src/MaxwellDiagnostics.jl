@@ -16,6 +16,12 @@ struct MaxwellQuadratureDiagnostics
     magnetic_relative_error::Float64
     field_error_l2::Float64
     field_relative_error::Float64
+    ex_error_l2::Float64
+    ey_error_l2::Float64
+    ez_error_l2::Float64
+    hx_error_l2::Float64
+    hy_error_l2::Float64
+    hz_error_l2::Float64
     energy_density_l2::Float64
     exact_energy_density_l2::Float64
     energy_density_error_l2::Float64
@@ -225,7 +231,7 @@ function distributed_maxwell_quadrature_diagnostics(
     physical_operators = distributed_dg.dg.physops.elements
 
     # Energies, field norms/errors, chirality, charges, and momenta.
-    local_sums = zeros(Float64, 32)
+    local_sums = zeros(Float64, 38)
 
     for elem in distributed_dg.distributed_mesh.partition.owned
         tet_nodes = @view mesh.tets[:, elem]
@@ -280,14 +286,16 @@ function distributed_maxwell_quadrature_diagnostics(
                 exact_magnetic_squared =
                     exact_Hx^2 + exact_Hy^2 + exact_Hz^2
 
+                ex_error_squared = (numerical_Ex - exact_Ex)^2
+                ey_error_squared = (numerical_Ey - exact_Ey)^2
+                ez_error_squared = (numerical_Ez - exact_Ez)^2
+                hx_error_squared = (numerical_Hx - exact_Hx)^2
+                hy_error_squared = (numerical_Hy - exact_Hy)^2
+                hz_error_squared = (numerical_Hz - exact_Hz)^2
                 electric_error_squared =
-                    (numerical_Ex - exact_Ex)^2 +
-                    (numerical_Ey - exact_Ey)^2 +
-                    (numerical_Ez - exact_Ez)^2
+                    ex_error_squared + ey_error_squared + ez_error_squared
                 magnetic_error_squared =
-                    (numerical_Hx - exact_Hx)^2 +
-                    (numerical_Hy - exact_Hy)^2 +
-                    (numerical_Hz - exact_Hz)^2
+                    hx_error_squared + hy_error_squared + hz_error_squared
 
                 numerical_electric_energy_density =
                     0.5 * epsilon * numerical_electric_squared
@@ -442,6 +450,12 @@ function distributed_maxwell_quadrature_diagnostics(
                     physical_weight * exact_angular_momentum_y
                 local_sums[32] +=
                     physical_weight * exact_angular_momentum_z
+                local_sums[33] += physical_weight * ex_error_squared
+                local_sums[34] += physical_weight * ey_error_squared
+                local_sums[35] += physical_weight * ez_error_squared
+                local_sums[36] += physical_weight * hx_error_squared
+                local_sums[37] += physical_weight * hy_error_squared
+                local_sums[38] += physical_weight * hz_error_squared
             end
         end
     end
@@ -462,6 +476,12 @@ function maxwell_quadrature_diagnostics_from_sums(
     magnetic_error_l2 = sqrt(max(sums[10], 0.0))
     field_error_l2 = sqrt(max(sums[7] + sums[10], 0.0))
     exact_field_l2 = sqrt(max(sums[6] + sums[9], 0.0))
+    ex_error_l2 = sqrt(max(sums[33], 0.0))
+    ey_error_l2 = sqrt(max(sums[34], 0.0))
+    ez_error_l2 = sqrt(max(sums[35], 0.0))
+    hx_error_l2 = sqrt(max(sums[36], 0.0))
+    hy_error_l2 = sqrt(max(sums[37], 0.0))
+    hz_error_l2 = sqrt(max(sums[38], 0.0))
     energy_density_l2 = sqrt(max(sums[11], 0.0))
     exact_energy_density_l2 = sqrt(max(sums[12], 0.0))
     energy_density_error_l2 = sqrt(max(sums[13], 0.0))
@@ -487,6 +507,12 @@ function maxwell_quadrature_diagnostics_from_sums(
         magnetic_error_l2 / max(exact_magnetic_l2, eps(Float64)),
         field_error_l2,
         field_error_l2 / max(exact_field_l2, eps(Float64)),
+        ex_error_l2,
+        ey_error_l2,
+        ez_error_l2,
+        hx_error_l2,
+        hy_error_l2,
+        hz_error_l2,
         energy_density_l2,
         exact_energy_density_l2,
         energy_density_error_l2,
@@ -898,7 +924,8 @@ function write_quadrature_diagnostics_header(io::IO)
         "electric_l2,exact_electric_l2,electric_error_l2," *
         "electric_relative_error,magnetic_l2,exact_magnetic_l2," *
         "magnetic_error_l2,magnetic_relative_error,field_error_l2," *
-        "field_relative_error,energy_density_l2," *
+        "field_relative_error,ex_error_l2,ey_error_l2,ez_error_l2," *
+        "hx_error_l2,hy_error_l2,hz_error_l2,energy_density_l2," *
         "exact_energy_density_l2,energy_density_error_l2," *
         "energy_density_relative_error,optical_chirality," *
         "exact_optical_chirality,optical_chirality_error," *
@@ -951,6 +978,12 @@ function write_quadrature_diagnostics_row(
         diagnostics.magnetic_relative_error,
         diagnostics.field_error_l2,
         diagnostics.field_relative_error,
+        diagnostics.ex_error_l2,
+        diagnostics.ey_error_l2,
+        diagnostics.ez_error_l2,
+        diagnostics.hx_error_l2,
+        diagnostics.hy_error_l2,
+        diagnostics.hz_error_l2,
         diagnostics.energy_density_l2,
         diagnostics.exact_energy_density_l2,
         diagnostics.energy_density_error_l2,

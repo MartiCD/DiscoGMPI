@@ -3,7 +3,7 @@
 using MPI
 using DiscoGMPI
 
-include(joinpath(@__DIR__, "meshes", "generate_periodic_box_2x1x1.jl"))
+include(joinpath(@__DIR__, "meshes", "generate_periodic_box_2x1x1_nx4.jl"))
 
 Base.@kwdef struct PMLDemoConfig
     nx::Int = 16

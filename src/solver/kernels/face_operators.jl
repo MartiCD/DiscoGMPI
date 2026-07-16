@@ -240,6 +240,33 @@ function eval_nodal_basis_at_points(
     return Vq * invV
 end
 
+function build_reference_face_lift_matrices(
+    ref::ReferenceTet,
+    face_nodes::NTuple{4, Vector{Int}},
+    face_mass::NTuple{4, Matrix{Float64}},
+)
+    lifts = Matrix{Float64}[]
+
+    for face in 1:4
+        nodes = face_nodes[face]
+        mass = face_mass[face]
+        embedded = zeros(Float64, ref.Np, length(nodes))
+
+        for j in axes(mass, 2), i in axes(mass, 1)
+            embedded[nodes[i], j] += mass[i, j]
+        end
+
+        push!(lifts, ref.M \ embedded)
+    end
+
+    return (
+        lifts[1],
+        lifts[2],
+        lifts[3],
+        lifts[4],
+    )
+end
+
 # Old version for debugging
 # function build_reference_face_operators(ref::ReferenceTet)
 #     face_nodes = reference_face_nodes(ref)
@@ -318,16 +345,19 @@ function build_reference_face_operators_quadrature(ref::ReferenceTet)
         Emat .+= Mf_full
     end
 
+    face_mass = (
+        face_mass_vec[1],
+        face_mass_vec[2],
+        face_mass_vec[3],
+        face_mass_vec[4],
+    )
+    face_lift = build_reference_face_lift_matrices(ref, face_nodes, face_mass)
     LIFT = ref.M \ Emat
 
     return ReferenceTetFaceOperators(
         face_nodes,
-        (
-            face_mass_vec[1],
-            face_mass_vec[2],
-            face_mass_vec[3],
-            face_mass_vec[4],
-        ),
+        face_mass,
+        face_lift,
         Emat,
         LIFT,
     )
@@ -832,16 +862,19 @@ function build_reference_face_operators(ref::ReferenceTet)
         end
     end
 
+    face_mass = (
+        face_mass_vec[1],
+        face_mass_vec[2],
+        face_mass_vec[3],
+        face_mass_vec[4],
+    )
+    face_lift = build_reference_face_lift_matrices(ref, face_nodes, face_mass)
     LIFT = ref.M \ Emat
 
     return ReferenceTetFaceOperators(
         face_nodes,
-        (
-            face_mass_vec[1],
-            face_mass_vec[2],
-            face_mass_vec[3],
-            face_mass_vec[4],
-        ),
+        face_mass,
+        face_lift,
         Emat,
         LIFT,
     )

@@ -144,6 +144,7 @@ end
 struct ReferenceTetFaceOperators
     face_nodes::NTuple{4, Vector{Int}}
     face_mass::NTuple{4, Matrix{Float64}}
+    face_lift::NTuple{4, Matrix{Float64}}
     Emat::Matrix{Float64}
     LIFT::Matrix{Float64}
 end
@@ -304,13 +305,21 @@ end
 
 abstract type AbstractBackend end
 
-struct SerialBackend <: AbstractBackend end
+struct SerialBackend <: AbstractBackend
+    maxwell_surface_workspace::Base.RefValue{Any}
+end
+
+SerialBackend() = SerialBackend(Ref{Any}(nothing))
 
 struct ThreadedBackend <: AbstractBackend
     maxwell_volume_workspace::Base.RefValue{Any}
+    maxwell_surface_workspace::Base.RefValue{Any}
 end
 
-ThreadedBackend() = ThreadedBackend(Ref{Any}(nothing))
+ThreadedBackend(volume_workspace::Base.RefValue{Any}) =
+    ThreadedBackend(volume_workspace, Ref{Any}(nothing))
+
+ThreadedBackend() = ThreadedBackend(Ref{Any}(nothing), Ref{Any}(nothing))
 
 struct DGDiscretization{B<:AbstractBackend}
     mesh::RawVTUMesh
@@ -394,6 +403,38 @@ end
 @enum MaxwellFluxKind begin
     MaxwellFlux_Central = 0
     MaxwellFlux_Upwind = 1
+    MaxwellFlux_Alternating = 2
+end
+
+function maxwell_flux_kind_label(flux_kind::MaxwellFluxKind)
+    if flux_kind == MaxwellFlux_Central
+        return "centered"
+    elseif flux_kind == MaxwellFlux_Upwind
+        return "upwind"
+    elseif flux_kind == MaxwellFlux_Alternating
+        return "alternating"
+    end
+
+    return string(flux_kind)
+end
+
+function parse_maxwell_flux_kind(value::AbstractString)
+    name = lowercase(strip(value))
+
+    if name in ("central", "centered", "centre", "centred")
+        return MaxwellFlux_Central
+    elseif name == "upwind"
+        return MaxwellFlux_Upwind
+    elseif name in ("alternating", "alternate", "alt")
+        return MaxwellFlux_Alternating
+    end
+
+    throw(
+        ArgumentError(
+            "Unknown Maxwell flux '$value'. Valid values are centered, " *
+            "upwind, and alternating.",
+        ),
+    )
 end
 
 abstract type AbstractDGFormulation end

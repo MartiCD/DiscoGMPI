@@ -5,6 +5,154 @@ struct PlaneWaveParameters
     x_origin::Float64
 end
 
+struct IncidentPlaneWaveParameters
+    propagation_direction::NTuple{3, Float64}
+    polarization::NTuple{3, Float64}
+    wavelength::Float64
+    amplitude::Float64
+    epsilon::Float64
+    mu::Float64
+    phase_shift::Float64
+end
+
+function normalize_vector3(
+    vector::NTuple{3, <:Real},
+    name::AbstractString,
+)
+    norm_value = sqrt(
+        Float64(vector[1])^2 +
+        Float64(vector[2])^2 +
+        Float64(vector[3])^2,
+    )
+    norm_value > 0.0 ||
+        throw(ArgumentError("$name must be nonzero."))
+    return (
+        Float64(vector[1]) / norm_value,
+        Float64(vector[2]) / norm_value,
+        Float64(vector[3]) / norm_value,
+    )
+end
+
+function IncidentPlaneWaveParameters(;
+    propagation_direction::NTuple{3, <:Real} = (0.0, 0.0, 1.0),
+    polarization::NTuple{3, <:Real} = (1.0, 0.0, 0.0),
+    wavelength::Real = 1.0,
+    amplitude::Real = 1.0,
+    epsilon::Real = 1.0,
+    mu::Real = 1.0,
+    phase_shift::Real = 0.0,
+)
+    wavelength > 0.0 ||
+        throw(ArgumentError("Incident wavelength must be positive."))
+    epsilon > 0.0 ||
+        throw(ArgumentError("Incident permittivity must be positive."))
+    mu > 0.0 ||
+        throw(ArgumentError("Incident permeability must be positive."))
+
+    direction = normalize_vector3(propagation_direction, "Propagation direction")
+    pol = normalize_vector3(polarization, "Polarization")
+    alignment =
+        direction[1] * pol[1] + direction[2] * pol[2] + direction[3] * pol[3]
+    abs(alignment) <= 1.0e-12 ||
+        throw(
+            ArgumentError(
+                "Incident polarization must be perpendicular to the " *
+                "propagation direction; dot product is $alignment.",
+            ),
+        )
+
+    return IncidentPlaneWaveParameters(
+        direction,
+        pol,
+        Float64(wavelength),
+        Float64(amplitude),
+        Float64(epsilon),
+        Float64(mu),
+        Float64(phase_shift),
+    )
+end
+
+incident_plane_wave_number(wave::IncidentPlaneWaveParameters) =
+    2.0 * pi / wave.wavelength
+
+incident_plane_wave_speed(wave::IncidentPlaneWaveParameters) =
+    1.0 / sqrt(wave.epsilon * wave.mu)
+
+incident_plane_wave_angular_frequency(wave::IncidentPlaneWaveParameters) =
+    incident_plane_wave_speed(wave) * incident_plane_wave_number(wave)
+
+incident_plane_wave_impedance(wave::IncidentPlaneWaveParameters) =
+    sqrt(wave.mu / wave.epsilon)
+
+function incident_plane_wave_phase(
+    wave::IncidentPlaneWaveParameters,
+    x::Real,
+    y::Real,
+    z::Real,
+    time::Real,
+)
+    k = incident_plane_wave_number(wave)
+    ω = incident_plane_wave_angular_frequency(wave)
+    coordinate =
+        wave.propagation_direction[1] * Float64(x) +
+        wave.propagation_direction[2] * Float64(y) +
+        wave.propagation_direction[3] * Float64(z)
+    return k * coordinate - ω * Float64(time) + wave.phase_shift
+end
+
+function incident_electric_plane_wave(
+    x::Real,
+    y::Real,
+    z::Real,
+    time::Real,
+    wave::IncidentPlaneWaveParameters = IncidentPlaneWaveParameters(),
+)
+    value =
+        wave.amplitude *
+        cos(incident_plane_wave_phase(wave, x, y, z, time))
+    return (
+        value * wave.polarization[1],
+        value * wave.polarization[2],
+        value * wave.polarization[3],
+    )
+end
+
+function incident_magnetic_plane_wave(
+    x::Real,
+    y::Real,
+    z::Real,
+    time::Real,
+    wave::IncidentPlaneWaveParameters = IncidentPlaneWaveParameters(),
+)
+    value =
+        wave.amplitude *
+        cos(incident_plane_wave_phase(wave, x, y, z, time)) /
+        incident_plane_wave_impedance(wave)
+    direction = wave.propagation_direction
+    polarization = wave.polarization
+    magnetic_direction = (
+        direction[2] * polarization[3] - direction[3] * polarization[2],
+        direction[3] * polarization[1] - direction[1] * polarization[3],
+        direction[1] * polarization[2] - direction[2] * polarization[1],
+    )
+    return (
+        value * magnetic_direction[1],
+        value * magnetic_direction[2],
+        value * magnetic_direction[3],
+    )
+end
+
+function exact_incident_plane_wave_functions(
+    time::Float64;
+    wave::IncidentPlaneWaveParameters = IncidentPlaneWaveParameters(),
+)
+    electric = (x, y, z) ->
+        incident_electric_plane_wave(x, y, z, time, wave)
+    magnetic = (x, y, z) ->
+        incident_magnetic_plane_wave(x, y, z, time, wave)
+    return electric, magnetic
+end
+
 function exact_cavity_mode_functions(
     time::Float64;
     epsilon::Float64,

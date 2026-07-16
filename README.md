@@ -126,10 +126,12 @@ mpiexec -n 2 julia --project=. \
   examples/distributed_poisson_bracket_maxwell.jl \
   --boundary-condition=pmc \
   --pml-width=0.2 --pml-sigma-max=12 \
-  --pml-degree=2 --rk-order=4
+  --pml-degree=2 --esprk-order=4
 ```
 
-PML runs use explicit RK instead of ESPRK. The undamped analytical cavity
+The production driver keeps the H-first ESPRK update when PML is active and
+passes the PML source through the same Poisson-bracket RHS closure. Scalar
+`--epsilon` and `--mu` values are supported. The undamped analytical cavity
 mode remains in the diagnostic files as a reference, but is no longer the
 exact solution once damping is active.
 
@@ -203,7 +205,6 @@ pair is still checked against the strict aggregate targets `E=N+1` and `H=N`,
 but the component and leakage diagnostics should be inspected when the strict
 electric aggregate check fails.
 
-<<<<<<< HEAD
 ### Strict periodic space-time isoresolution study
 
 The strict isoresolution driver uses the fixed periodic domain
@@ -268,26 +269,24 @@ reported separately, with the latter checking finite and monotonically
 decreasing active-component errors and finest-pair `Ez`/`Hy` rates for both
 temporal norms. The machine-readable summary is `<output-stem>_verdict.toml`.
 
-=======
->>>>>>> origin/main
-Run the distributed validation matrix to collect these checks across one rank
-and multiple ranks:
+Use the distributed validation matrix as the release correctness gate before
+major changes:
 
 ```bash
 julia --project=. examples/validate_distributed_maxwell_matrix.jl \
-  --profile=standard \
-  --cases=cavity-pec,cavity-pmc,periodic \
-  --ranks=1,2
+  --profile=standard
 ```
 
-The validation matrix reuses the public convergence and production drivers.
-It writes `validation_matrix.csv` under `output/validation_matrix/`, compares
-rank-1 CSV diagnostics against each multi-rank run within configurable
-tolerances, and records explicit expected-rate checks. For cavity PEC/PMC
-cases the aggregate targets are `E=N+1` and `H=N`; for the periodic plane wave
-the matrix additionally checks the active components `Ez=N+1` and `Hy=N`.
-Use `--profile=smoke` for quick rank-equivalence checks and `--profile=strict`
-for more expensive certification runs.
+By default this runs PEC, PMC, periodic plane-wave, and PML smoke cases over
+1, 2, and 4 MPI ranks. It reuses the public convergence and production drivers,
+compares rank-1 diagnostics against multi-rank runs, checks expected convergence
+rates where they are meaningful, enforces invariant tolerances for energy,
+charge, momentum, angular momentum, and optical chirality, and launches the
+standalone MPI regression tests from the same orchestrator. The detailed matrix
+is `validation_matrix.csv`; the official machine-readable release summary is
+`validation_summary.json` under `output/validation_matrix/`. Use
+`--profile=smoke` for a shorter local gate and `--profile=strict` for the more
+expensive certification run.
 
 ## Materials and boundary conditions
 
@@ -324,8 +323,8 @@ maxwell_rhs!(
 ## Nonlinear six-field PML
 
 `src/NonlinearPML.jl` implements the primary nonlinear PML system from
-Abarbanel, Gottlieb, and Hesthaven (2006). In the current dimensionless
-vacuum implementation,
+Abarbanel, Gottlieb, and Hesthaven (2006). For homogeneous unit material
+coefficients, the implemented source reduces to
 
 ```text
 dE/dt = curl(H) + (sigma .* P_H) x H
@@ -340,8 +339,7 @@ The default is `a=0.5` with a positive denominator regularization of
 identity in the paper; those are inconsistent with the sign printed in its
 vector equation (2.10).
 
-Build nodal damping profiles and advance one distributed explicit RK step
-with:
+Build nodal damping profiles and advance one distributed ESPRK step with:
 
 ```julia
 pml = build_maxwell_nonlinear_pml(
@@ -356,25 +354,29 @@ pml = build_maxwell_nonlinear_pml(
     regularization = 1e-12,
 )
 
-run_distributed_maxwell_nonlinear_pml_time_steps!(
+scheme = explicit_partitioned_symplectic_rk_scheme(4; first_partition = :H)
+work = MaxwellPartitionedRKWorkspace(U, scheme)
+distributed_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
     U,
+    work,
+    scheme,
+    dt,
     distributed_dg,
     registry,
     PoissonBracketFormulation(),
     pml;
-    rk_order = 4,
-    dt = dt,
-    nsteps = 100,
-    energy_every = 10,
+    ε = 2.0,
+    μ = 3.0,
 )
 ```
 
-Use `distributed_periodic_maxwell_nonlinear_pml_rk_step!` when some boundary
-pairs are periodic. The PML source is evaluated only on owned elements; it
-adds no auxiliary fields and requires no additional MPI traces. Use an
-explicit RK method rather than ESPRK because damping destroys the conservative
-Poisson-bracket structure. Both PEC and PMC outer boundaries are supported.
-Heterogeneous material coupling is not yet implemented for this PML path.
+Use `distributed_periodic_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!`
+when some boundary pairs are periodic. Explicit-RK PML helper functions remain
+available for non-Hamiltonian experiments. The PML source is evaluated only on
+owned elements; it adds no auxiliary fields and requires no additional MPI
+traces. Both PEC and PMC outer boundaries are supported. Heterogeneous
+piecewise-constant `MaxwellElementMaterials` are supported by the material-aware
+PML RHS and timestep overloads.
 
 Run the distributed Gaussian-pulse demonstration with:
 
@@ -389,6 +391,187 @@ mpiexec -n 2 julia --project=. \
 The box is periodic in `y` and `z`, has nonlinear PML layers at both `x`
 ends, and writes sampled global energy to
 `output/distributed_nonlinear_pml/energy.csv`.
+
+The first release-gate validation for the nonlinear PML is the empty-domain
+incident-wave reflection test:
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/validate_empty_domain_incident_pml.jl \
+  --max-reflection-ratio=1e-2 \
+  --max-final-energy-ratio=2.5e-1
+```
+
+By default this gate uses
+`examples/meshes/periodic_box_structured_nx16_ny8_nz8.vtk`, order `p=2`,
+ESPRK order `3`, `lambda0=0.5`, a right-going sine-modulated Gaussian pulse,
+periodic `y/z` boundaries, and nonlinear PML layers of width `0.5` on the two
+`x` ends. It writes
+`output/validation_sequence/empty_domain_incident_pml/empty_domain_incident_pml_summary.csv`
+and `.json`. The gate fails if the left-monitor reflected energy ratio exceeds
+`--max-reflection-ratio`, if the final total energy ratio exceeds
+`--max-final-energy-ratio`, or if the PML run grows energy beyond
+`--max-energy-growth`. Any option accepted by the production PML sweep driver
+can also be passed to this gate, for example `--mesh`, `--flux`,
+`--pml-width`, or `--sigma-max`.
+
+The next validation-sequence gate checks the incident-aware PEC condition on
+the metallic sphere:
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/validate_pec_sphere_boundary_residual.jl \
+  --max-final-relative-rms=1e-1
+```
+
+The scattering driver now writes
+`diagnostics/pec_boundary_residual.csv`, containing the sphere-surface
+diagnostic `||n x E_total||`, its RMS value, incident-amplitude-normalized RMS,
+and pointwise maximum. The gate writes
+`output/validation_sequence/pec_sphere_boundary_residual/pec_sphere_boundary_residual_summary.csv`
+and `.json`, and exits nonzero if the configured residual threshold fails.
+Use `--max-final-l2`, `--max-final-relative-max`, and
+`--max-sampled-relative-rms` to enable stricter checks. The gate defaults to
+`examples/meshes/metallic_sphere_scattering_validation.vtk`, a coarse
+validation mesh with about `2.9e4` tetrahedra. The higher-resolution
+`metallic_sphere_scattering.vtk` mesh has about `3.6e5` tetrahedra and is
+intended for production scattering/RCS studies, not for the quick residual
+gate.
+
+The qualitative scattered-field gate prepares the ParaView datasets used to
+inspect the scattered `E_x` and `H_y` fields:
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/validate_scattered_ex_hy_fields.jl
+```
+
+This gate uses the same coarse validation sphere mesh, runs a short scattering
+case, writes `fields.pvd`, and verifies that the final PVTU snapshot contains
+the vector arrays `E_scat` and `H_scat`. In ParaView, open the reported
+`fields.pvd` file and display the components `E_scat_x` and `H_scat_y`. The
+gate also writes `scattered_ex_hy_fields_summary.csv` and `.json` with the
+final PVD/PVTU paths and array checks.
+
+The next validation-sequence gate runs the coarse PEC-sphere RCS extraction
+and compares the angular samples against the exact PEC Mie series:
+
+The production workflow is documented in detail in
+`docs/numerics/rcs_metallic_sphere.md`. The implementation is centered on
+`examples/distributed_metallic_sphere_scattering.jl`, which solves for the
+scattered field of a PEC sphere under a `+z` propagating, `x` polarized
+incident plane wave. The physical field is reconstructed as
+`E_total = E_scat + E_inc` and `H_total = H_scat + H_inc`; the metallic sphere
+enforces `n x E_total = 0`. When `--enable-rcs` is active, the driver
+integrates the PEC surface current `J_s = n x H_total`, performs a
+time-windowed Fourier extraction at the incident frequency, reconstructs the
+far field, and writes
+`sigma(theta,phi) = 4*pi*|E_infinity_scat|^2/|E_inc|^2` to
+`diagnostics/rcs.csv`.
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/validate_coarse_sphere_rcs.jl
+```
+
+By default it uses `metallic_sphere_scattering_validation.vtk`, order `p=1`,
+RCS extraction over `37` polar angles at `phi=0`, and no ParaView output. It
+writes the numerical RCS table to `diagnostics/rcs.csv`, the Mie comparison to
+`diagnostics/coarse_mie_rcs_comparison.csv`, and machine-readable summaries to
+`coarse_sphere_rcs_summary.csv` and `.json`. The default pass/fail check is a
+coarse release-gate check: finite rows, at least one accumulated RCS sample,
+positive window weight, and nonzero numerical RCS. Add
+`--max-absolute-normalized-error`, `--max-rms-relative-error`, or
+`--max-db-error` when a stricter quantitative RCS gate is appropriate for the
+chosen mesh, final time, and transient window.
+
+The main RCS controls are:
+
+- `--rcs-start-time`: ignore samples before this time. For quantitative Mie
+  comparison it should be after the incident-wave startup transient has left
+  the near field.
+- `--rcs-every`: time-step interval for Fourier/RCS samples. Values such as
+  `5` or `10` are usually enough for long runs; `1` is useful for short smoke
+  tests but adds overhead.
+- `--rcs-theta-count`, `--rcs-theta-min-degrees`,
+  `--rcs-theta-max-degrees`: polar scattering angle grid.
+- `--rcs-phi-degrees`: comma-separated azimuth angles. The default `0`
+  produces the standard E-plane comparison for this incident polarization.
+
+For a lighter high-order smoke run, generate the EPW4 mesh and run the same
+gate with `p=4`/ESPRK5:
+
+```bash
+gmsh examples/meshes/metallic_sphere_scattering.geo -3 -format vtk \
+  -o examples/meshes/metallic_sphere_scattering_epw4.vtk \
+  -setnumber ElementsPerWavelength 4 \
+  -setnumber SphereMeshSizeFactor 1.0 \
+  -setnumber PMLMeshSizeFactor 3.0 \
+  -setnumber FarMeshSizeFactor 4.0 \
+  -setnumber CurvatureSamples 8 \
+  -setnumber PMLWidth 1.0 \
+  -setnumber AirBuffer 1.0 \
+  -setnumber OptimizeMesh 0
+
+mpiexec -n 2 -genv OPENBLAS_NUM_THREADS 1 julia --project=. \
+  examples/validate_coarse_sphere_rcs.jl \
+  --mesh=examples/meshes/metallic_sphere_scattering_epw4.vtk \
+  --order=4 --esprk-order=5 \
+  --final-time=1e-6 --rcs-start-time=1e-6 \
+  --rcs-every=1 --diagnostics-every=1 \
+  --min-max-rcs=0 \
+  --output-dir=output/validation_sequence/coarse_sphere_rcs_epw4_p4_smoke
+```
+
+The existing Mie postprocessor can be used directly on any RCS run directory:
+
+```bash
+python3 examples/postprocess_metallic_sphere_mie_rcs.py \
+  --run-dir output/validation_sequence/coarse_sphere_rcs_epw4_p4_smoke
+```
+
+It writes `diagnostics/mie_rcs_comparison.csv`,
+`tables/mie_rcs_comparison.tex`, and `plots/mie_rcs_comparison.pdf`. A
+one-step run validates the high-order RCS/output/postprocessing path only; use
+a longer final time and a transient-free `--rcs-start-time` for quantitative
+Mie agreement.
+
+Interpret the two-panel postprocessor figure as follows. The top panel compares
+`10 log10(sigma/(pi a^2))` against the exact Mie curve. The bottom panel shows
+`|sigma_h-sigma_Mie|/|sigma_Mie|`. Large errors in a one-step or startup-window
+run are expected and do not by themselves indicate a broken RCS implementation.
+A quantitative validation should show stable RCS curves under later
+`--rcs-start-time`, smaller `--rcs-every`, mesh refinement, and increased
+polynomial order.
+
+For production Poisson-bracket/ESPRK PML validation, use the separate sweep
+driver:
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_pml_validation.jl \
+  --mesh=examples/meshes/periodic_box_structured_nx16_ny8_nz8.vtk \
+  --order=2 --esprk-order=3 \
+  --final-time=3.0 --cfl=0.15 \
+  --central-wavelength=0.5 \
+  --fluxes=centered,alternating \
+  --pml-widths=0.25,0.5 \
+  --sigma-maxes=8,12 --sigma-degrees=2,3 \
+  --paraview-every=25
+```
+
+Each sweep case is isolated under
+`output/poisson_bracket_pml_validation/<case>/`. The case directory contains
+`diagnostics/energy.csv`, `diagnostics/reflection_diagnostics.csv`,
+`fields.pvd` with parallel VTU time-series data, resolved run configuration,
+the input manifest, run metadata, and partition metadata. The sweep root also
+writes `sweep_summary.csv` with the final energy ratio and measured reflection
+ratio. Alternating Poisson-bracket fluxes currently require PEC outer
+boundaries; centered fluxes can be run with PEC, PMC, or first-order absorbing
+outer boundaries. Use `--meshes=mesh1.vtk,mesh2.vtk` to sweep over multiple
+axis-aligned periodic cuboid meshes. The default carrier is a sine-modulated
+Gaussian with `lambda0=0.5`; for the `nx16` mesh this gives four x-elements
+per central wavelength and `f0=2` when `epsilon=mu=1`.
 
 Periodic boundary IDs are paired geometrically across all ranks. Pass
 `materials` while building the exchange when periodic partners may have

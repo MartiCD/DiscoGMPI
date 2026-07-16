@@ -15,33 +15,16 @@
 include(joinpath(@__DIR__, "distributed_poisson_bracket_maxwell.jl"))
 
 using Printf
-using Random
 
 const REFERENCE_TET_VOLUME = 4.0 / 3.0
 const CONVERGENCE_RATE_TOLERANCE = 0.5
 const COMPONENT_RATE_ERROR_FLOOR = 1e-12
 const UNSTRUCTURED_MESH_LEVELS = collect(0:3)
 
-struct DistributedConvergenceConfig
-    mesh_parameters::Vector{Int}
-    mesh_family::Symbol
-    mesh_dir::String
-    orders::Vector{Int}
-    final_time::Float64
-    periods::Union{Nothing, Float64}
-    cfl::Float64
-    cfl_divisor::Float64
-    jitter::Float64
-    seed::Int
-    epsilon::Float64
-    mu::Float64
-    boundary_condition::Symbol
-    output::String
-end
-
 Base.@kwdef mutable struct DistributedConvergenceResult
     mpi_ranks::Int
     boundary_condition::Symbol
+    flux::String
     mesh_family::Symbol
     order::Int
     esprk_order::Int
@@ -160,6 +143,8 @@ Common options
   --boundary-condition=NAME
                       Exterior boundary condition: pec or pmc.
                       Default: pec
+  --flux=NAME         Poisson-bracket surface flux: centered or alternating.
+                      Default: centered
   --output=PATH       Output CSV. Default:
                       output/convergence_distributed_poisson_bracket.csv
   --help              Show this message.
@@ -176,7 +161,7 @@ Reported diagnostics
 Method
 ------
   - unit-cube PEC eigenmode or its electromagnetic-dual PMC mode
-  - PoissonBracketFormulation with centered flux
+  - PoissonBracketFormulation with selectable centered/alternating flux
   - H-first ESPRK with time order N+1
   - Jaskowiec-Sukumar cubature order max(2,2N+4)
   - finest-pair checks: E components N+1, H components N
@@ -207,6 +192,7 @@ function parse_convergence_arguments(args::Vector{String})
     epsilon = 1.0
     mu = 1.0
     boundary_condition = :pec
+    flux_kind = MaxwellFlux_Central
     output =
         joinpath("output", "convergence_distributed_poisson_bracket.csv")
 
@@ -261,6 +247,8 @@ function parse_convergence_arguments(args::Vector{String})
         elseif startswith(arg, "--boundary-condition=")
             boundary_condition =
                 Symbol(lowercase(split(arg, "=", limit = 2)[2]))
+        elseif startswith(arg, "--flux=")
+            flux_kind = parse_maxwell_flux_kind(split(arg, "=", limit = 2)[2])
         elseif startswith(arg, "--output=")
             output = split(arg, "=", limit = 2)[2]
         else
@@ -337,6 +325,15 @@ function parse_convergence_arguments(args::Vector{String})
         throw(ArgumentError("--mu must be positive."))
     boundary_condition in (:pec, :pmc) ||
         throw(ArgumentError("--boundary-condition must be pec or pmc."))
+    flux_kind in (MaxwellFlux_Central, MaxwellFlux_Alternating) ||
+        throw(ArgumentError("--flux must be centered or alternating."))
+    if flux_kind == MaxwellFlux_Alternating && boundary_condition != :pec
+        throw(
+            ArgumentError(
+                "--flux=alternating currently supports --boundary-condition=pec.",
+            ),
+        )
+    end
 
     if periods !== nothing
         final_time = periods * cavity_wave_period(epsilon, mu)
@@ -356,6 +353,7 @@ function parse_convergence_arguments(args::Vector{String})
         epsilon,
         mu,
         boundary_condition,
+        flux_kind,
         abspath(output),
     )
 end
@@ -363,118 +361,19 @@ end
 effective_convergence_cfl(config::DistributedConvergenceConfig) =
     config.cfl / config.cfl_divisor
 
-function convergence_node_id(
-    i::Int,
-    j::Int,
-    k::Int,
-    cells_per_axis::Int,
-)
-    nodes_per_axis = cells_per_axis + 1
-    return 1 + i + nodes_per_axis * (j + nodes_per_axis * k)
-end
-
-function build_convergence_points(
-    cells_per_axis::Int;
-    jitter::Float64,
-    seed::Int,
-)
-    nodes_per_axis = cells_per_axis + 1
-    coordinates = collect(range(0.0, 1.0; length = nodes_per_axis))
-    mesh_spacing = 1.0 / cells_per_axis
-    random = MersenneTwister(seed + cells_per_axis)
-    points = zeros(Float64, 3, nodes_per_axis^3)
-
-    for k in 0:cells_per_axis
-        for j in 0:cells_per_axis
-            for i in 0:cells_per_axis
-                node = convergence_node_id(i, j, k, cells_per_axis)
-                x = coordinates[i + 1]
-                y = coordinates[j + 1]
-                z = coordinates[k + 1]
-
-                if 0 < i < cells_per_axis &&
-                   0 < j < cells_per_axis &&
-                   0 < k < cells_per_axis
-                    scale = jitter * mesh_spacing
-                    x += scale * (2.0 * rand(random) - 1.0)
-                    y += scale * (2.0 * rand(random) - 1.0)
-                    z += scale * (2.0 * rand(random) - 1.0)
-                end
-
-                points[:, node] .= (x, y, z)
-            end
-        end
-    end
-
-    return points
-end
-
-function build_convergence_tets(cells_per_axis::Int)
-    tetrahedra = NTuple{4, Int}[]
-
-    for k in 0:(cells_per_axis - 1)
-        for j in 0:(cells_per_axis - 1)
-            for i in 0:(cells_per_axis - 1)
-                v000 = convergence_node_id(i, j, k, cells_per_axis)
-                v100 = convergence_node_id(i + 1, j, k, cells_per_axis)
-                v010 = convergence_node_id(i, j + 1, k, cells_per_axis)
-                v110 =
-                    convergence_node_id(i + 1, j + 1, k, cells_per_axis)
-                v001 = convergence_node_id(i, j, k + 1, cells_per_axis)
-                v101 =
-                    convergence_node_id(i + 1, j, k + 1, cells_per_axis)
-                v011 =
-                    convergence_node_id(i, j + 1, k + 1, cells_per_axis)
-                v111 =
-                    convergence_node_id(
-                        i + 1,
-                        j + 1,
-                        k + 1,
-                        cells_per_axis,
-                    )
-
-                push!(tetrahedra, (v000, v100, v110, v111))
-                push!(tetrahedra, (v000, v110, v010, v111))
-                push!(tetrahedra, (v000, v010, v011, v111))
-                push!(tetrahedra, (v000, v011, v001, v111))
-                push!(tetrahedra, (v000, v001, v101, v111))
-                push!(tetrahedra, (v000, v101, v100, v111))
-            end
-        end
-    end
-
-    return reduce(hcat, collect.(tetrahedra))
-end
-
 function build_convergence_mesh(
     cells_per_axis::Int;
     jitter::Float64,
     seed::Int,
 )
-    points = build_convergence_points(
+    return structured_box_mesh(
+        cells_per_axis,
+        cells_per_axis,
         cells_per_axis;
+        boundary_id = PEC_BOUNDARY_ID,
         jitter = jitter,
         seed = seed,
     )
-    tets = build_convergence_tets(cells_per_axis)
-    tris = build_boundary_tris(tets)
-    ntets = size(tets, 2)
-    ntris = size(tris, 2)
-    tet_cell_ids = collect(1:ntets)
-    tri_cell_ids = collect((ntets + 1):(ntets + ntris))
-    boundary_ids = zeros(Int, ntets + ntris)
-    boundary_ids[tri_cell_ids] .= PEC_BOUNDARY_ID
-
-    mesh = RawVTUMesh(
-        points,
-        tets,
-        tris,
-        tet_cell_ids,
-        tri_cell_ids,
-        Dict{String, Any}("boundary_id" => boundary_ids),
-    )
-    check_mesh_consistency(mesh)
-    return mesh
 end
 
 unstructured_convergence_mesh_path(
@@ -549,50 +448,10 @@ function root_convergence_mesh(
     return root_mesh, mesh_path
 end
 
-function balanced_spatial_partition(mesh::RawVTUMesh, nranks::Int)
-    nelements = size(mesh.tets, 2)
-    nelements >= nranks ||
-        throw(
-            ArgumentError(
-                "Mesh has $nelements tetrahedra for $nranks MPI ranks.",
-            ),
-        )
-
-    centroids = Vector{NTuple{3, Float64}}(undef, nelements)
-    for elem in 1:nelements
-        nodes = @view mesh.tets[:, elem]
-        centroids[elem] = (
-            sum(@view mesh.points[1, nodes]) / 4.0,
-            sum(@view mesh.points[2, nodes]) / 4.0,
-            sum(@view mesh.points[3, nodes]) / 4.0,
-        )
-    end
-
-    order = sortperm(1:nelements; by = elem -> centroids[elem])
-    partition = zeros(Int, nelements)
-    for (position, elem) in enumerate(order)
-        partition[elem] =
-            min(div((position - 1) * nranks, nelements), nranks - 1)
-    end
-    return partition
-end
-
 function distributed_characteristic_h(
     distributed_dg::DistributedDGDiscretization,
 )
-    local_volume = 0.0
-    for elem in distributed_dg.distributed_mesh.partition.owned
-        local_volume +=
-            REFERENCE_TET_VOLUME *
-            distributed_dg.dg.mappings.tet_mappings[elem].absdetJ
-    end
-    global_volume = MPI.Allreduce(local_volume, +, distributed_dg.comm)
-    nelements = MPI.Allreduce(
-        length(distributed_dg.distributed_mesh.partition.owned),
-        +,
-        distributed_dg.comm,
-    )
-    return (global_volume / nelements)^(1.0 / 3.0)
+    return distributed_mesh_characteristic_h(distributed_dg)
 end
 
 function cavity_space_l2_error_vector!(
@@ -640,6 +499,7 @@ function advance_distributed_convergence_case!(
     epsilon::Float64,
     mu::Float64,
     boundary_condition::Symbol,
+    flux_kind::MaxwellFluxKind,
     cubature_order::Int,
 )
     rk_workspace = MaxwellPartitionedRKWorkspace(U, scheme)
@@ -647,7 +507,7 @@ function advance_distributed_convergence_case!(
         distributed_dg,
         cubature_order,
     )
-    formulation = PoissonBracketFormulation()
+    formulation = PoissonBracketFormulation(flux_kind)
     maxima = cavity_space_l2_error_vector!(
         error_workspace,
         U,
@@ -765,6 +625,7 @@ function run_distributed_convergence_case(
         epsilon = config.epsilon,
         mu = config.mu,
         boundary_condition = config.boundary_condition,
+        flux_kind = config.flux_kind,
         cubature_order = cubature_order,
     )
     final_energy = distributed_maxwell_energy(
@@ -780,6 +641,7 @@ function run_distributed_convergence_case(
     result = DistributedConvergenceResult(
         mpi_ranks = nranks,
         boundary_condition = config.boundary_condition,
+        flux = maxwell_flux_kind_label(config.flux_kind),
         mesh_family = config.mesh_family,
         order = polynomial_order,
         esprk_order = esprk_order,
@@ -821,16 +683,17 @@ function run_distributed_convergence_case(
 end
 
 function convergence_rate(
-    fine_error::Float64,
     coarse_error::Float64,
-    fine_h_max::Float64,
-    coarse_h_max::Float64,
+    fine_error::Float64,
+    coarse_h::Float64,
+    fine_h::Float64,
 )
-    fine_error > 0.0 && coarse_error > 0.0 || return missing
-    fine_h_max > 0.0 && coarse_h_max > 0.0 || return missing
-    coarse_h_max != fine_h_max || return missing
-    return log(coarse_error / fine_error) /
-           log(coarse_h_max / fine_h_max)
+    return observed_convergence_rate(
+        coarse_error,
+        fine_error,
+        coarse_h,
+        fine_h,
+    )
 end
 
 function convergence_errors(result::DistributedConvergenceResult)
@@ -896,15 +759,6 @@ end
 
 formatted_rate(rate::Union{Missing, Float64}) =
     ismissing(rate) ? "-" : @sprintf("%.3f", rate)
-
-function convergence_rate_pass(
-    rate::Union{Missing, Float64},
-    expected::Float64,
-    tolerance::Float64,
-)
-    ismissing(rate) && return missing
-    return isfinite(rate) && rate >= expected - tolerance
-end
 
 function formatted_rate_verdict(
     rate::Union{Missing, Float64},
@@ -1048,7 +902,7 @@ end
 
 function convergence_csv_header()
     return (
-        "mpi_ranks,boundary_condition,mesh_family,order,esprk_order," *
+        "mpi_ranks,boundary_condition,flux,mesh_family,order,esprk_order," *
         "cubature_order,mesh_level,mesh_parameter,nelements," *
         "min_owned_elements,max_owned_elements,characteristic_h,h_min,h_max," *
         "volume_min,volume_max,volume_total,volume_ratio,edge_min,edge_max," *
@@ -1075,6 +929,7 @@ function write_convergence_results(
             values = (
                 result.mpi_ranks,
                 result.boundary_condition,
+                result.flux,
                 result.mesh_family,
                 result.order,
                 result.esprk_order,
@@ -1245,6 +1100,7 @@ function run_convergence_study(
             "boundary condition: ",
             uppercase(string(config.boundary_condition)),
         )
+        println("flux:               ", maxwell_flux_kind_label(config.flux_kind))
         println("ESPRK rule:         order N+1, H-first")
         println("rate length scale:  h_max")
         println("error norm:         L-infinity time, L2 space")

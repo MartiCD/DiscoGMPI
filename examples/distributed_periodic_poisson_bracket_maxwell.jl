@@ -13,47 +13,8 @@ using LinearAlgebra: dot
 using Printf
 const DEFAULT_WAVE_NUMBER = 2.0 * pi
 const MAGNETIC_AMPLITUDE = 1.0
-const TET_FACE_NODE_IDS = (
-    (2, 3, 4),
-    (1, 4, 3),
-    (1, 2, 4),
-    (1, 3, 2),
-)
-const REF_TET_VERTEX_COORDS = (
-    (-1.0, -1.0, -1.0),
-    (1.0, -1.0, -1.0),
-    (-1.0, 1.0, -1.0),
-    (-1.0, -1.0, 1.0),
-)
-
-struct ExperimentConfig
-    mesh_path::String
-    partition_path::String
-    partition_count::Int
-    repartition::Bool
-    distributed_mesh_dir::String
-    rebuild_distributed_mesh::Bool
-    collective_distributed_mesh_prep::Bool
-    output_dir::String
-    polynomial_order::Int
-    esprk_order::Int
-    final_time::Float64
-    cfl::Float64
-    epsilon::Float64
-    mu::Float64
-    wave_number::Float64
-    energy_every::Int
-    cubature_order::Int
-    paraview_every::Int
-    checkpoint_every::Int
-    checkpoint_dir::String
-    restart_path::String
-end
-
-struct PeriodicBox
-    lower::NTuple{3, Float64}
-    upper::NTuple{3, Float64}
-end
+const ExperimentConfig = DistributedPeriodicMaxwellExperimentConfig
+const PeriodicBox = AxisAlignedBox
 
 function usage(io::IO = stdout)
     println(io, """
@@ -87,8 +48,12 @@ Options:
                         mpmetis once before the collective read.
   --output-dir PATH     Output directory.
                         Default: output/distributed_periodic_poisson_bracket
-  --order N             DG polynomial order (N >= 2). Order 1 aliases the
-                        prescribed sine wave to zero on this mesh. Default: 2
+  --run-root PATH       Create an isolated timestamped run directory below PATH.
+                        Mutually exclusive with --output-dir.
+  --run-name NAME       Human-readable run-name suffix for --run-root.
+  --order N             DG polynomial order (N >= 1). On the default
+                        structured mesh, order 1 aliases the prescribed
+                        sine wave to zero. Default: 2
   --esprk-order N       ESPRK order in 1:6. Default: 4
   --final-time T        Simulation end time. Default: 0.25
   --cfl C               CFL used to estimate dt. Default: 0.05
@@ -99,6 +64,8 @@ Options:
   --wave-number VALUE   Positive x-directed wave number. It must contain an
                         integer number of wavelengths in the mesh x extent.
                         Default: 2*pi
+  --flux NAME           Poisson-bracket surface flux: centered or alternating.
+                        Default: centered
   --energy-every N      Write energy every N steps. Default: 1
   --cubature-order N    Jaskowiec-Sukumar volume cubature order.
                         Default: max(2, 2 * DG order + 4)
@@ -115,16 +82,24 @@ Options:
   --help                Show this message.
 
 Outputs:
-  energy.csv                       DG mass-matrix energy history.
-  quadrature_diagnostics.csv       Energy, chirality, L2 errors, charges,
+  diagnostics/energy.csv           DG mass-matrix energy history.
+  diagnostics/quadrature_diagnostics.csv
+                                   Energy, chirality, L2 errors, charges,
                                    and momenta.
-  run_metadata.toml                Run configuration and runtime metadata.
-  partition_metadata.csv           Per-rank ownership and halo metadata.
+  config/run_layout.toml           Run-directory layout.
+  config/resolved_config.toml      Fully resolved run configuration.
+  config/run_metadata.toml         Runtime metadata.
+  config/partition_metadata.csv    Per-rank ownership and halo metadata.
+  input/input_manifest.toml        Mesh, partition, cache, restart inputs.
+  status.toml                      Current run status.
   fields.pvd                       ParaView time-series collection.
   paraview_series.csv              Snapshot step/time index.
   fields/fields_stepNNNNNNNN.pvtu  Parallel field snapshot.
   checkpoints/stepNNNNNNNN/        Per-rank restart checkpoint.
-  integration_points_rankNNNN.csv  Final integration-point values per rank.
+  diagnostics/integration_points_rankNNNN.csv
+                                   Final integration-point values per rank.
+  energy.csv, quadrature_diagnostics.csv, run_metadata.toml, and
+  partition_metadata.csv are compatibility symlinks at the run root.
 """)
 end
 
@@ -148,6 +123,7 @@ function parse_arguments(
     args::Vector{String},
     nranks::Int,
     repository_root::String,
+    run_stamp::String,
 )
     mesh_path = joinpath(
         repository_root,
@@ -167,6 +143,9 @@ function parse_arguments(
             "output",
             "distributed_periodic_poisson_bracket",
         )
+    output_dir_set = false
+    run_root = ""
+    run_name = ""
     polynomial_order = 2
     esprk_order = 4
     final_time = 0.25
@@ -174,6 +153,7 @@ function parse_arguments(
     epsilon = 1.0
     mu = 1.0
     wave_number = DEFAULT_WAVE_NUMBER
+    flux_kind = MaxwellFlux_Central
     energy_every = 1
     cubature_order = 0
     paraview_every = 10
@@ -217,6 +197,13 @@ function parse_arguments(
         elseif startswith(arg, "--output-dir")
             value, i = option_value(args, i, "--output-dir")
             output_dir = abspath(value)
+            output_dir_set = true
+        elseif startswith(arg, "--run-root")
+            value, i = option_value(args, i, "--run-root")
+            run_root = abspath(value)
+        elseif startswith(arg, "--run-name")
+            value, i = option_value(args, i, "--run-name")
+            run_name = value
         elseif startswith(arg, "--order")
             value, i = option_value(args, i, "--order")
             polynomial_order = parse(Int, value)
@@ -238,6 +225,9 @@ function parse_arguments(
         elseif startswith(arg, "--wave-number")
             value, i = option_value(args, i, "--wave-number")
             wave_number = parse(Float64, value)
+        elseif startswith(arg, "--flux")
+            value, i = option_value(args, i, "--flux")
+            flux_kind = parse_maxwell_flux_kind(value)
         elseif startswith(arg, "--energy-every")
             value, i = option_value(args, i, "--energy-every")
             energy_every = parse(Int, value)
@@ -261,6 +251,22 @@ function parse_arguments(
         end
 
         i += 1
+    end
+
+    if !isempty(run_root)
+        output_dir_set &&
+            throw(ArgumentError("--run-root and --output-dir are mutually exclusive."))
+        if isempty(run_name)
+            run_name =
+                "periodic-poisson-bracket_" *
+                maxwell_flux_kind_label(flux_kind) *
+                "_p$(polynomial_order)_r$(nranks)"
+        end
+        output_dir = isolated_run_directory(
+            run_root,
+            run_name;
+            stamp = run_stamp,
+        )
     end
 
     partition_count >= 1 ||
@@ -294,13 +300,8 @@ function parse_arguments(
         checkpoint_dir = joinpath(output_dir, "checkpoints")
     end
 
-    polynomial_order >= 2 ||
-        throw(
-            ArgumentError(
-                "--order must be at least 2: for this mesh, all order-1 DG " *
-                "nodes lie at zeros of sin(2*pi*x).",
-            ),
-        )
+    polynomial_order >= 1 ||
+        throw(ArgumentError("--order must be at least 1."))
     1 <= esprk_order <= 6 ||
         throw(ArgumentError("--esprk-order must be in 1:6."))
     final_time > 0.0 ||
@@ -313,6 +314,8 @@ function parse_arguments(
         throw(ArgumentError("--mu must be positive."))
     wave_number > 0.0 ||
         throw(ArgumentError("--wave-number must be positive."))
+    flux_kind in (MaxwellFlux_Central, MaxwellFlux_Alternating) ||
+        throw(ArgumentError("--flux must be centered or alternating."))
     isapprox(epsilon, 1.0; rtol = 0.0, atol = 1e-14) ||
         throw(ArgumentError("The prescribed analytical solution requires epsilon=1."))
     isapprox(mu, 1.0; rtol = 0.0, atol = 1e-14) ||
@@ -342,6 +345,7 @@ function parse_arguments(
         epsilon,
         mu,
         wave_number,
+        flux_kind,
         energy_every,
         cubature_order,
         paraview_every,
@@ -351,309 +355,33 @@ function parse_arguments(
     )
 end
 
-function sorted_face_key(nodes::NTuple{3, Int})
-    values = sort(collect(nodes))
-    return (values[1], values[2], values[3])
-end
+load_periodic_mesh(mesh_path::String) =
+    load_periodic_box_mesh(mesh_path)
 
-function build_boundary_tris(tets::Matrix{Int})
-    counts = Dict{NTuple{3, Int}, Int}()
-    oriented_nodes = Dict{NTuple{3, Int}, NTuple{3, Int}}()
-
-    for elem in axes(tets, 2)
-        tet = @view tets[:, elem]
-
-        for ids in TET_FACE_NODE_IDS
-            nodes = (tet[ids[1]], tet[ids[2]], tet[ids[3]])
-            key = sorted_face_key(nodes)
-            counts[key] = get(counts, key, 0) + 1
-            oriented_nodes[key] = nodes
-        end
-    end
-
-    boundary_faces = NTuple{3, Int}[]
-
-    for (key, count) in counts
-        if count == 1
-            push!(boundary_faces, oriented_nodes[key])
-        elseif count != 2
-            error("Non-manifold tetrahedral face $key appears $count times.")
-        end
-    end
-
-    sort!(boundary_faces; by = sorted_face_key)
-    return reduce(hcat, collect.(boundary_faces))
-end
-
-function periodic_boundary_id(
-    points::Matrix{Float64},
-    triangle::AbstractVector{Int};
-    box::PeriodicBox,
-    tolerance::Float64 = 1e-10,
-)
-    centroid = (
-        sum(@view points[1, triangle]) / 3.0,
-        sum(@view points[2, triangle]) / 3.0,
-        sum(@view points[3, triangle]) / 3.0,
-    )
-    abs(centroid[1] - box.lower[1]) <= tolerance && return 1
-    abs(centroid[1] - box.upper[1]) <= tolerance && return 2
-    abs(centroid[2] - box.lower[2]) <= tolerance && return 3
-    abs(centroid[2] - box.upper[2]) <= tolerance && return 4
-    abs(centroid[3] - box.lower[3]) <= tolerance && return 5
-    abs(centroid[3] - box.upper[3]) <= tolerance && return 6
-
-    error(
-        "Boundary triangle $(collect(triangle)) at centroid $centroid is not " *
-        "on one of the inferred box planes $(box.lower) to $(box.upper). " *
-        "The periodic driver requires an axis-aligned box mesh.",
-    )
-end
-
-function periodic_box(points::Matrix{Float64})
-    size(points, 2) > 0 || error("Cannot infer bounds from an empty mesh.")
-    lower_values = vec(minimum(points; dims = 2))
-    upper_values = vec(maximum(points; dims = 2))
-    lower = Tuple(lower_values)
-    upper = Tuple(upper_values)
-    lengths = ntuple(dimension -> upper[dimension] - lower[dimension], 3)
-    all(>(0.0), lengths) ||
-        error("The periodic mesh has degenerate coordinate bounds $lower to $upper.")
-    return PeriodicBox(lower, upper)
-end
-
-function periodic_box_lengths(box::PeriodicBox)
-    return ntuple(
-        dimension -> box.upper[dimension] - box.lower[dimension],
-        3,
-    )
-end
-
-function load_periodic_mesh(mesh_path::String)
-    points, tets = read_mesh_file_tet_vtk(mesh_path)
-    size(tets, 2) > 0 ||
-        error("The mesh '$mesh_path' contains no tetrahedra.")
-
-    box = periodic_box(points)
-    tolerance = max(1e-10, 1e-10 * maximum(periodic_box_lengths(box)))
-
-    tris = build_boundary_tris(tets)
-    ntets = size(tets, 2)
-    ntris = size(tris, 2)
-    tet_cell_ids = collect(1:ntets)
-    tri_cell_ids = collect((ntets + 1):(ntets + ntris))
-    boundary_ids = zeros(Int, ntets + ntris)
-    for triangle in axes(tris, 2)
-        boundary_ids[ntets + triangle] =
-            periodic_boundary_id(
-                points,
-                @view(tris[:, triangle]);
-                box = box,
-                tolerance = tolerance,
-            )
-    end
-
-    mesh = RawVTUMesh(
-        points,
-        tets,
-        tris,
-        tet_cell_ids,
-        tri_cell_ids,
-        Dict{String, Any}("boundary_id" => boundary_ids),
-    )
-    check_mesh_consistency(mesh)
-    return mesh
-end
-
-function periodic_boundary_specs(box::PeriodicBox)
-    Lx, Ly, Lz = periodic_box_lengths(box)
-    return (
-        DiscoGMPI.PeriodicBoundarySpec(
-            1,
-            2,
-            (-Lx, 0.0, 0.0),
-            :x_periodic,
-        ),
-        DiscoGMPI.PeriodicBoundarySpec(
-            3,
-            4,
-            (0.0, -Ly, 0.0),
-            :y_periodic,
-        ),
-        DiscoGMPI.PeriodicBoundarySpec(
-            5,
-            6,
-            (0.0, 0.0, -Lz),
-            :z_periodic,
-        ),
-    )
-end
-
-function distributed_periodic_box(
-    distributed_dg::DistributedDGDiscretization,
-)
-    points = distributed_dg.dg.mesh.points
-    local_lower = vec(minimum(points; dims = 2))
-    local_upper = vec(maximum(points; dims = 2))
-    global_lower =
-        MPI.Allreduce(local_lower, min, distributed_dg.comm)
-    global_upper =
-        MPI.Allreduce(local_upper, max, distributed_dg.comm)
-    return PeriodicBox(Tuple(global_lower), Tuple(global_upper))
-end
+periodic_box(points::Matrix{Float64}) = infer_axis_aligned_box(points)
+periodic_box_lengths(box::PeriodicBox) = axis_aligned_box_lengths(box)
+periodic_boundary_specs(box::PeriodicBox) = periodic_box_specs(box)
+distributed_periodic_box(distributed_dg::DistributedDGDiscretization) =
+    distributed_axis_aligned_box(distributed_dg)
 
 function configured_plane_wave(
     config::ExperimentConfig,
     box::PeriodicBox,
 )
-    Lx = periodic_box_lengths(box)[1]
-    periods = config.wave_number * Lx / (2.0 * pi)
-    nearest_periods = round(Int, periods)
-    isapprox(periods, nearest_periods; rtol = 1e-10, atol = 1e-10) ||
-        throw(
-            ArgumentError(
-                "--wave-number=$(config.wave_number) gives $periods periods " *
-                "over the inferred x extent $Lx. A periodic analytical wave " *
-                "requires an integer number of periods. For one period use " *
-                "--wave-number=$(2.0 * pi / Lx); multiply that value by an " *
-                "integer for additional periods.",
-            ),
-        )
-    nearest_periods >= 1 ||
-        throw(ArgumentError("The periodic wave must contain at least one x period."))
-
-    angular_frequency =
-        config.wave_number / sqrt(config.epsilon * config.mu)
-    return PlaneWaveParameters(
-        config.wave_number,
-        angular_frequency,
-        MAGNETIC_AMPLITUDE,
-        box.lower[1],
+    return plane_wave_for_periodic_box(
+        box;
+        wave_number = config.wave_number,
+        epsilon = config.epsilon,
+        mu = config.mu,
+        magnetic_amplitude = MAGNETIC_AMPLITUDE,
     )
 end
 
-function resolved_cubature_order(config::ExperimentConfig)
-    order = config.cubature_order == 0 ?
-            max(2, 2 * config.polynomial_order + 4) :
-            config.cubature_order
-    order <= 20 ||
-        error(
-            "DG order $(config.polynomial_order) requires cubature order " *
-            "$order, but Jaskowiec-Sukumar rules are available only through 20.",
-        )
-    return order
-end
-
-function distributed_quadrature_diagnostics(
-    U::MaxwellField,
-    distributed_dg::DistributedDGDiscretization,
-    time::Float64,
-    cubature_order::Int;
-    epsilon::Float64,
-    mu::Float64,
-    wave::PlaneWaveParameters,
-)
-    return distributed_periodic_quadrature_diagnostics(
-        U,
-        distributed_dg,
-        time,
-        cubature_order;
-        epsilon = epsilon,
-        mu = mu,
-        wave = wave,
+resolved_cubature_order(config::ExperimentConfig) =
+    resolved_maxwell_cubature_order(
+        config.polynomial_order,
+        config.cubature_order,
     )
-end
-
-function write_parallel_fields(
-    output_basename::String,
-    distributed_dg::DistributedDGDiscretization,
-    U::MaxwellField;
-    time::Float64,
-    epsilon::Float64,
-    mu::Float64,
-    wave::PlaneWaveParameters,
-)
-    exact_electric, exact_magnetic = exact_periodic_wave_functions(
-        time;
-        epsilon = epsilon,
-        mu = mu,
-        wave = wave,
-    )
-    return write_parallel_maxwell_fields(
-        output_basename,
-        distributed_dg,
-        U;
-        time = time,
-        exact_electric = exact_electric,
-        exact_magnetic = exact_magnetic,
-    )
-end
-
-function write_paraview_snapshot!(
-    entries,
-    output_dir::String,
-    distributed_dg::DistributedDGDiscretization,
-    U::MaxwellField,
-    step::Int,
-    time::Float64,
-    wave::PlaneWaveParameters;
-    epsilon::Float64,
-    mu::Float64,
-)
-    exact_electric, exact_magnetic = exact_periodic_wave_functions(
-        time;
-        epsilon = epsilon,
-        mu = mu,
-        wave = wave,
-    )
-    return write_maxwell_paraview_snapshot!(
-        entries,
-        output_dir,
-        distributed_dg,
-        U,
-        step,
-        time;
-        exact_electric = exact_electric,
-        exact_magnetic = exact_magnetic,
-    )
-end
-
-function write_final_integration_points(
-    output_dir::String,
-    distributed_dg::DistributedDGDiscretization,
-    U::MaxwellField,
-    time::Float64,
-    cubature_order::Int;
-    epsilon::Float64,
-    mu::Float64,
-    wave::PlaneWaveParameters,
-)
-    exact_electric, exact_magnetic = exact_periodic_wave_functions(
-        time;
-        epsilon = epsilon,
-        mu = mu,
-        wave = wave,
-    )
-    exact_curl_electric, exact_curl_magnetic =
-        exact_periodic_wave_curl_functions(
-            time;
-            epsilon = epsilon,
-            mu = mu,
-            wave = wave,
-        )
-    return write_maxwell_integration_points(
-        output_dir,
-        distributed_dg,
-        U,
-        cubature_order;
-        epsilon = epsilon,
-        mu = mu,
-        exact_electric = exact_electric,
-        exact_magnetic = exact_magnetic,
-        exact_curl_electric = exact_curl_electric,
-        exact_curl_magnetic = exact_curl_magnetic,
-    )
-end
 
 function generate_metis_partition(config::ExperimentConfig)
     mkpath(dirname(config.partition_path))
@@ -717,19 +445,14 @@ function validate_partition(
     config::ExperimentConfig,
     nranks::Int,
 )
-    length(partition) == size(mesh.tets, 2) ||
-        error(
-            "Partition file $(config.partition_path) has " *
-            "$(length(partition)) entries, but mesh " *
-            "$(config.mesh_path) has $(size(mesh.tets, 2)) " *
-            "tetrahedra. Use a partition generated for this mesh, " *
-            "or regenerate it with --repartition.",
-        )
-    all(part -> 0 <= part < config.partition_count, partition) ||
-        error("Partition entries must be zero-based ranks in 0:$(nranks - 1).")
-    all(part -> any(==(part), partition), 0:(config.partition_count - 1)) ||
-        error("Every MPI rank must own at least one tetrahedron.")
-    return nothing
+    return validate_element_partition(
+        partition,
+        mesh,
+        nranks;
+        partition_count = config.partition_count,
+        partition_path = config.partition_path,
+        mesh_path = config.mesh_path,
+    )
 end
 
 function load_root_inputs(
@@ -898,7 +621,7 @@ function experiment_configuration(
         "checkpoint_dir" => config.checkpoint_dir,
         "restart_path" => config.restart_path,
         "formulation" => "PoissonBracketFormulation",
-        "flux" => "centered",
+        "flux" => maxwell_flux_kind_label(config.flux_kind),
         "boundary_condition" => "periodic in x, y, and z",
         "periodic_pairs" => "1<->2, 3<->4, 5<->6",
         "analytical_solution" => "traveling wave along +x",
@@ -931,63 +654,32 @@ function checkpoint_metadata(
         "domain_upper" => collect(box.upper),
         "esprk_order" => config.esprk_order,
         "first_partition" => "H",
+        "flux" => maxwell_flux_kind_label(config.flux_kind),
         "distributed_mesh_dir" => config.distributed_mesh_dir,
         "mesh_load_mode" => mesh_load_mode,
     )
-end
-
-function open_history_file(path::String, restarting::Bool)
-    append_existing = restarting && isfile(path) && filesize(path) > 0
-    return open(path, append_existing ? "a" : "w"), !append_existing
-end
-
-function restart_initial_energy(
-    state::DistributedCheckpointState,
-    fallback::Float64,
-)
-    value = get(state.metadata, "initial_energy_total", fallback)
-    return value isa Number ? Float64(value) : parse(Float64, string(value))
-end
-
-function restart_metadata_number(
-    state::DistributedCheckpointState,
-    name::String,
-)
-    haskey(state.metadata, name) || return nothing
-    value = state.metadata[name]
-    return value isa Number ? Float64(value) : parse(Float64, string(value))
 end
 
 function validate_restart_configuration(
     state::DistributedCheckpointState,
     config::ExperimentConfig,
 )
-    for (name, expected) in (
-        ("epsilon", config.epsilon),
-        ("mu", config.mu),
-        ("wave_number", config.wave_number),
-        ("esprk_order", Float64(config.esprk_order)),
+    validate_restart_numbers(
+        state,
+        (
+            ("epsilon", config.epsilon),
+            ("mu", config.mu),
+            ("wave_number", config.wave_number),
+            ("esprk_order", Float64(config.esprk_order)),
+        ),
     )
-        stored = restart_metadata_number(state, name)
-        stored === nothing && continue
-        isapprox(stored, expected; rtol = 0.0, atol = 1e-14) ||
-            throw(
-                ArgumentError(
-                    "Checkpoint $name=$stored does not match the requested " *
-                    "value $expected.",
-                ),
-            )
-    end
-
-    first_partition =
-        get(state.metadata, "first_partition", "H")
-    string(first_partition) == "H" ||
-        throw(
-            ArgumentError(
-                "The checkpoint does not use the required H-first " *
-                "Poisson-bracket integrator.",
-            ),
-        )
+    validate_restart_strings(
+        state,
+        (
+            ("first_partition", "H"),
+            ("flux", maxwell_flux_kind_label(config.flux_kind)),
+        ),
+    )
     return nothing
 end
 
@@ -996,21 +688,8 @@ function remaining_time_step(
     start_time::Float64,
     checkpoint_dt::Float64,
 )
-    remaining = final_time - start_time
-    remaining > 0.0 ||
-        throw(
-            ArgumentError(
-                "--final-time ($final_time) must be greater than the " *
-                "checkpoint time ($start_time).",
-            ),
-        )
-    ratio = remaining / checkpoint_dt
-    nearest = round(Int, ratio)
-    if nearest >= 1 && isapprox(ratio, nearest; rtol = 1e-10, atol = 1e-12)
-        return checkpoint_dt, nearest
-    end
-    nsteps = max(1, ceil(Int, ratio))
-    return remaining / nsteps, nsteps
+    plan = restart_time_plan(final_time, start_time, checkpoint_dt)
+    return plan.dt, plan.nsteps
 end
 
 function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
@@ -1049,7 +728,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         distributed_dg,
         periodic_boundary_specs(box),
     )
-    formulation = PoissonBracketFormulation()
+    formulation = PoissonBracketFormulation(config.flux_kind)
     scheme = explicit_partitioned_symplectic_rk_scheme(
         config.esprk_order;
         first_partition = :H,
@@ -1085,34 +764,23 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     end
     final_step = start_step + remaining_steps
 
-    collective_root_action(
-        comm,
-        "Output directory creation",
-    ) do
-        mkpath(config.output_dir)
-        mkpath(config.checkpoint_dir)
-    end
-    MPI.Barrier(comm)
+    run_paths = prepare_run_directory(config.output_dir, comm)
+    checkpoint_dir =
+        default_checkpoint_dir(config.output_dir, config.checkpoint_dir, run_paths)
 
-    energy_path = joinpath(config.output_dir, "energy.csv")
+    energy_path = run_diagnostics_path(run_paths, "energy.csv")
     quadrature_path =
-        joinpath(config.output_dir, "quadrature_diagnostics.csv")
-    energy_io = nothing
-    quadrature_io = nothing
-    write_history_header = false
+        run_diagnostics_path(run_paths, "quadrature_diagnostics.csv")
+    history_files = DiagnosticHistoryFiles(nothing, nothing, false)
     history_open_error = nothing
     if rank == 0
         try
-            energy_io, energy_header =
-                open_history_file(energy_path, restarting)
-            quadrature_io, quadrature_header =
-                open_history_file(quadrature_path, restarting)
-            energy_header == quadrature_header ||
-                error("Energy and quadrature history append states disagree.")
-            write_history_header = energy_header
+            history_files = open_diagnostic_history_files(
+                energy_path,
+                quadrature_path;
+                restarting = restarting,
+            )
         catch error
-            energy_io !== nothing && close(energy_io)
-            quadrature_io !== nothing && close(quadrature_io)
             history_open_error = sprint(showerror, error)
         end
     end
@@ -1133,7 +801,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         current_energy.total,
     ) :
                            current_energy.total
-    current_quadrature = distributed_quadrature_diagnostics(
+    current_quadrature = distributed_periodic_quadrature_diagnostics(
         U,
         distributed_dg,
         start_time,
@@ -1147,18 +815,18 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         comm,
         "Diagnostic history initialization",
     ) do
-        if write_history_header
-            write_energy_header(energy_io)
-            write_quadrature_diagnostics_header(quadrature_io)
+        if history_files.write_header
+            write_energy_header(history_files.energy_io)
+            write_quadrature_diagnostics_header(history_files.quadrature_io)
             write_energy_row(
-                energy_io,
+                history_files.energy_io,
                 start_step,
                 start_time,
                 current_energy,
                 initial_energy_total,
             )
             write_quadrature_diagnostics_row(
-                quadrature_io,
+                history_files.quadrature_io,
                 start_step,
                 start_time,
                 current_quadrature,
@@ -1203,7 +871,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         println("initial energy:       ", initial_energy_total)
         println("ParaView every:       ", config.paraview_every)
         println("checkpoint every:     ", config.checkpoint_every)
-        println("checkpoint directory: ", config.checkpoint_dir)
+        println("checkpoint directory: ", checkpoint_dir)
         if restarting
             println("restart checkpoint:   ", config.restart_path)
         end
@@ -1218,8 +886,21 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             box,
             wave,
         )
+    collectively_write_run_provenance(
+        run_paths,
+        comm;
+        configuration = configuration,
+        inputs = Dict(
+            "mesh_path" => config.mesh_path,
+            "partition_path" => config.partition_path,
+            "distributed_mesh_dir" => config.distributed_mesh_dir,
+            "mesh_load_mode" => mesh_load_mode,
+            "checkpoint_dir" => checkpoint_dir,
+            "restart_path" => config.restart_path,
+        ),
+    )
     write_distributed_run_metadata(
-        config.output_dir,
+        run_paths.config_dir,
         distributed_dg;
         configuration = configuration,
         runtime = Dict(
@@ -1233,6 +914,18 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             "used_dt" => dt,
             "global_hmin" => global_hmin,
             "initial_energy_total" => initial_energy_total,
+        ),
+    )
+    collectively_write_run_status(
+        run_paths,
+        comm,
+        "running";
+        values = Dict(
+            "start_step" => start_step,
+            "start_time" => start_time,
+            "final_step" => final_step,
+            "target_final_time" => config.final_time,
+            "checkpoint_dir" => checkpoint_dir,
         ),
     )
 
@@ -1259,7 +952,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         root = 0,
     )
     if !snapshot_exists
-        write_paraview_snapshot!(
+        write_periodic_paraview_snapshot!(
             series_entries,
             config.output_dir,
             distributed_dg,
@@ -1313,7 +1006,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                     ε = config.epsilon,
                     μ = config.mu,
                 )
-                final_quadrature = distributed_quadrature_diagnostics(
+                final_quadrature = distributed_periodic_quadrature_diagnostics(
                     U,
                     distributed_dg,
                     time,
@@ -1327,14 +1020,14 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                     "Diagnostic history writing at step $step",
                 ) do
                     relative_drift = write_energy_row(
-                        energy_io,
+                        history_files.energy_io,
                         step,
                         time,
                         final_energy,
                         initial_energy_total,
                     )
                     write_quadrature_diagnostics_row(
-                        quadrature_io,
+                        history_files.quadrature_io,
                         step,
                         time,
                         final_quadrature,
@@ -1359,7 +1052,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             end
 
             if step % config.paraview_every == 0 || step == final_step
-                write_paraview_snapshot!(
+                write_periodic_paraview_snapshot!(
                     series_entries,
                     config.output_dir,
                     distributed_dg,
@@ -1378,7 +1071,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                 step == final_step
             if checkpoint_due
                 checkpoint_path =
-                    checkpoint_step_dir(config.checkpoint_dir, step)
+                    checkpoint_step_dir(checkpoint_dir, step)
                 write_distributed_checkpoint(
                     checkpoint_path,
                     U,
@@ -1390,7 +1083,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                 )
                 collectively_write_latest_checkpoint(
                     comm,
-                    config.checkpoint_dir,
+                    checkpoint_dir,
                     checkpoint_path,
                     step,
                     time,
@@ -1406,8 +1099,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             comm,
             "Diagnostic history closing",
         ) do
-            close(energy_io)
-            close(quadrature_io)
+            close_diagnostic_history_files(history_files)
         end
     end
 
@@ -1415,8 +1107,8 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         comm,
         "Final integration-point output",
     ) do
-        write_final_integration_points(
-            config.output_dir,
+        write_periodic_integration_points(
+            run_paths.diagnostics_dir,
             distributed_dg,
             U,
             final_time,
@@ -1430,7 +1122,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
 
     elapsed = MPI.Allreduce(local_elapsed, max, comm)
     write_distributed_run_metadata(
-        config.output_dir,
+        run_paths.config_dir,
         distributed_dg;
         configuration = configuration,
         runtime = Dict(
@@ -1453,6 +1145,17 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             "final_checkpoint" => final_checkpoint_path,
         ),
     )
+    collectively_write_run_status(
+        run_paths,
+        comm,
+        "complete";
+        values = Dict(
+            "final_step" => final_step,
+            "final_time" => final_time,
+            "integration_wall_seconds" => elapsed,
+            "final_checkpoint" => final_checkpoint_path,
+        ),
+    )
 
     if rank == 0
         println()
@@ -1460,15 +1163,24 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         println("Quadrature diagnostics:", quadrature_path)
         println(
             "Run metadata:          ",
-            joinpath(config.output_dir, "run_metadata.toml"),
+            run_config_path(run_paths, "run_metadata.toml"),
         )
         println(
+            "Resolved config:       ",
+            run_config_path(run_paths, "resolved_config.toml"),
+        )
+        println(
+            "Input manifest:        ",
+            run_input_path(run_paths, "input_manifest.toml"),
+        )
+        println("Run status:            ", joinpath(run_paths.root, "status.toml"))
+        println(
             "Partition metadata:    ",
-            joinpath(config.output_dir, "partition_metadata.csv"),
+            run_config_path(run_paths, "partition_metadata.csv"),
         )
         println(
             "Integration points:    ",
-            joinpath(config.output_dir, "integration_points_rankNNNN.csv"),
+            run_diagnostics_path(run_paths, "integration_points_rankNNNN.csv"),
         )
         println(
             "ParaView time series:  ",
@@ -1493,7 +1205,8 @@ function main(args::Vector{String})
     repository_root = normpath(joinpath(@__DIR__, ".."))
 
     try
-        config = parse_arguments(args, nranks, repository_root)
+        run_stamp = MPI.bcast(rank == 0 ? utc_run_stamp() : "", comm; root = 0)
+        config = parse_arguments(args, nranks, repository_root, run_stamp)
 
         if config === nothing
             rank == 0 && usage()

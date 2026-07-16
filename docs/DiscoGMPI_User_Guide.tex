@@ -5,16 +5,21 @@
 \usepackage{lmodern}
 \usepackage[a4paper,margin=25mm]{geometry}
 \usepackage{microtype}
-\usepackage{amsmath,amssymb,mathtools}
+\usepackage{amsmath,amssymb,mathtools,bm}
 \usepackage{booktabs}
 \usepackage{longtable}
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{tabularx}
 \usepackage{listings}
 \usepackage{fancyhdr}
 \usepackage{hyperref}
 \usepackage[nameinlink,noabbrev]{cleveref}
+\usetikzlibrary{arrows.meta,calc}
+\graphicspath{{./}{../}}
 
 \hypersetup{
   colorlinks=true,
@@ -30,7 +35,7 @@
 \fancyhead[L]{DiscoGMPI User Guide}
 \fancyhead[R]{\leftmark}
 \fancyfoot[C]{\thepage}
-\setlength{\headheight}{14pt}
+\setlength{\headheight}{26pt}
 
 \definecolor{codebg}{RGB}{247,247,247}
 \definecolor{codeframe}{RGB}{210,210,210}
@@ -83,8 +88,21 @@
 \newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\api}[1]{\path{#1}}
 \newcommand{\vect}[1]{\boldsymbol{#1}}
+\newcommand{\unit}[1]{\widehat{\vect{#1}}}
 \newcommand{\jump}[1]{\left[\!\left[#1\right]\!\right]}
 \newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\ii}{\mathrm{i}}
+\newcommand{\ee}{\mathrm{e}}
+\newcommand{\RCS}{\mathrm{RCS}}
+\newcommand{\Einc}{\vect{E}_{\mathrm{inc}}}
+\newcommand{\Hinc}{\vect{H}_{\mathrm{inc}}}
+\newcommand{\Escat}{\vect{E}_{\mathrm{scat}}}
+\newcommand{\Hscat}{\vect{H}_{\mathrm{scat}}}
+\newcommand{\Etot}{\vect{E}_{\mathrm{tot}}}
+\newcommand{\Htot}{\vect{H}_{\mathrm{tot}}}
+\newcommand{\Gpec}{\Gamma_{\mathrm{PEC}}}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash\ttfamily\small}p{#1}}
 \setlength{\emergencystretch}{2em}
 
 \title{\Huge DiscoGMPI\\[0.5em]\Large User Guide and Technical Reference}
@@ -324,14 +342,15 @@ registry = MaxwellBoundaryRegistry(Dict(
 \pkg{} implements the primary nonlinear PML proposed by Abarbanel, Gottlieb,
 and Hesthaven for time-dependent electromagnetics in three dimensions. The
 implementation modifies the six physical Maxwell fields directly and
-introduces no auxiliary unknowns. In its current dimensionless homogeneous
-vacuum form,
+introduces no auxiliary unknowns. For positive isotropic, piecewise-constant
+material coefficients $\varepsilon_K$ and $\mu_K$, the implemented elementwise
+form is
 \begin{align}
-  \frac{\partial \vect E}{\partial t}
+  \varepsilon_K\frac{\partial \vect E}{\partial t}
     &= \nabla\times\vect H
        + (\vect\sigma\odot\vect P_H)\times\vect H,
        \label{eq:nonlinear-pml-e}\\
-  \frac{\partial \vect H}{\partial t}
+  \mu_K\frac{\partial \vect H}{\partial t}
     &= -\nabla\times\vect E
        + (\vect\sigma\odot\vect P_E)\times\vect E,
        \label{eq:nonlinear-pml-h}
@@ -341,11 +360,11 @@ where $\odot$ denotes componentwise multiplication,
   \vect P_H
     &=
     \frac{\vect E\times\vect H}
-    {a|\vect H|^2+(1-a)|\vect E|^2+\delta},\\
+    {a\mu_K|\vect H|^2+(1-a)\varepsilon_K|\vect E|^2+\delta},\\
   \vect P_E
     &=
     -\frac{\vect E\times\vect H}
-    {a|\vect E|^2+(1-a)|\vect H|^2+\delta}.
+    {a\varepsilon_K|\vect E|^2+(1-a)\mu_K|\vect H|^2+\delta}.
 \end{align}
 The recommended and default parameter is $a=1/2$. The positive
 regularization $\delta$, whose default is $10^{-12}$, prevents division by
@@ -357,7 +376,7 @@ $\vect\sigma=(\sigma_x,\sigma_y,\sigma_z)$, the regularized PML contribution
 to the pointwise energy balance is
 \begin{equation}
   \frac{1}{2}\frac{\partial}{\partial t}
-  \left(|\vect E|^2+|\vect H|^2\right)
+  \left(\varepsilon_K|\vect E|^2+\mu_K|\vect H|^2\right)
   =
   -\nabla\cdot(\vect E\times\vect H)
   -
@@ -367,8 +386,8 @@ to the pointwise energy balance is
 \end{equation}
 with
 \[
-  D_H=a|\vect H|^2+(1-a)|\vect E|^2+\delta,\qquad
-  D_E=a|\vect E|^2+(1-a)|\vect H|^2+\delta.
+  D_H=a\mu_K|\vect H|^2+(1-a)\varepsilon_K|\vect E|^2+\delta,\qquad
+  D_E=a\varepsilon_K|\vect E|^2+(1-a)\mu_K|\vect H|^2+\delta.
 \]
 The local PML term is therefore nonpositive.
 
@@ -416,27 +435,25 @@ pml = build_maxwell_nonlinear_pml(
     regularization = 1e-12,
 )
 
-scheme = explicit_rk_scheme(4)
-work = MaxwellRKWorkspace(U, scheme)
-distributed_maxwell_nonlinear_pml_rk_step!(
+scheme = explicit_partitioned_symplectic_rk_scheme(4; first_partition=:H)
+work = MaxwellPartitionedRKWorkspace(U, scheme)
+distributed_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
     U, work, scheme, dt, distributed_dg, registry,
-    HesthavenWarburtonFormulation(:upwind), pml,
+    PoissonBracketFormulation(MaxwellFlux_Alternating), pml;
+    ε = 2.0,
+    μ = 3.0,
 )
 \end{lstlisting}
 
 The periodic wrapper is
-\code{distributed\_periodic\_maxwell\_nonlinear\_pml\_rk\_step!}. On MPI
-ranks, PML sources are added only to owned elements and ghost residuals remain
-zero. Because no additional state variables or traces are introduced, the
-existing six-component halo exchange is sufficient.
-
-The nonlinear PML is dissipative and is therefore advanced with the explicit
-RK family. For \code{PoissonBracketFormulation}, use
-\code{run\_maxwell\_nonlinear\_pml\_time\_steps!} or its distributed
-counterpart rather than the conservative ESPRK driver. The current PML
-wrapper fixes
-$\varepsilon=\mu=1$; coupling this formulation consistently to heterogeneous
-materials is future work.
+\code{distributed\_periodic\_maxwell\_nonlinear\_pml\_partitioned\_symplectic\_rk\_step!}.
+On MPI ranks, PML sources are added only to owned elements and ghost residuals
+remain zero. Because no additional state variables or traces are introduced,
+the existing six-component halo exchange is sufficient. Explicit-RK PML helper
+functions remain available, but the production Poisson-bracket drivers keep the
+requested ESPRK scheme when PML damping is active. The material-aware overloads
+accept \code{MaxwellElementMaterials}; the scalar overloads accept
+\code{epsilon}/\code{mu} through the usual Maxwell RHS coefficients.
 
 \chapter{Tetrahedral DG Discretization}
 
@@ -1295,12 +1312,12 @@ mpiexec -n 2 julia --project=. \
   --pml-width=0.2 \
   --pml-sigma-max=12 \
   --pml-degree=2 \
-  --rk-order=4
+  --esprk-order=4
 \end{lstlisting}
 Both \code{--pml-width} and \code{--pml-sigma-max} must be positive to enable
 the PML, or both zero to disable it. The width must be smaller than half the
-shortest global domain extent. PML runs require
-\code{--epsilon=1 --mu=1} and switch from ESPRK to ordinary explicit RK.
+shortest global domain extent. PML runs support scalar \code{--epsilon} and
+\code{--mu} values and keep the requested H-first ESPRK method.
 The cavity mode remains in the output as an undamped reference; it is not an
 exact solution of the damped problem.
 
@@ -1310,17 +1327,26 @@ The default output directory is
 \code{output/distributed\_poisson\_bracket/}. The driver writes the same
 production artifact family as the periodic driver:
 \begin{itemize}[leftmargin=*]
-  \item \code{energy.csv}: DG mass-matrix electric, magnetic, and total
-        energy;
-  \item \code{quadrature\_diagnostics.csv}: independent-cubature field and
-        energy errors, optical chirality, electric and magnetic charge, and
-        linear and angular momentum;
-  \item \code{fields.pvd} and parallel VTU pieces: ParaView time series;
-  \item \code{integration\_points\_rankNNNN.csv}: final integration-point
-        numerical and analytical values, including pointwise chirality;
-  \item \code{run\_metadata.toml} and \code{partition\_metadata.csv};
-  \item \code{checkpoints/stepNNNNNNNN/}: checksummed rank-local restart data.
+  \item \code{diagnostics/energy.csv}: DG mass-matrix electric, magnetic, and
+        total energy;
+  \item \code{diagnostics/quadrature\_diagnostics.csv}:
+        independent-cubature field and energy errors, optical chirality,
+        electric and magnetic charge, and linear and angular momentum;
+  \item \code{fields.pvd} and \code{fields/fields\_stepNNNNNNNN.pvtu}:
+        ParaView time series;
+  \item \code{diagnostics/integration\_points\_rankNNNN.csv}: final
+        integration-point numerical and analytical values, including pointwise
+        chirality;
+  \item \code{config/run\_metadata.toml},
+        \code{config/resolved\_config.toml}, and
+        \code{config/partition\_metadata.csv};
+  \item \code{input/input\_manifest.toml};
+  \item \code{checkpoints/stepNNNNNNNN/}: checksummed rank-local restart data;
+  \item \code{status.toml}: current run status.
 \end{itemize}
+For backward compatibility, the run root also contains symlinks named
+\code{energy.csv}, \code{quadrature\_diagnostics.csv},
+\code{run\_metadata.toml}, and \code{partition\_metadata.csv}.
 
 At every cubature point, the driver evaluates
 \[
@@ -1528,16 +1554,25 @@ The default output directory is
 \code{output/distributed\_periodic\_poisson\_bracket/}. The driver preserves
 the production I/O behavior of the PEC Poisson-bracket case:
 \begin{itemize}[leftmargin=*]
-  \item \code{energy.csv}: DG mass-matrix electric, magnetic, and total energy;
-  \item \code{quadrature\_diagnostics.csv}: independent-cubature field and
-        energy errors, optical chirality, electric and magnetic charge, and
-        linear and angular momentum;
-  \item \code{fields.pvd} and parallel VTU pieces: ParaView time series;
-  \item \code{integration\_points\_rankNNNN.csv}: final integration-point
-        numerical and analytical values;
-  \item \code{run\_metadata.toml} and \code{partition\_metadata.csv};
-  \item \code{checkpoints/stepNNNNNNNN/}: checksummed rank-local restart data.
+  \item \code{diagnostics/energy.csv}: DG mass-matrix electric, magnetic, and
+        total energy;
+  \item \code{diagnostics/quadrature\_diagnostics.csv}:
+        independent-cubature field and energy errors, optical chirality,
+        electric and magnetic charge, and linear and angular momentum;
+  \item \code{fields.pvd} and \code{fields/fields\_stepNNNNNNNN.pvtu}:
+        ParaView time series;
+  \item \code{diagnostics/integration\_points\_rankNNNN.csv}: final
+        integration-point numerical and analytical values;
+  \item \code{config/run\_metadata.toml},
+        \code{config/resolved\_config.toml}, and
+        \code{config/partition\_metadata.csv};
+  \item \code{input/input\_manifest.toml};
+  \item \code{checkpoints/stepNNNNNNNN/}: checksummed rank-local restart data;
+  \item \code{status.toml}: current run status.
 \end{itemize}
+For backward compatibility, the run root also contains symlinks named
+\code{energy.csv}, \code{quadrature\_diagnostics.csv},
+\code{run\_metadata.toml}, and \code{partition\_metadata.csv}.
 
 At every cubature point, the driver evaluates the optical chirality density
 \[
@@ -1620,6 +1655,380 @@ step, electric energy, magnetic energy, total energy, and total-to-initial
 energy ratio. A representative two-rank run with the command above reduced
 the ratio to approximately $1.25\times10^{-2}$ by $t=1.3$, with no increase
 between sampled energy values.
+
+\section{Empty-domain incident-wave PML gate}
+
+The first validation-sequence gate for the nonlinear PML is
+\code{examples/validate\_empty\_domain\_incident\_pml.jl}. It is a thin
+release-gate wrapper around the production Poisson-bracket PML validation
+driver, so it exercises the same H-first ESPRK and nonlinear PML code path.
+The default case launches the same right-going sine-modulated Gaussian pulse
+in an otherwise empty cuboid, uses periodic boundaries in $y$ and $z$, and
+places nonlinear PML layers at the two $x$ boundaries. The default mesh is
+\code{examples/meshes/periodic\_box\_structured\_nx16\_ny8\_nz8.vtk}; with
+$\lambda_0=0.5$ this gives four $x$-elements per central wavelength.
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/validate_empty_domain_incident_pml.jl \
+  --max-reflection-ratio=1e-2 \
+  --max-final-energy-ratio=2.5e-1
+\end{lstlisting}
+
+The pass/fail quantities are computed from the quadrature diagnostics written
+by the production PML driver:
+\begin{description}[style=nextline]
+  \item[\code{reflection\_ratio}]
+  Maximum left-monitor energy after the configured reflection-start time,
+  normalized by the initial total electromagnetic energy. This is the main
+  empty-domain PML reflection metric.
+
+  \item[\code{final\_energy\_ratio}]
+  Final total electromagnetic energy divided by the initial total energy.
+  Since the PML is dissipative, the release gate requires this ratio to stay
+  below \code{--max-final-energy-ratio}.
+
+  \item[\code{max\_energy\_growth}]
+  Numerical tolerance for energy growth above the initial energy. The PML
+  path should not generate energy, even though it is not energy-conservative.
+\end{description}
+
+The root output directory is
+\code{output/validation\_sequence/empty\_domain\_incident\_pml}. It contains
+the normal per-case PML run directories plus
+\code{empty\_domain\_incident\_pml\_summary.csv} and
+\code{empty\_domain\_incident\_pml\_summary.json}. The CSV and JSON files are
+machine-readable release-gate summaries. The executable exits with a nonzero
+status when any case fails. All options accepted by
+\code{distributed\_poisson\_bracket\_pml\_validation.jl} can be passed to this
+gate and override the defaults, including \code{--mesh}, \code{--flux},
+\code{--pml-width}, \code{--sigma-max}, \code{--sigma-degree},
+\code{--energy-every}, and \code{--paraview-every}.
+
+\section{PEC sphere boundary-residual gate}
+
+The second validation-sequence gate checks the incident-aware PEC condition on
+the metallic sphere. The numerical solution is stored as the scattered field,
+so the physical boundary condition is evaluated on the total field
+\[
+  \vect E_{\mathrm{tot}}
+  =
+  \vect E_{\mathrm{scat}}+\vect E_{\mathrm{inc}},
+  \qquad
+  \vect n\times\vect E_{\mathrm{tot}}=\vect 0
+  \quad\text{on }\Gamma_{\mathrm{PEC}}.
+\]
+The driver computes the surface diagnostic
+\[
+  \left\|\vect n\times\vect E_{\mathrm{tot}}\right\|_{L^2(\Gamma_{\mathrm{PEC}})}
+  =
+  \left(
+    \int_{\Gamma_{\mathrm{PEC}}}
+    \left|\vect n\times\vect E_{\mathrm{tot}}\right|^2\,dS
+  \right)^{1/2},
+\]
+using the same owned sphere-face quadrature infrastructure used by the RCS
+surface-current diagnostic. It also reports the RMS residual, the RMS residual
+divided by the incident amplitude, and the maximum sampled pointwise residual.
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/validate_pec_sphere_boundary_residual.jl \
+  --max-final-relative-rms=1e-1
+\end{lstlisting}
+
+The scattering run writes
+\code{diagnostics/pec\_boundary\_residual.csv}. The validation gate writes
+\code{pec\_sphere\_boundary\_residual\_summary.csv} and
+\code{pec\_sphere\_boundary\_residual\_summary.json} in
+\code{output/validation\_sequence/pec\_sphere\_boundary\_residual}. The
+primary pass/fail metric is \code{final\_relative\_rms}, controlled by
+\code{--max-final-relative-rms}. Additional optional gates are
+\code{--max-final-l2}, \code{--max-final-relative-max}, and
+\code{--max-sampled-relative-rms}. The sampled maximum includes the startup
+transient unless the user selects diagnostics and final time so that startup
+samples are excluded from the gate. By default this gate uses
+\code{examples/meshes/metallic\_sphere\_scattering\_validation.vtk}, a coarse
+validation mesh with roughly $2.9\times 10^4$ tetrahedra. The larger
+\code{metallic\_sphere\_scattering.vtk} mesh has roughly
+$3.6\times 10^5$ tetrahedra and should be reserved for production
+scattering/RCS studies.
+
+\section{Qualitative scattered \texorpdfstring{$E_x/H_y$}{Ex/Hy} field gate}
+
+The next validation-sequence step is qualitative: it prepares the field output
+used to inspect the scattered electric and magnetic components from the
+metallic-sphere problem. The executable is
+\code{examples/validate\_scattered\_ex\_hy\_fields.jl}. It runs the scattering
+driver on the coarse validation sphere mesh, forces ParaView output, and checks
+that the final \code{.pvtu} snapshot contains the vector arrays
+\code{E\_scat} and \code{H\_scat}.
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/validate_scattered_ex_hy_fields.jl
+\end{lstlisting}
+
+The gate writes \code{fields.pvd} and the corresponding parallel VTK snapshots
+under \code{output/validation\_sequence/scattered\_ex\_hy\_fields}. Open
+\code{fields.pvd} in ParaView and display the components
+\code{E\_scat\_x} and \code{H\_scat\_y}. This step intentionally does not
+assign a strict numerical pass/fail criterion to the visual pattern. Its
+machine-readable summary,
+\code{scattered\_ex\_hy\_fields\_summary.json}, records the final PVD/PVTU
+paths, confirms the required scattered-field arrays are present, and checks
+that the final scattered energy is above \code{--min-final-scattered-energy}.
+
+\section{Coarse PEC-sphere RCS gate}
+
+The next validation-sequence step exercises the near-to-far RCS extraction on
+the coarse metallic-sphere mesh and compares the angular samples with the exact
+PEC Mie-series solution. The executable is
+\code{examples/validate\_coarse\_sphere\_rcs.jl}. It is intentionally a coarse
+release gate: by default it checks that the RCS pipeline runs, that the
+accumulated Fourier samples are finite and nonzero, and that a
+machine-readable Mie comparison is written.
+The implementation details are documented in
+\code{docs/numerics/rcs\_metallic\_sphere.md}.
+
+The production scattering driver is
+\code{examples/distributed\_metallic\_sphere\_scattering.jl}. It solves for
+the scattered field of a PEC sphere illuminated by a plane wave propagating in
+the $+z$ direction with $x$-polarized electric field,
+\[
+  \vect E_{\rm inc}
+  =
+  A\hat{\vect x}\cos(kz-\omega t),
+  \qquad
+  \vect H_{\rm inc}
+  =
+  \frac{A}{Z}\hat{\vect y}\cos(kz-\omega t),
+\]
+where $k=2\pi/\lambda$, $\omega=ck$, $c=(\epsilon\mu)^{-1/2}$, and
+$Z=(\mu/\epsilon)^{1/2}$. The numerical unknown is the scattered field and the
+physical field is reconstructed as
+\[
+  \vect E_{\rm tot}=\vect E_{\rm scat}+\vect E_{\rm inc},
+  \qquad
+  \vect H_{\rm tot}=\vect H_{\rm scat}+\vect H_{\rm inc}.
+\]
+The incident-aware PEC boundary condition on the sphere is
+\[
+  \vect n\times\vect E_{\rm tot}=\vect 0,
+  \qquad
+  \vect n\times\vect E_{\rm scat}
+  =
+  -\vect n\times\vect E_{\rm inc}.
+\]
+
+When RCS extraction is enabled, the driver forms the PEC equivalent surface
+current
+\[
+  \vect J_s = \vect n\times\vect H_{\rm tot}
+\]
+and accumulates the near-to-far integral
+\[
+  \vect I(\hat{\vect r},t)
+  =
+  \int_{\Gamma_{\rm PEC}}
+  \vect J_s(\vect x,t)
+  \exp\!\left(-i k\,\hat{\vect r}\cdot\vect x\right)\,dS.
+\]
+The time-domain integral is converted to a phasor through a Hann-windowed
+Fourier extraction over
+$[\code{--rcs-start-time},\code{--final-time}]$. The reconstructed transverse
+far field is then normalized as
+\[
+  \sigma(\theta,\phi)
+  =
+  4\pi
+  \frac{
+    \left|\vect E^\infty_{\rm scat}(\theta,\phi)\right|^2
+  }{
+    \left|\vect E_{\rm inc}\right|^2
+  }.
+\]
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/validate_coarse_sphere_rcs.jl
+\end{lstlisting}
+
+The default run uses
+\code{examples/meshes/metallic\_sphere\_scattering\_validation.vtk},
+DG order $p=1$, ESPRK order $2$, \code{--enable-rcs}, a $37$-point polar
+sampling grid at $\phi=0$, and disables ParaView snapshots. The scattering
+driver writes the numerical far-field table
+\code{diagnostics/rcs.csv}. The validation gate writes
+\code{diagnostics/coarse\_mie\_rcs\_comparison.csv}, with one row per
+observation direction and columns for
+\[
+  \sigma_h(\theta,\phi),\qquad
+  \sigma_{\mathrm{Mie}}(\theta,\phi),\qquad
+  \left|\sigma_h-\sigma_{\mathrm{Mie}}\right|,\qquad
+  \frac{\left|\sigma_h-\sigma_{\mathrm{Mie}}\right|}{\pi a^2},
+\]
+together with relative and dB errors. It also writes
+\code{coarse\_sphere\_rcs\_summary.csv} and
+\code{coarse\_sphere\_rcs\_summary.json} in
+\code{output/validation\_sequence/coarse\_sphere\_rcs}.
+
+The default pass/fail criteria are deliberately loose because a short coarse
+run is not a resolved RCS benchmark. The gate requires finite RCS rows, at
+least one accumulated sample, positive window weight, and
+\code{max\_numerical\_rcs >= --min-max-rcs}. The default
+\code{--min-max-rcs} is $10^{-12}$. Stricter quantitative checks can be enabled
+with \code{--max-absolute-normalized-error},
+\code{--max-rms-relative-error}, and \code{--max-db-error}. Those thresholds
+should be selected only after choosing a resolved mesh, final time, and
+Fourier-window start time.
+
+The RCS command-line controls have the following meaning:
+\begin{description}[style=nextline]
+  \item[\code{--rcs-start-time}]
+  First time included in the Fourier extraction. For quantitative Mie
+  comparison, this should be after the startup transient has left the near
+  field. Setting it equal to the final time is useful only for one-step smoke
+  tests.
+
+  \item[\code{--rcs-every}]
+  Time-step interval between RCS samples. Small values increase sampling but
+  also increase surface-integration overhead. Long production runs usually do
+  not require \code{--rcs-every=1}.
+
+  \item[\code{--rcs-theta-count},
+        \code{--rcs-theta-min-degrees},
+        \code{--rcs-theta-max-degrees}]
+  Polar scattering-angle grid. The default coarse gate uses $37$ samples over
+  $[0^\circ,180^\circ]$.
+
+  \item[\code{--rcs-phi-degrees}]
+  Comma-separated azimuth angles. The default $\phi=0^\circ$ is the E-plane
+  cut for the current incident polarization.
+\end{description}
+
+For a lighter high-order smoke check, generate the four-elements-per-wavelength
+mesh near the sphere and run the same gate with $p=4$ and ESPRK5:
+\begin{lstlisting}[language=bash]
+gmsh examples/meshes/metallic_sphere_scattering.geo -3 -format vtk \
+  -o examples/meshes/metallic_sphere_scattering_epw4.vtk \
+  -setnumber ElementsPerWavelength 4 \
+  -setnumber SphereMeshSizeFactor 1.0 \
+  -setnumber PMLMeshSizeFactor 3.0 \
+  -setnumber FarMeshSizeFactor 4.0 \
+  -setnumber CurvatureSamples 8 \
+  -setnumber PMLWidth 1.0 \
+  -setnumber AirBuffer 1.0 \
+  -setnumber OptimizeMesh 0
+
+mpiexec -n 2 -genv OPENBLAS_NUM_THREADS 1 julia --project=. \
+  examples/validate_coarse_sphere_rcs.jl \
+  --mesh=examples/meshes/metallic_sphere_scattering_epw4.vtk \
+  --order=4 --esprk-order=5 \
+  --final-time=1e-6 --rcs-start-time=1e-6 \
+  --rcs-every=1 --diagnostics-every=1 \
+  --min-max-rcs=0 \
+  --output-dir=output/validation_sequence/coarse_sphere_rcs_epw4_p4_smoke
+\end{lstlisting}
+The resulting \code{diagnostics/rcs.csv} can be processed with the existing Mie
+comparison script:
+\begin{lstlisting}[language=bash]
+python3 examples/postprocess_metallic_sphere_mie_rcs.py \
+  --run-dir output/validation_sequence/coarse_sphere_rcs_epw4_p4_smoke
+\end{lstlisting}
+The script writes \code{diagnostics/mie\_rcs\_comparison.csv},
+\code{tables/mie\_rcs\_comparison.tex}, and
+\code{plots/mie\_rcs\_comparison.pdf}. A one-step high-order smoke run
+validates the setup, RCS extraction, and postprocessing path; it is not a
+quantitative RCS benchmark. For Mie agreement, use a longer final time and
+start the Fourier extraction after the transient has left the near field.
+The postprocessor figure has two panels: the top panel compares
+$10\log_{10}(\sigma/(\pi a^2))$ with the exact Mie curve, while the lower panel
+shows $|\sigma_h-\sigma_{\rm Mie}|/|\sigma_{\rm Mie}|$. Large errors in a
+one-step or startup-window run indicate that the Fourier estimate is not a
+steady monochromatic RCS; they do not by themselves prove that the output
+pipeline is wrong. A resolved validation should be stable when
+\code{--rcs-start-time}, \code{--rcs-every}, the mesh, and the polynomial order
+are varied.
+
+\section{Production Poisson-bracket PML validation}
+
+The production PML validation executable is
+\code{examples/distributed\_poisson\_bracket\_pml\_validation.jl}. It uses
+the Poisson-bracket Maxwell operator, the H-first ESPRK integrator, periodic
+boundary pairs in $y$ and $z$, and nonlinear PML layers at the two $x$
+boundaries. By default it reads
+\code{examples/meshes/periodic\_box\_structured\_nx4\_ny2\_nz2.vtk}; pass
+\code{--mesh} for one mesh or \code{--meshes} for a comma-separated mesh
+sweep. Meshes must be axis-aligned cuboids; boundary IDs are inferred
+geometrically as $1/2$ on $x_{\min}/x_{\max}$, $3/4$ on
+$y_{\min}/y_{\max}$, and $5/6$ on $z_{\min}/z_{\max}$. The loaded mesh is
+partitioned with a deterministic balanced spatial partition. The initial
+condition is a right-going sine-modulated Gaussian pulse,
+\[
+  g(x)=
+  \exp\left[-\left(\frac{x-x_0}{w}\right)^2\right]
+  \sin\left(k_0(x-x_0)\right),
+  \qquad
+  \vect E=(0,0,\sqrt{\mu/\epsilon}\,g(x)),\qquad
+  \vect H=(0,-g(x),0).
+\]
+By default $\lambda_0=0.5$, so $k_0=4\pi$ and, for
+$\epsilon=\mu=1$, $f_0=2$. On
+\code{examples/meshes/periodic\_box\_structured\_nx16\_ny8\_nz8.vtk}, this is
+four $x$-elements per central wavelength.
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_pml_validation.jl \
+  --mesh=examples/meshes/periodic_box_structured_nx16_ny8_nz8.vtk \
+  --order=2 --esprk-order=3 \
+  --final-time=3.0 --cfl=0.15 \
+  --central-wavelength=0.5 \
+  --fluxes=centered,alternating \
+  --pml-widths=0.25,0.5 \
+  --sigma-maxes=8,12 --sigma-degrees=2,3 \
+  --paraview-every=25
+\end{lstlisting}
+
+The command above runs a Cartesian product sweep over mesh, flux kind, PML
+width, maximum damping, and damping polynomial degree. Each case gets its own
+isolated run directory below
+\code{output/poisson\_bracket\_pml\_validation}. The root directory also
+contains \code{sweep\_summary.csv}, with one row per case and columns for the
+mesh path, central frequency, central wavelength, central wavenumber, final
+energy ratio, reflection ratio, maximum reflected left-monitor energy, time
+step, step count, and case output directory.
+
+The case diagnostics are:
+\begin{description}[style=nextline]
+  \item[\code{diagnostics/energy.csv}]
+  Global electric, magnetic, total, and component Hamiltonian energies.
+
+  \item[\code{diagnostics/reflection\_diagnostics.csv}]
+  Quadrature-integrated total energy, left-PML energy, right-PML energy,
+  interior energy, left-monitor energy, right-monitor energy, the maximum
+  left-monitor energy after the configured reflection start time, and the
+  normalized reflection ratio.
+
+  \item[\code{fields.pvd} and \code{fields/}]
+  ParaView time-series output using parallel high-order VTK Lagrange
+  tetrahedra. The analytical arrays are zero placeholders for this validation
+  pulse; the reflection diagnostics are the quantitative validation output.
+
+  \item[\code{config/} and \code{input/}]
+  Resolved configuration, input manifest, run metadata, partition metadata,
+  and run-layout metadata.
+\end{description}
+
+The default reflection start time is estimated from the pulse center, wave
+speed $c=1/\sqrt{\epsilon\mu}$, and the right PML interface. Override it with
+\code{--reflection-start} when the monitor placement or pulse shape changes.
+The left monitor is \code{x <= --left-monitor-max}; the right monitor is
+\code{x >= --right-monitor-min}. Alternating Poisson-bracket fluxes currently
+support only PEC outer boundaries, so the validation driver rejects
+\code{--flux=alternating --outer-boundary=pmc} and
+\code{--flux=alternating --outer-boundary=absorbing} before time stepping.
 
 \section{Stationary PEC cube}
 
@@ -1867,6 +2276,12 @@ electric rate can fail the strict \(N+1\) target even when the active
 Inspect the component table, leakage table, and mesh-size-ratio table before
 interpreting a failed strict verdict.
 
+\chapter{Radar Cross Section: Theory, Conventions, and Numerical Evaluation}
+
+\IfFileExists{docs/rcs/rcs_theory_and_discretization_body.tex}
+  {\input{docs/rcs/rcs_theory_and_discretization_body.tex}}
+  {\input{rcs/rcs_theory_and_discretization_body.tex}}
+
 \chapter{Testing}
 
 \section{Package tests}
@@ -2024,7 +2439,7 @@ SCALING_MODES="strong weak" \
 \end{lstlisting}
 
 Strong scaling keeps \code{--cells} fixed. Weak scaling uses
-\code{round(cells * ranks^(1/3))} cells per axis so the element count grows
+\code{round(cells * ranks\textasciicircum{}(1/3))} cells per axis so the element count grows
 approximately linearly with MPI ranks. The benchmark warms up the RHS, places a
 barrier immediately before timing, reduces maximum elapsed times across ranks,
 and reports separate columns for halo exchange, RHS assembly, ghost zeroing,
@@ -2133,16 +2548,127 @@ VTU pieces contain the numerical, exact, and error vectors for \(E\) and
 \(H\), their magnitudes, global element IDs, owner rank, polynomial order, and
 physical time.
 
+\section{Run I/O organization}
+
+The production Maxwell drivers treat each \code{--output-dir} as one isolated
+run directory. A run directory is intended to be a complete scientific record:
+it contains the resolved configuration, input provenance, diagnostics,
+visualization files, checkpoint data, and status metadata for one execution.
+The current canonical layout is:
+
+\begin{lstlisting}[language=bash]
+RUN_DIR/
+  config/
+    run_layout.toml
+    resolved_config.toml
+    run_metadata.toml
+    partition_metadata.csv
+  input/
+    input_manifest.toml
+  diagnostics/
+    energy.csv
+    quadrature_diagnostics.csv
+    integration_points_rankNNNN.csv
+  fields/
+    fields_stepNNNNNNNN.pvtu
+    rank-local VTU pieces
+  checkpoints/
+    stepNNNNNNNN/
+    latest.toml
+  logs/
+  plots/
+  tables/
+  fields.pvd
+  paraview_series.csv
+  status.toml
+\end{lstlisting}
+
+The \code{logs/}, \code{plots/}, and \code{tables/} directories are created by
+the run-layout layer even when the production driver itself does not write
+into them. They provide stable locations for scheduler logs, post-processing
+figures, and derived tables.
+
+For compatibility with older plotting and post-processing scripts, the run
+root also contains symlinks:
+\begin{lstlisting}[language=bash]
+RUN_DIR/energy.csv -> diagnostics/energy.csv
+RUN_DIR/quadrature_diagnostics.csv -> diagnostics/quadrature_diagnostics.csv
+RUN_DIR/run_metadata.toml -> config/run_metadata.toml
+RUN_DIR/partition_metadata.csv -> config/partition_metadata.csv
+\end{lstlisting}
+New tools should prefer the canonical paths in \code{diagnostics/} and
+\code{config/}. Older scripts that read the root-level CSV and TOML filenames
+continue to work through the symlinks.
+
+\subsection{Automatic isolated run directories}
+
+When \code{--output-dir} is supplied, the driver writes exactly there. For
+routine numerical experiments, prefer \code{--run-root}. This creates a
+timestamped subdirectory automatically:
+
+\begin{lstlisting}[language=bash]
+mpiexec -n 4 julia --project=. \
+  examples/distributed_periodic_poisson_bracket_maxwell.jl \
+  --run-root=output/runs \
+  --run-name=periodic-cuboid-af-p4m1-r4 \
+  --partitions=4 \
+  --flux=alternating \
+  --order=4 --esprk-order=5
+\end{lstlisting}
+
+The resulting directory has the form
+\begin{lstlisting}[language=bash]
+output/runs/20260708T153000_periodic-cuboid-af-p4m1-r4/
+\end{lstlisting}
+where the timestamp is generated once on rank zero and broadcast to all MPI
+ranks. The run name is sanitized to lower-case path-safe text. If
+\code{--run-name} is omitted, the driver constructs a name from the problem
+class, flux, polynomial order, and MPI rank count.
+
+\code{--run-root} and \code{--output-dir} are intentionally mutually
+exclusive. Use \code{--output-dir} when an exact path is required, and use
+\code{--run-root} when a study launches many runs and each run should be
+isolated automatically.
+
+\subsection{Configuration and input provenance}
+
+\code{config/resolved\_config.toml} stores the fully resolved driver
+configuration, including defaults that were not explicitly typed on the CLI.
+\code{input/input\_manifest.toml} records the mesh path, partition path,
+distributed mesh cache, checkpoint directory, restart checkpoint, and mesh-load
+mode used by the run. \code{config/run\_layout.toml} records the resolved
+directory paths themselves.
+
+\code{status.toml} is a small machine-readable status file. It is first written
+as \code{prepared}, then updated to \code{running}, and finally to
+\code{complete}. The final status contains the final step, final time, elapsed
+integration time, and final checkpoint path.
+
+\subsection{Checkpoint paths}
+
+By default, checkpoints are written to \code{RUN\_DIR/checkpoints/}. Supplying
+\code{--checkpoint-dir=PATH} overrides this and can place checkpoints outside
+the run directory. This is useful on machines with a dedicated high-throughput
+scratch filesystem, but it reduces the self-contained nature of the run
+artifact. When using an external checkpoint directory, keep the
+\code{input/input\_manifest.toml} file with the run because it records the
+external path.
+
 \section{Run and partition metadata}
 
 Every production experiment writes:
 
 \begin{itemize}[leftmargin=*]
-  \item \code{run\_metadata.toml}: configuration, Julia version, MPI size,
-        time-step data, elapsed solve time, and final checkpoint;
-  \item \code{partition\_metadata.csv}: owned and ghost elements, local nodes,
-        neighbor ranks, interface-face counts, halo-size ratios, send/receive
-        buffer sizes, and global element ranges;
+  \item \code{config/run\_metadata.toml}: configuration, Julia version, MPI
+        size, time-step data, elapsed solve time, and final checkpoint;
+  \item \code{config/partition\_metadata.csv}: owned and ghost elements, local
+        nodes, neighbor ranks, interface-face counts, halo-size ratios,
+        send/receive buffer sizes, and global element ranges;
+  \item \code{config/resolved\_config.toml}: resolved driver configuration;
+  \item \code{input/input\_manifest.toml}: mesh, partition, distributed mesh
+        cache, checkpoint, restart, and load-mode provenance;
+  \item \code{status.toml}: prepared/running/complete status and final run
+        summary;
   \item \code{paraview\_series.csv}: step, time, and PVTU dataset index.
 \end{itemize}
 
@@ -2263,11 +2789,13 @@ Every production experiment writes:
         tetrahedron; curved or nodally varying tensors are not implemented.
   \item The characteristic absorbing boundary is first order. It is separate
         from the nonlinear PML and remains useful as an outer termination.
-  \item The nonlinear PML currently supports only the dimensionless
-        homogeneous-vacuum system with $\varepsilon=\mu=1$; heterogeneous
-        material coupling and anisotropic damping tensors are not implemented.
-  \item The nonlinear PML path supports explicit RK integration, not ESPRK,
-        because damping breaks the conservative Poisson-bracket structure.
+  \item The nonlinear PML supports scalar homogeneous coefficients and
+        piecewise-constant isotropic \code{MaxwellElementMaterials}. Anisotropic
+        material tensors and nodally varying material coefficients are not
+        implemented.
+  \item The nonlinear PML is dissipative, so ESPRK runs with PML should be
+        interpreted as the selected partitioned update applied to a damped
+        right-hand side, not as a conservative symplectic map.
   \item No adaptive mesh refinement.
   \item No distributed mesh repartitioning during a run.
   \item Checkpoint restart requires the same MPI rank count and partition.
@@ -2285,8 +2813,8 @@ Every production experiment writes:
 \begin{enumerate}[leftmargin=*]
   \item Add impressed electric and magnetic sources.
   \item Add anisotropic and within-element varying material tensors.
-  \item Extend the nonlinear PML to heterogeneous materials and validate
-        reflection errors for oblique incidence and corner layers.
+  \item Validate nonlinear-PML reflection errors for oblique incidence, material
+        jumps, and corner layers.
   \item Add alternative higher-order absorbing boundary conditions.
   \item Split the right-hand side into owned volume work and interface surface
         work, then overlap communication.
@@ -2330,6 +2858,12 @@ the local DG nodes. \\
 components at one point. \\
 \api{maxwell\_nonlinear\_pml\_rhs!(...)} & Assemble ordinary Maxwell terms and
 the serial or distributed nonlinear PML source. \\
+\api{distributed\_maxwell\_nonlinear\_pml\_partitioned\_symplectic\_rk\_step!(...)}
+& Advance one distributed Poisson-bracket ESPRK step with nonperiodic PML
+boundaries. \\
+\api{distributed\_periodic\_maxwell\_nonlinear\_pml\_partitioned\_symplectic\_rk\_step!(...)}
+& Advance one distributed Poisson-bracket ESPRK step with periodic face pairs
+and nonlinear PML. \\
 \api{distributed\_maxwell\_nonlinear\_pml\_rk\_step!(...)} & Advance one
 distributed explicit RK step with nonperiodic PML boundaries. \\
 \api{distributed\_periodic\_maxwell\_nonlinear\_pml\_rk\_step!(...)} & Advance
@@ -2366,6 +2900,20 @@ loading one prepared mesh piece per rank. \\
 and restart metadata. \\
 \api{load_distributed_checkpoint(...)} & Validate and restore a same-partition
 Maxwell checkpoint. \\
+\api{RunPaths(root)} & Resolve the canonical run-directory tree under a root
+path. \\
+\api{prepare_run_directory(...)} & Create the run directory, standard
+subdirectories, compatibility symlinks, layout metadata, and initial status. \\
+\api{isolated_run_directory(...)} & Build a timestamped
+\code{STAMP\_run-name} directory below a run root. \\
+\api{write_resolved_run_config(...)} & Write
+\code{config/resolved\_config.toml}. \\
+\api{write_run_input_manifest(...)} & Write
+\code{input/input\_manifest.toml}. \\
+\api{collectively_write_run_provenance(...)} & Root-rank collective writer for
+resolved configuration and input manifest files. \\
+\api{collectively_write_run_status(...)} & Root-rank collective writer for
+\code{status.toml}. \\
 \api{write_distributed_run_metadata(...)} & Write TOML run metadata and CSV
 partition metadata. \\
 \api{exchange_maxwell_ghost_traces!(...)} & Exchange six Maxwell face traces. \\
@@ -2400,9 +2948,25 @@ mpiexec -n 2 julia --project=. \
   --nx=8 --order=2 --final-time=1.3 \
   --pml-width=0.5 --sigma-max=12
 
+# Production Poisson-bracket PML reflection sweep
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_pml_validation.jl \
+  --mesh=examples/meshes/periodic_box_structured_nx16_ny8_nz8.vtk \
+  --central-wavelength=0.5 \
+  --fluxes=centered,alternating \
+  --pml-widths=0.25,0.5 --sigma-maxes=8,12 \
+  --sigma-degrees=2,3 --paraview-every=25
+
 # Production Poisson-bracket run with time-series output and checkpoints
 mpiexec -n 2 julia --project=. \
   examples/distributed_poisson_bracket_maxwell.jl \
+  --paraview-every=10 --checkpoint-every=50
+
+# Production run in an isolated timestamped directory
+mpiexec -n 2 julia --project=. \
+  examples/distributed_poisson_bracket_maxwell.jl \
+  --run-root=output/runs \
+  --run-name=cavity-pec-centered-p2-r2 \
   --paraview-every=10 --checkpoint-every=50
 
 # PMC Poisson-bracket cavity
@@ -2414,7 +2978,7 @@ mpiexec -n 2 julia --project=. \
 mpiexec -n 2 julia --project=. \
   examples/distributed_poisson_bracket_maxwell.jl \
   --boundary-condition=pmc \
-  --pml-width=0.2 --pml-sigma-max=12 --rk-order=4
+  --pml-width=0.2 --pml-sigma-max=12 --esprk-order=4
 
 # Distributed PMC convergence study
 mpiexec -n 2 julia --project=. \
@@ -2436,6 +3000,10 @@ mpiexec -n 2 julia --project=. \
   examples/distributed_poisson_bracket_maxwell.jl \
   --restart=output/distributed_poisson_bracket/checkpoints/step00000050 \
   --final-time=0.5
+
+# Plot diagnostics from the canonical diagnostics subdirectory
+python3 examples/plot_maxwell_energy.py \
+  output/distributed_poisson_bracket/diagnostics/quadrature_diagnostics.csv
 
 # MPI tests
 mpiexec -n 2 julia --project=. test/test_mpi_face_permutation.jl

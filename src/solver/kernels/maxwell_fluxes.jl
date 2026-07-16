@@ -103,26 +103,54 @@ function maxwell_poisson_bracket_surface_flux_values(
     minus,
     plus,
     n::NTuple{3, Float64};
+    flux_kind::MaxwellFluxKind = MaxwellFlux_Central,
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
-    dHx = minus.Hx .- plus.Hx
-    dHy = minus.Hy .- plus.Hy
-    dHz = minus.Hz .- plus.Hz
+    if flux_kind == MaxwellFlux_Central
+        dHx = minus.Hx .- plus.Hx
+        dHy = minus.Hy .- plus.Hy
+        dHz = minus.Hz .- plus.Hz
 
-    sumEx = minus.Ex .+ plus.Ex
-    sumEy = minus.Ey .+ plus.Ey
-    sumEz = minus.Ez .+ plus.Ez
+        sumEx = minus.Ex .+ plus.Ex
+        sumEy = minus.Ey .+ plus.Ey
+        sumEz = minus.Ez .+ plus.Ez
 
-    fluxEx, fluxEy, fluxEz = cross_n_vec(n, dHx, dHy, dHz)
-    fluxEx .*= -0.5 / ε
-    fluxEy .*= -0.5 / ε
-    fluxEz .*= -0.5 / ε
+        fluxEx, fluxEy, fluxEz = cross_n_vec(n, dHx, dHy, dHz)
+        fluxEx .*= -0.5 / ε
+        fluxEy .*= -0.5 / ε
+        fluxEz .*= -0.5 / ε
 
-    fluxHx, fluxHy, fluxHz = cross_n_vec(n, sumEx, sumEy, sumEz)
-    fluxHx .*= -0.5 / μ
-    fluxHy .*= -0.5 / μ
-    fluxHz .*= -0.5 / μ
+        fluxHx, fluxHy, fluxHz = cross_n_vec(n, sumEx, sumEy, sumEz)
+        fluxHx .*= -0.5 / μ
+        fluxHy .*= -0.5 / μ
+        fluxHz .*= -0.5 / μ
+
+    elseif flux_kind == MaxwellFlux_Alternating
+        θ = poisson_bracket_alternating_theta(n)
+        α = 1.0 - θ
+
+        dHx = minus.Hx .- plus.Hx
+        dHy = minus.Hy .- plus.Hy
+        dHz = minus.Hz .- plus.Hz
+
+        Ehatx = θ .* plus.Ex .+ α .* minus.Ex
+        Ehaty = θ .* plus.Ey .+ α .* minus.Ey
+        Ehatz = θ .* plus.Ez .+ α .* minus.Ez
+
+        fluxEx, fluxEy, fluxEz = cross_n_vec(n, dHx, dHy, dHz)
+        fluxEx .*= -α / ε
+        fluxEy .*= -α / ε
+        fluxEz .*= -α / ε
+
+        fluxHx, fluxHy, fluxHz = cross_n_vec(n, Ehatx, Ehaty, Ehatz)
+        fluxHx .*= -1.0 / μ
+        fluxHy .*= -1.0 / μ
+        fluxHz .*= -1.0 / μ
+
+    else
+        error("Unsupported Poisson-bracket Maxwell flux kind: $flux_kind")
+    end
 
     return (
         fluxEx = fluxEx,
@@ -131,6 +159,163 @@ function maxwell_poisson_bracket_surface_flux_values(
         fluxHx = fluxHx,
         fluxHy = fluxHy,
         fluxHz = fluxHz,
+    )
+end
+
+@inline function poisson_bracket_alternating_theta(
+    n::NTuple{3, Float64},
+)
+    s = n[1] + n[2] + n[3]
+
+    if s > 0.0
+        return 1.0
+    elseif s < 0.0
+        return 0.0
+    end
+
+    return 0.5
+end
+
+@inline function cross_n_components(
+    n::NTuple{3, Float64},
+    vx::Float64,
+    vy::Float64,
+    vz::Float64,
+)
+    return (
+        n[2] * vz - n[3] * vy,
+        n[3] * vx - n[1] * vz,
+        n[1] * vy - n[2] * vx,
+    )
+end
+
+function maxwell_surface_flux_values!(
+    flux::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    plus::MaxwellFaceWorkspace,
+    n::NTuple{3, Float64};
+    flux_kind::MaxwellFluxKind,
+    ε::Float64,
+    μ::Float64,
+)
+    if flux_kind == MaxwellFlux_Central
+        @inbounds for q in eachindex(minus.Ex)
+            dEx = plus.Ex[q] - minus.Ex[q]
+            dEy = plus.Ey[q] - minus.Ey[q]
+            dEz = plus.Ez[q] - minus.Ez[q]
+            dHx = plus.Hx[q] - minus.Hx[q]
+            dHy = plus.Hy[q] - minus.Hy[q]
+            dHz = plus.Hz[q] - minus.Hz[q]
+
+            nx_dH = cross_n_components(n, dHx, dHy, dHz)
+            nx_dE = cross_n_components(n, dEx, dEy, dEz)
+
+            flux.Ex[q] = 0.5 * nx_dH[1]
+            flux.Ey[q] = 0.5 * nx_dH[2]
+            flux.Ez[q] = 0.5 * nx_dH[3]
+            flux.Hx[q] = -0.5 * nx_dE[1]
+            flux.Hy[q] = -0.5 * nx_dE[2]
+            flux.Hz[q] = -0.5 * nx_dE[3]
+        end
+    elseif flux_kind == MaxwellFlux_Upwind
+        Z = maxwell_impedance(; ε = ε, μ = μ)
+        Y = 1.0 / Z
+
+        @inbounds for q in eachindex(minus.Ex)
+            dEx = plus.Ex[q] - minus.Ex[q]
+            dEy = plus.Ey[q] - minus.Ey[q]
+            dEz = plus.Ez[q] - minus.Ez[q]
+            dHx = plus.Hx[q] - minus.Hx[q]
+            dHy = plus.Hy[q] - minus.Hy[q]
+            dHz = plus.Hz[q] - minus.Hz[q]
+
+            nx_dH = cross_n_components(n, dHx, dHy, dHz)
+            nx_dE = cross_n_components(n, dEx, dEy, dEz)
+            nn_dE = cross_n_components(n, nx_dE[1], nx_dE[2], nx_dE[3])
+            nn_dH = cross_n_components(n, nx_dH[1], nx_dH[2], nx_dH[3])
+
+            flux.Ex[q] = 0.5 * nx_dH[1] - 0.5 * Y * nn_dE[1]
+            flux.Ey[q] = 0.5 * nx_dH[2] - 0.5 * Y * nn_dE[2]
+            flux.Ez[q] = 0.5 * nx_dH[3] - 0.5 * Y * nn_dE[3]
+            flux.Hx[q] = -0.5 * nx_dE[1] - 0.5 * Z * nn_dH[1]
+            flux.Hy[q] = -0.5 * nx_dE[2] - 0.5 * Z * nn_dH[2]
+            flux.Hz[q] = -0.5 * nx_dE[3] - 0.5 * Z * nn_dH[3]
+        end
+    else
+        error("Unsupported Maxwell flux kind: $flux_kind")
+    end
+
+    return flux
+end
+
+function maxwell_poisson_bracket_surface_flux_values!(
+    flux::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    plus::MaxwellFaceWorkspace,
+    n::NTuple{3, Float64};
+    flux_kind::MaxwellFluxKind = MaxwellFlux_Central,
+    ε::Float64,
+    μ::Float64,
+)
+    if flux_kind == MaxwellFlux_Central
+        @inbounds for q in eachindex(minus.Ex)
+            dHx = minus.Hx[q] - plus.Hx[q]
+            dHy = minus.Hy[q] - plus.Hy[q]
+            dHz = minus.Hz[q] - plus.Hz[q]
+            sumEx = minus.Ex[q] + plus.Ex[q]
+            sumEy = minus.Ey[q] + plus.Ey[q]
+            sumEz = minus.Ez[q] + plus.Ez[q]
+
+            nx_dH = cross_n_components(n, dHx, dHy, dHz)
+            nx_sumE = cross_n_components(n, sumEx, sumEy, sumEz)
+
+            flux.Ex[q] = -0.5 * nx_dH[1] / ε
+            flux.Ey[q] = -0.5 * nx_dH[2] / ε
+            flux.Ez[q] = -0.5 * nx_dH[3] / ε
+            flux.Hx[q] = -0.5 * nx_sumE[1] / μ
+            flux.Hy[q] = -0.5 * nx_sumE[2] / μ
+            flux.Hz[q] = -0.5 * nx_sumE[3] / μ
+        end
+    elseif flux_kind == MaxwellFlux_Alternating
+        θ = poisson_bracket_alternating_theta(n)
+        α = 1.0 - θ
+
+        @inbounds for q in eachindex(minus.Ex)
+            dHx = minus.Hx[q] - plus.Hx[q]
+            dHy = minus.Hy[q] - plus.Hy[q]
+            dHz = minus.Hz[q] - plus.Hz[q]
+            Ehatx = θ * plus.Ex[q] + α * minus.Ex[q]
+            Ehaty = θ * plus.Ey[q] + α * minus.Ey[q]
+            Ehatz = θ * plus.Ez[q] + α * minus.Ez[q]
+
+            nx_dH = cross_n_components(n, dHx, dHy, dHz)
+            nx_Ehat = cross_n_components(n, Ehatx, Ehaty, Ehatz)
+
+            flux.Ex[q] = -α * nx_dH[1] / ε
+            flux.Ey[q] = -α * nx_dH[2] / ε
+            flux.Ez[q] = -α * nx_dH[3] / ε
+            flux.Hx[q] = -nx_Ehat[1] / μ
+            flux.Hy[q] = -nx_Ehat[2] / μ
+            flux.Hz[q] = -nx_Ehat[3] / μ
+        end
+    else
+        error("Unsupported Poisson-bracket Maxwell flux kind: $flux_kind")
+    end
+
+    return flux
+end
+
+function require_poisson_bracket_surface_flux(formulation::PoissonBracketFormulation)
+    if formulation.flux_kind in (MaxwellFlux_Central, MaxwellFlux_Alternating)
+        return nothing
+    end
+
+    throw(
+        ArgumentError(
+            "PoissonBracketFormulation supports MaxwellFlux_Central and " *
+            "MaxwellFlux_Alternating. Upwind Maxwell fluxes are dissipative " *
+            "and do not define the partitioned Poisson-bracket operator."
+        ),
     )
 end
 
@@ -192,6 +377,137 @@ function add_lifted_maxwell_surface_flux!(
     return rhs
 end
 
+function add_lifted_maxwell_surface_flux!(
+    rhs::MaxwellRHS,
+    elem::Int,
+    fops::ReferenceTetFaceOperators,
+    mappings::DGReferenceMapping,
+    face::Int,
+    flux::MaxwellFaceWorkspace,
+    area::Float64,
+    workspace::MaxwellSurfaceWorkspace,
+)
+    add_lifted_face_contribution!(
+        rhs.rhsEx, elem, fops, mappings,
+        face, flux.Ex, area, workspace.lifted,
+    )
+
+    add_lifted_face_contribution!(
+        rhs.rhsEy, elem, fops, mappings,
+        face, flux.Ey, area, workspace.lifted,
+    )
+
+    add_lifted_face_contribution!(
+        rhs.rhsEz, elem, fops, mappings,
+        face, flux.Ez, area, workspace.lifted,
+    )
+
+    add_lifted_face_contribution!(
+        rhs.rhsHx, elem, fops, mappings,
+        face, flux.Hx, area, workspace.lifted,
+    )
+
+    add_lifted_face_contribution!(
+        rhs.rhsHy, elem, fops, mappings,
+        face, flux.Hy, area, workspace.lifted,
+    )
+
+    add_lifted_face_contribution!(
+        rhs.rhsHz, elem, fops, mappings,
+        face, flux.Hz, area, workspace.lifted,
+    )
+
+    return rhs
+end
+
+function add_lifted_permuted_maxwell_surface_flux!(
+    rhs::MaxwellRHS,
+    elem::Int,
+    fops::ReferenceTetFaceOperators,
+    mappings::DGReferenceMapping,
+    face::Int,
+    flux::MaxwellFaceWorkspace,
+    plus_to_minus_perm::AbstractVector{Int},
+    area::Float64,
+    workspace::MaxwellSurfaceWorkspace,
+)
+    unpermute_plus_face_values!(
+        workspace.face_values,
+        flux.Ex,
+        plus_to_minus_perm,
+    )
+    add_lifted_face_contribution!(
+        rhs.rhsEx, elem, fops, mappings,
+        face, workspace.face_values, area, workspace.lifted,
+    )
+
+    unpermute_plus_face_values!(
+        workspace.face_values,
+        flux.Ey,
+        plus_to_minus_perm,
+    )
+    add_lifted_face_contribution!(
+        rhs.rhsEy, elem, fops, mappings,
+        face, workspace.face_values, area, workspace.lifted,
+    )
+
+    unpermute_plus_face_values!(
+        workspace.face_values,
+        flux.Ez,
+        plus_to_minus_perm,
+    )
+    add_lifted_face_contribution!(
+        rhs.rhsEz, elem, fops, mappings,
+        face, workspace.face_values, area, workspace.lifted,
+    )
+
+    unpermute_plus_face_values!(
+        workspace.face_values,
+        flux.Hx,
+        plus_to_minus_perm,
+    )
+    add_lifted_face_contribution!(
+        rhs.rhsHx, elem, fops, mappings,
+        face, workspace.face_values, area, workspace.lifted,
+    )
+
+    unpermute_plus_face_values!(
+        workspace.face_values,
+        flux.Hy,
+        plus_to_minus_perm,
+    )
+    add_lifted_face_contribution!(
+        rhs.rhsHy, elem, fops, mappings,
+        face, workspace.face_values, area, workspace.lifted,
+    )
+
+    unpermute_plus_face_values!(
+        workspace.face_values,
+        flux.Hz,
+        plus_to_minus_perm,
+    )
+    add_lifted_face_contribution!(
+        rhs.rhsHz, elem, fops, mappings,
+        face, workspace.face_values, area, workspace.lifted,
+    )
+
+    return rhs
+end
+
+function maxwell_surface_workspace(
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace},
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    if workspace === nothing
+        return MaxwellSurfaceWorkspace(ref, fops)
+    end
+
+    matches_workspace(workspace, ref, fops) ||
+        throw(ArgumentError("Maxwell surface workspace has incompatible dimensions."))
+    return workspace
+end
+
 function maxwell_interior_surface_rhs!(
     rhs::MaxwellRHS,
     U::MaxwellField,
@@ -202,101 +518,22 @@ function maxwell_interior_surface_rhs!(
     flux_kind::MaxwellFluxKind = MaxwellFlux_Central,
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
+
     for ff in flux_faces.interior
-        tr = ff.trace
-        n = ff.normal
-
-        minus = maxwell_minus_trace(U, tr)
-        plus = maxwell_plus_trace(U, tr)
-
-        fluxM = maxwell_surface_flux_values(
-            minus,
-            plus,
-            n;
+        maxwell_interior_surface_face_rhs!(
+            rhs,
+            U,
+            ref,
+            fops,
+            mappings,
+            ff;
             flux_kind = flux_kind,
             ε = ε,
             μ = μ,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEx, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxEx, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEy, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxEy, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEz, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxEz, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHx, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxHx, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHy, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxHy, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHz, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxHz, ff.area,
-        )
-
-        # Plus side: swap states and use outward normal from plus element.
-        nplus = (-n[1], -n[2], -n[3])
-
-        fluxP_aligned = maxwell_surface_flux_values(
-            plus,
-            minus,
-            nplus;
-            flux_kind = flux_kind,
-            ε = ε,
-            μ = μ,
-        )
-
-        fluxExP = unpermute_plus_face_values(fluxP_aligned.fluxEx, tr.plus_to_minus_perm)
-        fluxEyP = unpermute_plus_face_values(fluxP_aligned.fluxEy, tr.plus_to_minus_perm)
-        fluxEzP = unpermute_plus_face_values(fluxP_aligned.fluxEz, tr.plus_to_minus_perm)
-
-        fluxHxP = unpermute_plus_face_values(fluxP_aligned.fluxHx, tr.plus_to_minus_perm)
-        fluxHyP = unpermute_plus_face_values(fluxP_aligned.fluxHy, tr.plus_to_minus_perm)
-        fluxHzP = unpermute_plus_face_values(fluxP_aligned.fluxHz, tr.plus_to_minus_perm)
-
-        add_lifted_face_contribution!(
-            rhs.rhsEx, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxExP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEy, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxEyP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEz, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxEzP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHx, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxHxP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHy, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxHyP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHz, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxHzP, ff.area,
+            workspace = surface_workspace,
         )
     end
 
@@ -313,6 +550,7 @@ function maxwell_interior_surface_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     return maxwell_interior_surface_rhs!(
         rhs,
@@ -324,6 +562,7 @@ function maxwell_interior_surface_rhs!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -337,8 +576,10 @@ function maxwell_interior_surface_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     for ff in flux_faces.interior
         maxwell_interior_surface_face_rhs!(
@@ -351,6 +592,7 @@ function maxwell_interior_surface_rhs!(
             formulation;
             ε = ε,
             μ = μ,
+            workspace = surface_workspace,
         )
     end
 
@@ -367,118 +609,22 @@ function maxwell_periodic_surface_rhs!(
     flux_kind::MaxwellFluxKind = MaxwellFlux_Central,
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
+
     for ff in periodic.faces
-        tr = ff.trace
-        n = ff.normal
-
-        plus_nodes_aligned = tr.plus_nodes[tr.plus_to_minus_perm]
-
-        minus = (
-            Ex = U.Ex[tr.minus_nodes, tr.minus_elem],
-            Ey = U.Ey[tr.minus_nodes, tr.minus_elem],
-            Ez = U.Ez[tr.minus_nodes, tr.minus_elem],
-            Hx = U.Hx[tr.minus_nodes, tr.minus_elem],
-            Hy = U.Hy[tr.minus_nodes, tr.minus_elem],
-            Hz = U.Hz[tr.minus_nodes, tr.minus_elem],
-        )
-
-        plus = (
-            Ex = U.Ex[plus_nodes_aligned, tr.plus_elem],
-            Ey = U.Ey[plus_nodes_aligned, tr.plus_elem],
-            Ez = U.Ez[plus_nodes_aligned, tr.plus_elem],
-            Hx = U.Hx[plus_nodes_aligned, tr.plus_elem],
-            Hy = U.Hy[plus_nodes_aligned, tr.plus_elem],
-            Hz = U.Hz[plus_nodes_aligned, tr.plus_elem],
-        )
-
-        fluxM = maxwell_surface_flux_values(
-            minus,
-            plus,
-            n;
+        maxwell_periodic_surface_face_rhs!(
+            rhs,
+            U,
+            ref,
+            fops,
+            mappings,
+            ff;
             flux_kind = flux_kind,
             ε = ε,
             μ = μ,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEx, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxEx, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEy, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxEy, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEz, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxEz, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHx, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxHx, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHy, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxHy, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHz, tr.minus_elem, ref, fops, mappings,
-            tr.minus_face, tr.minus_nodes, fluxM.fluxHz, ff.area,
-        )
-
-        # Plus side.
-        nplus = (-n[1], -n[2], -n[3])
-
-        fluxP_aligned = maxwell_surface_flux_values(
-            plus,
-            minus,
-            nplus;
-            flux_kind = flux_kind,
-            ε = ε,
-            μ = μ,
-        )
-
-        fluxExP = unpermute_plus_face_values(fluxP_aligned.fluxEx, tr.plus_to_minus_perm)
-        fluxEyP = unpermute_plus_face_values(fluxP_aligned.fluxEy, tr.plus_to_minus_perm)
-        fluxEzP = unpermute_plus_face_values(fluxP_aligned.fluxEz, tr.plus_to_minus_perm)
-
-        fluxHxP = unpermute_plus_face_values(fluxP_aligned.fluxHx, tr.plus_to_minus_perm)
-        fluxHyP = unpermute_plus_face_values(fluxP_aligned.fluxHy, tr.plus_to_minus_perm)
-        fluxHzP = unpermute_plus_face_values(fluxP_aligned.fluxHz, tr.plus_to_minus_perm)
-
-        add_lifted_face_contribution!(
-            rhs.rhsEx, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxExP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEy, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxEyP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEz, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxEzP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHx, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxHxP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHy, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxHyP, ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHz, tr.plus_elem, ref, fops, mappings,
-            tr.plus_face, tr.plus_nodes, fluxHzP, ff.area,
+            workspace = surface_workspace,
         )
     end
 
@@ -495,6 +641,7 @@ function maxwell_periodic_surface_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     return maxwell_periodic_surface_rhs!(
         rhs,
@@ -506,6 +653,7 @@ function maxwell_periodic_surface_rhs!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -519,8 +667,10 @@ function maxwell_periodic_surface_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     for ff in periodic.faces
         maxwell_periodic_surface_face_rhs!(
@@ -533,6 +683,7 @@ function maxwell_periodic_surface_rhs!(
             formulation;
             ε = ε,
             μ = μ,
+            workspace = surface_workspace,
         )
     end
 
@@ -550,110 +701,24 @@ function maxwell_boundary_surface_rhs!(
     flux_kind::MaxwellFluxKind = MaxwellFlux_Central,
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
+
     for ff in flux_faces.boundary
-        kind = boundary_kind(registry, ff.boundary_id)
-
-        if kind == MaxwellBC_None
-            continue
-
-        elseif kind in (MaxwellBC_PEC, MaxwellBC_PMC, MaxwellBC_Absorbing)
-            tr = ff.trace
-            n = ff.normal
-
-            minus = maxwell_boundary_minus_trace(U, tr)
-            plus = maxwell_boundary_plus_trace(
-                minus,
-                n,
-                kind;
-                ε = ε,
-                μ = μ,
-            )
-
-            flux = maxwell_surface_flux_values(
-                minus,
-                plus,
-                n;
-                flux_kind = flux_kind,
-                ε = ε,
-                μ = μ,
-            )
-
-            add_lifted_face_contribution!(
-                rhs.rhsEx,
-                tr.elem,
-                ref,
-                fops,
-                mappings,
-                tr.face,
-                tr.nodes,
-                flux.fluxEx,
-                ff.area,
-            )
-
-            add_lifted_face_contribution!(
-                rhs.rhsEy,
-                tr.elem,
-                ref,
-                fops,
-                mappings,
-                tr.face,
-                tr.nodes,
-                flux.fluxEy,
-                ff.area,
-            )
-
-            add_lifted_face_contribution!(
-                rhs.rhsEz,
-                tr.elem,
-                ref,
-                fops,
-                mappings,
-                tr.face,
-                tr.nodes,
-                flux.fluxEz,
-                ff.area,
-            )
-
-            add_lifted_face_contribution!(
-                rhs.rhsHx,
-                tr.elem,
-                ref,
-                fops,
-                mappings,
-                tr.face,
-                tr.nodes,
-                flux.fluxHx,
-                ff.area,
-            )
-
-            add_lifted_face_contribution!(
-                rhs.rhsHy,
-                tr.elem,
-                ref,
-                fops,
-                mappings,
-                tr.face,
-                tr.nodes,
-                flux.fluxHy,
-                ff.area,
-            )
-
-            add_lifted_face_contribution!(
-                rhs.rhsHz,
-                tr.elem,
-                ref,
-                fops,
-                mappings,
-                tr.face,
-                tr.nodes,
-                flux.fluxHz,
-                ff.area,
-            )
-
-        else
-            error("Unsupported Maxwell boundary kind $kind for boundary_id = $(ff.boundary_id).")
-        end
+        maxwell_boundary_surface_face_rhs!(
+            rhs,
+            U,
+            ref,
+            fops,
+            mappings,
+            ff,
+            registry;
+            flux_kind = flux_kind,
+            ε = ε,
+            μ = μ,
+            workspace = surface_workspace,
+        )
     end
 
     return rhs
@@ -670,6 +735,7 @@ function maxwell_boundary_surface_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     return maxwell_boundary_surface_rhs!(
         rhs,
@@ -682,6 +748,7 @@ function maxwell_boundary_surface_rhs!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -696,8 +763,10 @@ function maxwell_boundary_surface_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     for ff in flux_faces.boundary
         maxwell_boundary_surface_face_rhs!(
@@ -711,6 +780,7 @@ function maxwell_boundary_surface_rhs!(
             formulation;
             ε = ε,
             μ = μ,
+            workspace = surface_workspace,
         )
     end
 
@@ -727,14 +797,16 @@ function maxwell_interior_surface_face_rhs!(
     flux_kind::MaxwellFluxKind,
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
     tr = ff.trace
     n = ff.normal
 
-    minus = maxwell_minus_trace(U, tr)
-    plus = maxwell_plus_trace(U, tr)
+    minus, plus = interior_face_traces!(surface_workspace, U, tr)
 
-    fluxM = maxwell_surface_flux_values(
+    maxwell_surface_flux_values!(
+        surface_workspace.flux,
         minus,
         plus,
         n;
@@ -743,39 +815,21 @@ function maxwell_interior_surface_face_rhs!(
         μ = μ,
     )
 
-    add_lifted_face_contribution!(
-        rhs.rhsEx, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxEx, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEy, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxEy, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEz, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxEz, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHx, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxHx, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHy, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxHy, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHz, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxHz, ff.area,
+    add_lifted_maxwell_surface_flux!(
+        rhs,
+        tr.minus_elem,
+        fops,
+        mappings,
+        tr.minus_face,
+        surface_workspace.flux,
+        ff.area,
+        surface_workspace,
     )
 
     nplus = (-n[1], -n[2], -n[3])
 
-    fluxP_aligned = maxwell_surface_flux_values(
+    maxwell_surface_flux_values!(
+        surface_workspace.flux,
         plus,
         minus,
         nplus;
@@ -784,42 +838,16 @@ function maxwell_interior_surface_face_rhs!(
         μ = μ,
     )
 
-    fluxExP = unpermute_plus_face_values(fluxP_aligned.fluxEx, tr.plus_to_minus_perm)
-    fluxEyP = unpermute_plus_face_values(fluxP_aligned.fluxEy, tr.plus_to_minus_perm)
-    fluxEzP = unpermute_plus_face_values(fluxP_aligned.fluxEz, tr.plus_to_minus_perm)
-
-    fluxHxP = unpermute_plus_face_values(fluxP_aligned.fluxHx, tr.plus_to_minus_perm)
-    fluxHyP = unpermute_plus_face_values(fluxP_aligned.fluxHy, tr.plus_to_minus_perm)
-    fluxHzP = unpermute_plus_face_values(fluxP_aligned.fluxHz, tr.plus_to_minus_perm)
-
-    add_lifted_face_contribution!(
-        rhs.rhsEx, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxExP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEy, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxEyP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEz, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxEzP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHx, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxHxP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHy, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxHyP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHz, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxHzP, ff.area,
+    add_lifted_permuted_maxwell_surface_flux!(
+        rhs,
+        tr.plus_elem,
+        fops,
+        mappings,
+        tr.plus_face,
+        surface_workspace.flux,
+        tr.plus_to_minus_perm,
+        ff.area,
+        surface_workspace,
     )
 
     return rhs
@@ -835,6 +863,7 @@ function maxwell_interior_surface_face_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     return maxwell_interior_surface_face_rhs!(
         rhs,
@@ -846,6 +875,7 @@ function maxwell_interior_surface_face_rhs!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -859,19 +889,22 @@ function maxwell_interior_surface_face_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     tr = ff.trace
     n = ff.normal
 
-    minus = maxwell_minus_trace(U, tr)
-    plus = maxwell_plus_trace(U, tr)
+    minus, plus = interior_face_traces!(surface_workspace, U, tr)
 
-    fluxM = maxwell_poisson_bracket_surface_flux_values(
+    maxwell_poisson_bracket_surface_flux_values!(
+        surface_workspace.flux,
         minus,
         plus,
         n;
+        flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
     )
@@ -879,44 +912,36 @@ function maxwell_interior_surface_face_rhs!(
     add_lifted_maxwell_surface_flux!(
         rhs,
         tr.minus_elem,
-        ref,
         fops,
         mappings,
         tr.minus_face,
-        tr.minus_nodes,
-        fluxM,
+        surface_workspace.flux,
         ff.area,
+        surface_workspace,
     )
 
     nplus = (-n[1], -n[2], -n[3])
 
-    fluxP_aligned = maxwell_poisson_bracket_surface_flux_values(
+    maxwell_poisson_bracket_surface_flux_values!(
+        surface_workspace.flux,
         plus,
         minus,
         nplus;
+        flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
     )
 
-    fluxP = (
-        fluxEx = unpermute_plus_face_values(fluxP_aligned.fluxEx, tr.plus_to_minus_perm),
-        fluxEy = unpermute_plus_face_values(fluxP_aligned.fluxEy, tr.plus_to_minus_perm),
-        fluxEz = unpermute_plus_face_values(fluxP_aligned.fluxEz, tr.plus_to_minus_perm),
-        fluxHx = unpermute_plus_face_values(fluxP_aligned.fluxHx, tr.plus_to_minus_perm),
-        fluxHy = unpermute_plus_face_values(fluxP_aligned.fluxHy, tr.plus_to_minus_perm),
-        fluxHz = unpermute_plus_face_values(fluxP_aligned.fluxHz, tr.plus_to_minus_perm),
-    )
-
-    add_lifted_maxwell_surface_flux!(
+    add_lifted_permuted_maxwell_surface_flux!(
         rhs,
         tr.plus_elem,
-        ref,
         fops,
         mappings,
         tr.plus_face,
-        tr.plus_nodes,
-        fluxP,
+        surface_workspace.flux,
+        tr.plus_to_minus_perm,
         ff.area,
+        surface_workspace,
     )
 
     return rhs
@@ -932,31 +957,16 @@ function maxwell_periodic_surface_face_rhs!(
     flux_kind::MaxwellFluxKind,
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
     tr = ff.trace
     n = ff.normal
 
-    plus_nodes_aligned = tr.plus_nodes[tr.plus_to_minus_perm]
+    minus, plus = periodic_face_traces!(surface_workspace, U, tr)
 
-    minus = (
-        Ex = U.Ex[tr.minus_nodes, tr.minus_elem],
-        Ey = U.Ey[tr.minus_nodes, tr.minus_elem],
-        Ez = U.Ez[tr.minus_nodes, tr.minus_elem],
-        Hx = U.Hx[tr.minus_nodes, tr.minus_elem],
-        Hy = U.Hy[tr.minus_nodes, tr.minus_elem],
-        Hz = U.Hz[tr.minus_nodes, tr.minus_elem],
-    )
-
-    plus = (
-        Ex = U.Ex[plus_nodes_aligned, tr.plus_elem],
-        Ey = U.Ey[plus_nodes_aligned, tr.plus_elem],
-        Ez = U.Ez[plus_nodes_aligned, tr.plus_elem],
-        Hx = U.Hx[plus_nodes_aligned, tr.plus_elem],
-        Hy = U.Hy[plus_nodes_aligned, tr.plus_elem],
-        Hz = U.Hz[plus_nodes_aligned, tr.plus_elem],
-    )
-
-    fluxM = maxwell_surface_flux_values(
+    maxwell_surface_flux_values!(
+        surface_workspace.flux,
         minus,
         plus,
         n;
@@ -965,39 +975,21 @@ function maxwell_periodic_surface_face_rhs!(
         μ = μ,
     )
 
-    add_lifted_face_contribution!(
-        rhs.rhsEx, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxEx, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEy, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxEy, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEz, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxEz, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHx, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxHx, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHy, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxHy, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHz, tr.minus_elem, ref, fops, mappings,
-        tr.minus_face, tr.minus_nodes, fluxM.fluxHz, ff.area,
+    add_lifted_maxwell_surface_flux!(
+        rhs,
+        tr.minus_elem,
+        fops,
+        mappings,
+        tr.minus_face,
+        surface_workspace.flux,
+        ff.area,
+        surface_workspace,
     )
 
     nplus = (-n[1], -n[2], -n[3])
 
-    fluxP_aligned = maxwell_surface_flux_values(
+    maxwell_surface_flux_values!(
+        surface_workspace.flux,
         plus,
         minus,
         nplus;
@@ -1006,42 +998,16 @@ function maxwell_periodic_surface_face_rhs!(
         μ = μ,
     )
 
-    fluxExP = unpermute_plus_face_values(fluxP_aligned.fluxEx, tr.plus_to_minus_perm)
-    fluxEyP = unpermute_plus_face_values(fluxP_aligned.fluxEy, tr.plus_to_minus_perm)
-    fluxEzP = unpermute_plus_face_values(fluxP_aligned.fluxEz, tr.plus_to_minus_perm)
-
-    fluxHxP = unpermute_plus_face_values(fluxP_aligned.fluxHx, tr.plus_to_minus_perm)
-    fluxHyP = unpermute_plus_face_values(fluxP_aligned.fluxHy, tr.plus_to_minus_perm)
-    fluxHzP = unpermute_plus_face_values(fluxP_aligned.fluxHz, tr.plus_to_minus_perm)
-
-    add_lifted_face_contribution!(
-        rhs.rhsEx, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxExP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEy, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxEyP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsEz, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxEzP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHx, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxHxP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHy, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxHyP, ff.area,
-    )
-
-    add_lifted_face_contribution!(
-        rhs.rhsHz, tr.plus_elem, ref, fops, mappings,
-        tr.plus_face, tr.plus_nodes, fluxHzP, ff.area,
+    add_lifted_permuted_maxwell_surface_flux!(
+        rhs,
+        tr.plus_elem,
+        fops,
+        mappings,
+        tr.plus_face,
+        surface_workspace.flux,
+        tr.plus_to_minus_perm,
+        ff.area,
+        surface_workspace,
     )
 
     return rhs
@@ -1057,6 +1023,7 @@ function maxwell_periodic_surface_face_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     return maxwell_periodic_surface_face_rhs!(
         rhs,
@@ -1068,6 +1035,7 @@ function maxwell_periodic_surface_face_rhs!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -1081,36 +1049,22 @@ function maxwell_periodic_surface_face_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     tr = ff.trace
     n = ff.normal
 
-    plus_nodes_aligned = tr.plus_nodes[tr.plus_to_minus_perm]
+    minus, plus = periodic_face_traces!(surface_workspace, U, tr)
 
-    minus = (
-        Ex = U.Ex[tr.minus_nodes, tr.minus_elem],
-        Ey = U.Ey[tr.minus_nodes, tr.minus_elem],
-        Ez = U.Ez[tr.minus_nodes, tr.minus_elem],
-        Hx = U.Hx[tr.minus_nodes, tr.minus_elem],
-        Hy = U.Hy[tr.minus_nodes, tr.minus_elem],
-        Hz = U.Hz[tr.minus_nodes, tr.minus_elem],
-    )
-
-    plus = (
-        Ex = U.Ex[plus_nodes_aligned, tr.plus_elem],
-        Ey = U.Ey[plus_nodes_aligned, tr.plus_elem],
-        Ez = U.Ez[plus_nodes_aligned, tr.plus_elem],
-        Hx = U.Hx[plus_nodes_aligned, tr.plus_elem],
-        Hy = U.Hy[plus_nodes_aligned, tr.plus_elem],
-        Hz = U.Hz[plus_nodes_aligned, tr.plus_elem],
-    )
-
-    fluxM = maxwell_poisson_bracket_surface_flux_values(
+    maxwell_poisson_bracket_surface_flux_values!(
+        surface_workspace.flux,
         minus,
         plus,
         n;
+        flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
     )
@@ -1118,44 +1072,36 @@ function maxwell_periodic_surface_face_rhs!(
     add_lifted_maxwell_surface_flux!(
         rhs,
         tr.minus_elem,
-        ref,
         fops,
         mappings,
         tr.minus_face,
-        tr.minus_nodes,
-        fluxM,
+        surface_workspace.flux,
         ff.area,
+        surface_workspace,
     )
 
     nplus = (-n[1], -n[2], -n[3])
 
-    fluxP_aligned = maxwell_poisson_bracket_surface_flux_values(
+    maxwell_poisson_bracket_surface_flux_values!(
+        surface_workspace.flux,
         plus,
         minus,
         nplus;
+        flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
     )
 
-    fluxP = (
-        fluxEx = unpermute_plus_face_values(fluxP_aligned.fluxEx, tr.plus_to_minus_perm),
-        fluxEy = unpermute_plus_face_values(fluxP_aligned.fluxEy, tr.plus_to_minus_perm),
-        fluxEz = unpermute_plus_face_values(fluxP_aligned.fluxEz, tr.plus_to_minus_perm),
-        fluxHx = unpermute_plus_face_values(fluxP_aligned.fluxHx, tr.plus_to_minus_perm),
-        fluxHy = unpermute_plus_face_values(fluxP_aligned.fluxHy, tr.plus_to_minus_perm),
-        fluxHz = unpermute_plus_face_values(fluxP_aligned.fluxHz, tr.plus_to_minus_perm),
-    )
-
-    add_lifted_maxwell_surface_flux!(
+    add_lifted_permuted_maxwell_surface_flux!(
         rhs,
         tr.plus_elem,
-        ref,
         fops,
         mappings,
         tr.plus_face,
-        tr.plus_nodes,
-        fluxP,
+        surface_workspace.flux,
+        tr.plus_to_minus_perm,
         ff.area,
+        surface_workspace,
     )
 
     return rhs
@@ -1172,7 +1118,9 @@ function maxwell_boundary_surface_face_rhs!(
     flux_kind::MaxwellFluxKind,
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
     kind = boundary_kind(registry, ff.boundary_id)
 
     if kind == MaxwellBC_None
@@ -1182,8 +1130,9 @@ function maxwell_boundary_surface_face_rhs!(
         tr = ff.trace
         n = ff.normal
 
-        minus = maxwell_boundary_minus_trace(U, tr)
-        plus = maxwell_boundary_plus_trace(
+        minus = boundary_face_minus_trace!(surface_workspace, U, tr)
+        plus = maxwell_boundary_plus_trace!(
+            surface_workspace.plus,
             minus,
             n,
             kind;
@@ -1191,7 +1140,8 @@ function maxwell_boundary_surface_face_rhs!(
             μ = μ,
         )
 
-        flux = maxwell_surface_flux_values(
+        maxwell_surface_flux_values!(
+            surface_workspace.flux,
             minus,
             plus,
             n;
@@ -1200,76 +1150,15 @@ function maxwell_boundary_surface_face_rhs!(
             μ = μ,
         )
 
-        add_lifted_face_contribution!(
-            rhs.rhsEx,
+        add_lifted_maxwell_surface_flux!(
+            rhs,
             tr.elem,
-            ref,
             fops,
             mappings,
             tr.face,
-            tr.nodes,
-            flux.fluxEx,
+            surface_workspace.flux,
             ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEy,
-            tr.elem,
-            ref,
-            fops,
-            mappings,
-            tr.face,
-            tr.nodes,
-            flux.fluxEy,
-            ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsEz,
-            tr.elem,
-            ref,
-            fops,
-            mappings,
-            tr.face,
-            tr.nodes,
-            flux.fluxEz,
-            ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHx,
-            tr.elem,
-            ref,
-            fops,
-            mappings,
-            tr.face,
-            tr.nodes,
-            flux.fluxHx,
-            ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHy,
-            tr.elem,
-            ref,
-            fops,
-            mappings,
-            tr.face,
-            tr.nodes,
-            flux.fluxHy,
-            ff.area,
-        )
-
-        add_lifted_face_contribution!(
-            rhs.rhsHz,
-            tr.elem,
-            ref,
-            fops,
-            mappings,
-            tr.face,
-            tr.nodes,
-            flux.fluxHz,
-            ff.area,
+            surface_workspace,
         )
 
         return rhs
@@ -1290,6 +1179,7 @@ function maxwell_boundary_surface_face_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     return maxwell_boundary_surface_face_rhs!(
         rhs,
@@ -1302,6 +1192,7 @@ function maxwell_boundary_surface_face_rhs!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -1316,8 +1207,10 @@ function maxwell_boundary_surface_face_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     kind = boundary_kind(registry, ff.boundary_id)
 
@@ -1328,8 +1221,23 @@ function maxwell_boundary_surface_face_rhs!(
         tr = ff.trace
         n = ff.normal
 
-        minus = maxwell_boundary_minus_trace(U, tr)
-        plus = maxwell_boundary_plus_trace(
+        if formulation.flux_kind == MaxwellFlux_Alternating
+            if kind == MaxwellBC_PEC
+                return rhs
+            end
+
+            throw(
+                ArgumentError(
+                    "PoissonBracketFormulation with MaxwellFlux_Alternating " *
+                    "currently supports interior/periodic faces and PEC " *
+                    "boundaries. Boundary kind $kind is not implemented.",
+                ),
+            )
+        end
+
+        minus = boundary_face_minus_trace!(surface_workspace, U, tr)
+        plus = maxwell_boundary_plus_trace!(
+            surface_workspace.plus,
             minus,
             n,
             kind;
@@ -1337,10 +1245,12 @@ function maxwell_boundary_surface_face_rhs!(
             μ = μ,
         )
 
-        flux = maxwell_poisson_bracket_surface_flux_values(
+        maxwell_poisson_bracket_surface_flux_values!(
+            surface_workspace.flux,
             minus,
             plus,
             n;
+            flux_kind = formulation.flux_kind,
             ε = ε,
             μ = μ,
         )
@@ -1348,13 +1258,12 @@ function maxwell_boundary_surface_face_rhs!(
         add_lifted_maxwell_surface_flux!(
             rhs,
             tr.elem,
-            ref,
             fops,
             mappings,
             tr.face,
-            tr.nodes,
-            flux,
+            surface_workspace.flux,
             ff.area,
+            surface_workspace,
         )
 
         return rhs
@@ -1491,7 +1400,7 @@ function maxwell_volume_rhs_threaded!(
     μ::Float64,
     workspace::Union{Nothing,MaxwellVolumeThreadWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
 
     ne = size(U.Ex, 2)
 
@@ -1559,6 +1468,78 @@ function maxwell_volume_rhs_threaded!(
     return rhs
 end
 
+struct MaxwellSurfaceThreadWorkspace
+    work::Vector{MaxwellSurfaceWorkspace}
+    nfp::Int
+    nrows::Int
+    nthreads::Int
+end
+
+function MaxwellSurfaceThreadWorkspace(
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    return MaxwellSurfaceThreadWorkspace(
+        [
+            MaxwellSurfaceWorkspace(ref, fops)
+            for _ in 1:Base.Threads.nthreads()
+        ],
+        length(fops.face_nodes[1]),
+        ref.Np,
+        Base.Threads.nthreads(),
+    )
+end
+
+function matches_workspace(
+    workspace::MaxwellSurfaceThreadWorkspace,
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    return workspace.nfp == length(fops.face_nodes[1]) &&
+           workspace.nrows == ref.Np &&
+           workspace.nthreads == Base.Threads.nthreads()
+end
+
+function maxwell_surface_thread_workspace!(
+    backend::ThreadedBackend,
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    workspace = backend.maxwell_surface_workspace[]
+
+    if !(workspace isa MaxwellSurfaceThreadWorkspace) ||
+       !matches_workspace(workspace, ref, fops)
+        workspace = MaxwellSurfaceThreadWorkspace(ref, fops)
+        backend.maxwell_surface_workspace[] = workspace
+    end
+
+    return workspace::MaxwellSurfaceThreadWorkspace
+end
+
+function maxwell_surface_workspace!(
+    backend::SerialBackend,
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    workspace = backend.maxwell_surface_workspace[]
+
+    if !(workspace isa MaxwellSurfaceWorkspace) ||
+       !matches_workspace(workspace, ref, fops)
+        workspace = MaxwellSurfaceWorkspace(ref, fops)
+        backend.maxwell_surface_workspace[] = workspace
+    end
+
+    return workspace::MaxwellSurfaceWorkspace
+end
+
+function maxwell_surface_workspace!(
+    backend::ThreadedBackend,
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    return maxwell_surface_thread_workspace!(backend, ref, fops).work[1]
+end
+
 function maxwell_interior_surface_rhs_threaded!(
     rhs::MaxwellRHS,
     U::MaxwellField,
@@ -1569,9 +1550,15 @@ function maxwell_interior_surface_rhs_threaded!(
     flux_kind::MaxwellFluxKind,
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
+    work = workspace === nothing ?
+           MaxwellSurfaceThreadWorkspace(ref, fops).work :
+           workspace.work
+
     for color in flux_faces.interior_colors
         Base.Threads.@threads :static for j in eachindex(color)
+            surface_workspace = work[Base.Threads.threadid()]
             maxwell_interior_surface_face_rhs!(
                 rhs,
                 U,
@@ -1582,6 +1569,7 @@ function maxwell_interior_surface_rhs_threaded!(
                 flux_kind = flux_kind,
                 ε = ε,
                 μ = μ,
+                workspace = surface_workspace,
             )
         end
     end
@@ -1599,6 +1587,7 @@ function maxwell_interior_surface_rhs_threaded!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
     return maxwell_interior_surface_rhs_threaded!(
         rhs,
@@ -1610,6 +1599,7 @@ function maxwell_interior_surface_rhs_threaded!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -1623,11 +1613,16 @@ function maxwell_interior_surface_rhs_threaded!(
     formulation::PoissonBracketFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    work = workspace === nothing ?
+           MaxwellSurfaceThreadWorkspace(ref, fops).work :
+           workspace.work
 
     for color in flux_faces.interior_colors
         Base.Threads.@threads :static for j in eachindex(color)
+            surface_workspace = work[Base.Threads.threadid()]
             maxwell_interior_surface_face_rhs!(
                 rhs,
                 U,
@@ -1638,6 +1633,7 @@ function maxwell_interior_surface_rhs_threaded!(
                 formulation;
                 ε = ε,
                 μ = μ,
+                workspace = surface_workspace,
             )
         end
     end
@@ -1655,9 +1651,15 @@ function maxwell_periodic_surface_rhs_threaded!(
     flux_kind::MaxwellFluxKind,
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
+    work = workspace === nothing ?
+           MaxwellSurfaceThreadWorkspace(ref, fops).work :
+           workspace.work
+
     for color in periodic.colors
         Base.Threads.@threads :static for j in eachindex(color)
+            surface_workspace = work[Base.Threads.threadid()]
             maxwell_periodic_surface_face_rhs!(
                 rhs,
                 U,
@@ -1668,6 +1670,7 @@ function maxwell_periodic_surface_rhs_threaded!(
                 flux_kind = flux_kind,
                 ε = ε,
                 μ = μ,
+                workspace = surface_workspace,
             )
         end
     end
@@ -1685,6 +1688,7 @@ function maxwell_periodic_surface_rhs_threaded!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
     return maxwell_periodic_surface_rhs_threaded!(
         rhs,
@@ -1696,6 +1700,7 @@ function maxwell_periodic_surface_rhs_threaded!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -1709,11 +1714,16 @@ function maxwell_periodic_surface_rhs_threaded!(
     formulation::PoissonBracketFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    work = workspace === nothing ?
+           MaxwellSurfaceThreadWorkspace(ref, fops).work :
+           workspace.work
 
     for color in periodic.colors
         Base.Threads.@threads :static for j in eachindex(color)
+            surface_workspace = work[Base.Threads.threadid()]
             maxwell_periodic_surface_face_rhs!(
                 rhs,
                 U,
@@ -1724,6 +1734,7 @@ function maxwell_periodic_surface_rhs_threaded!(
                 formulation;
                 ε = ε,
                 μ = μ,
+                workspace = surface_workspace,
             )
         end
     end
@@ -1742,9 +1753,15 @@ function maxwell_boundary_surface_rhs_threaded!(
     flux_kind::MaxwellFluxKind,
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
+    work = workspace === nothing ?
+           MaxwellSurfaceThreadWorkspace(ref, fops).work :
+           workspace.work
+
     for color in flux_faces.boundary_colors
         Base.Threads.@threads :static for j in eachindex(color)
+            surface_workspace = work[Base.Threads.threadid()]
             maxwell_boundary_surface_face_rhs!(
                 rhs,
                 U,
@@ -1756,6 +1773,7 @@ function maxwell_boundary_surface_rhs_threaded!(
                 flux_kind = flux_kind,
                 ε = ε,
                 μ = μ,
+                workspace = surface_workspace,
             )
         end
     end
@@ -1774,6 +1792,7 @@ function maxwell_boundary_surface_rhs_threaded!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
     return maxwell_boundary_surface_rhs_threaded!(
         rhs,
@@ -1786,6 +1805,7 @@ function maxwell_boundary_surface_rhs_threaded!(
         flux_kind = formulation.flux_kind,
         ε = ε,
         μ = μ,
+        workspace = workspace,
     )
 end
 
@@ -1800,11 +1820,16 @@ function maxwell_boundary_surface_rhs_threaded!(
     formulation::PoissonBracketFormulation;
     ε::Float64,
     μ::Float64,
+    workspace::Union{Nothing, MaxwellSurfaceThreadWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
+    work = workspace === nothing ?
+           MaxwellSurfaceThreadWorkspace(ref, fops).work :
+           workspace.work
 
     for color in flux_faces.boundary_colors
         Base.Threads.@threads :static for j in eachindex(color)
+            surface_workspace = work[Base.Threads.threadid()]
             maxwell_boundary_surface_face_rhs!(
                 rhs,
                 U,
@@ -1816,6 +1841,7 @@ function maxwell_boundary_surface_rhs_threaded!(
                 formulation;
                 ε = ε,
                 μ = μ,
+                workspace = surface_workspace,
             )
         end
     end
@@ -1865,8 +1891,10 @@ function maxwell_rhs!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     fill_maxwell_rhs!(rhs, 0.0)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     maxwell_volume_rhs!(
         rhs,
@@ -1889,6 +1917,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs!(
@@ -1902,6 +1931,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -1919,10 +1949,12 @@ function maxwell_rhs!(
     formulation::PoissonBracketFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
 
     fill_maxwell_rhs!(rhs, 0.0)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     maxwell_volume_rhs!(
         rhs,
@@ -1945,6 +1977,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs!(
@@ -1958,6 +1991,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -2016,6 +2050,11 @@ function maxwell_rhs!(
 )
     fill_maxwell_rhs!(rhs, 0.0)
     volume_workspace = maxwell_volume_thread_workspace!(backend, U)
+    surface_workspace = maxwell_surface_thread_workspace!(
+        backend,
+        dg.ref,
+        dg.fops,
+    )
 
     maxwell_volume_rhs_threaded!(
         rhs,
@@ -2038,6 +2077,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs_threaded!(
@@ -2051,6 +2091,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -2066,6 +2107,7 @@ function maxwell_rhs!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
+    surface_workspace = maxwell_surface_workspace!(backend, dg.ref, dg.fops)
     return maxwell_rhs!(
         rhs,
         U,
@@ -2078,6 +2120,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 end
 
@@ -2112,6 +2155,7 @@ function maxwell_rhs!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
+    surface_workspace = maxwell_surface_workspace!(backend, dg.ref, dg.fops)
     return maxwell_rhs!(
         rhs,
         U,
@@ -2124,6 +2168,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 end
 
@@ -2137,10 +2182,15 @@ function maxwell_rhs!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
 
     fill_maxwell_rhs!(rhs, 0.0)
     volume_workspace = maxwell_volume_thread_workspace!(backend, U)
+    surface_workspace = maxwell_surface_thread_workspace!(
+        backend,
+        dg.ref,
+        dg.fops,
+    )
 
     maxwell_volume_rhs_threaded!(
         rhs,
@@ -2163,6 +2213,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs_threaded!(
@@ -2176,6 +2227,7 @@ function maxwell_rhs!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -2226,8 +2278,10 @@ function maxwell_rhs_periodic!(
     formulation::HesthavenWarburtonFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
     fill_maxwell_rhs!(rhs, 0.0)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     maxwell_volume_rhs!(
         rhs,
@@ -2250,6 +2304,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_periodic_surface_rhs!(
@@ -2262,6 +2317,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs!(
@@ -2275,6 +2331,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -2293,10 +2350,12 @@ function maxwell_rhs_periodic!(
     formulation::PoissonBracketFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
 
     fill_maxwell_rhs!(rhs, 0.0)
+    surface_workspace = maxwell_surface_workspace(workspace, ref, fops)
 
     maxwell_volume_rhs!(
         rhs,
@@ -2319,6 +2378,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_periodic_surface_rhs!(
@@ -2331,6 +2391,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs!(
@@ -2344,6 +2405,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -2384,6 +2446,11 @@ function maxwell_rhs_periodic!(
 )
     fill_maxwell_rhs!(rhs, 0.0)
     volume_workspace = maxwell_volume_thread_workspace!(backend, U)
+    surface_workspace = maxwell_surface_thread_workspace!(
+        backend,
+        dg.ref,
+        dg.fops,
+    )
 
     maxwell_volume_rhs_threaded!(
         rhs,
@@ -2406,6 +2473,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_periodic_surface_rhs_threaded!(
@@ -2418,6 +2486,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs_threaded!(
@@ -2431,6 +2500,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs
@@ -2470,6 +2540,7 @@ function maxwell_rhs_periodic!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
+    surface_workspace = maxwell_surface_workspace!(backend, dg.ref, dg.fops)
     return maxwell_rhs_periodic!(
         rhs,
         U,
@@ -2483,6 +2554,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 end
 
@@ -2520,6 +2592,7 @@ function maxwell_rhs_periodic!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
+    surface_workspace = maxwell_surface_workspace!(backend, dg.ref, dg.fops)
     return maxwell_rhs_periodic!(
         rhs,
         U,
@@ -2533,6 +2606,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 end
 
@@ -2547,10 +2621,15 @@ function maxwell_rhs_periodic!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
 
     fill_maxwell_rhs!(rhs, 0.0)
     volume_workspace = maxwell_volume_thread_workspace!(backend, U)
+    surface_workspace = maxwell_surface_thread_workspace!(
+        backend,
+        dg.ref,
+        dg.fops,
+    )
 
     maxwell_volume_rhs_threaded!(
         rhs,
@@ -2573,6 +2652,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_periodic_surface_rhs_threaded!(
@@ -2585,6 +2665,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     maxwell_boundary_surface_rhs_threaded!(
@@ -2598,6 +2679,7 @@ function maxwell_rhs_periodic!(
         formulation;
         ε = ε,
         μ = μ,
+        workspace = surface_workspace,
     )
 
     return rhs

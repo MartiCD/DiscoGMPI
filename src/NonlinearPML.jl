@@ -160,6 +160,8 @@ This is the primary energy-decaying system in Appendix A of the paper.
     electric::NTuple{3, <:Real},
     magnetic::NTuple{3, <:Real},
     sigma::NTuple{3, <:Real};
+    ε::Real = 1.0,
+    μ::Real = 1.0,
     a::Real = 0.5,
     regularization::Real = 1e-12,
 )
@@ -173,10 +175,10 @@ This is the primary energy-decaying system in Appendix A of the paper.
     electric_squared = Ex^2 + Ey^2 + Ez^2
     magnetic_squared = Hx^2 + Hy^2 + Hz^2
     denominator_h =
-        a * magnetic_squared + (1.0 - a) * electric_squared +
+        a * μ * magnetic_squared + (1.0 - a) * ε * electric_squared +
         regularization
     denominator_e =
-        a * electric_squared + (1.0 - a) * magnetic_squared +
+        a * ε * electric_squared + (1.0 - a) * μ * magnetic_squared +
         regularization
 
     p_h_x = cross_x / denominator_h
@@ -205,8 +207,16 @@ This is the primary energy-decaying system in Appendix A of the paper.
     )
 
     return (
-        electric = electric_source,
-        magnetic = magnetic_source,
+        electric = (
+            electric_source[1] / ε,
+            electric_source[2] / ε,
+            electric_source[3] / ε,
+        ),
+        magnetic = (
+            magnetic_source[1] / μ,
+            magnetic_source[2] / μ,
+            magnetic_source[3] / μ,
+        ),
     )
 end
 
@@ -214,9 +224,15 @@ function nonlinear_pml_source(
     electric::NTuple{3, <:Real},
     magnetic::NTuple{3, <:Real},
     sigma::NTuple{3, <:Real};
+    ε::Real = 1.0,
+    μ::Real = 1.0,
     a::Real = 0.5,
     regularization::Real = 1e-12,
 )
+    ε > 0.0 ||
+        throw(ArgumentError("Nonlinear PML permittivity must be positive."))
+    μ > 0.0 ||
+        throw(ArgumentError("Nonlinear PML permeability must be positive."))
     0.0 < a < 1.0 ||
         throw(ArgumentError("Nonlinear PML parameter a must lie in (0,1)."))
     regularization > 0.0 ||
@@ -233,6 +249,8 @@ function nonlinear_pml_source(
         electric,
         magnetic,
         sigma;
+        ε = ε,
+        μ = μ,
         a = a,
         regularization = regularization,
     )
@@ -263,11 +281,17 @@ function add_maxwell_nonlinear_pml_source!(
     rhs::MaxwellRHS,
     U::MaxwellField,
     pml::MaxwellNonlinearPML;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
     elements = axes(U.Ex, 2),
 )
     validate_maxwell_nonlinear_pml(pml, U)
     size(rhs.rhsEx) == size(U.Ex) ||
         throw(ArgumentError("Maxwell RHS and field sizes must match."))
+    ε > 0.0 ||
+        throw(ArgumentError("Nonlinear PML permittivity must be positive."))
+    μ > 0.0 ||
+        throw(ArgumentError("Nonlinear PML permeability must be positive."))
 
     @inbounds for elem in elements, node in axes(U.Ex, 1)
         source = _nonlinear_pml_source(
@@ -286,6 +310,8 @@ function add_maxwell_nonlinear_pml_source!(
                 pml.sigma_y[node, elem],
                 pml.sigma_z[node, elem],
             );
+            ε = ε,
+            μ = μ,
             a = pml.a,
             regularization = pml.regularization,
         )
@@ -300,6 +326,55 @@ function add_maxwell_nonlinear_pml_source!(
     return rhs
 end
 
+function add_maxwell_nonlinear_pml_source!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    pml::MaxwellNonlinearPML,
+    materials::MaxwellElementMaterials;
+    elements = axes(U.Ex, 2),
+)
+    validate_maxwell_nonlinear_pml(pml, U)
+    validate_maxwell_materials(materials, size(U.Ex, 2))
+    size(rhs.rhsEx) == size(U.Ex) ||
+        throw(ArgumentError("Maxwell RHS and field sizes must match."))
+
+    @inbounds for elem in elements
+        ε = materials.epsilon[elem]
+        μ = materials.permeability[elem]
+        for node in axes(U.Ex, 1)
+            source = _nonlinear_pml_source(
+                (
+                    U.Ex[node, elem],
+                    U.Ey[node, elem],
+                    U.Ez[node, elem],
+                ),
+                (
+                    U.Hx[node, elem],
+                    U.Hy[node, elem],
+                    U.Hz[node, elem],
+                ),
+                (
+                    pml.sigma_x[node, elem],
+                    pml.sigma_y[node, elem],
+                    pml.sigma_z[node, elem],
+                );
+                ε = ε,
+                μ = μ,
+                a = pml.a,
+                regularization = pml.regularization,
+            )
+            rhs.rhsEx[node, elem] += source.electric[1]
+            rhs.rhsEy[node, elem] += source.electric[2]
+            rhs.rhsEz[node, elem] += source.electric[3]
+            rhs.rhsHx[node, elem] += source.magnetic[1]
+            rhs.rhsHy[node, elem] += source.magnetic[2]
+            rhs.rhsHz[node, elem] += source.magnetic[3]
+        end
+    end
+
+    return rhs
+end
+
 function maxwell_nonlinear_pml_rhs!(
     rhs::MaxwellRHS,
     U::MaxwellField,
@@ -307,9 +382,25 @@ function maxwell_nonlinear_pml_rhs!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
-    maxwell_rhs!(rhs, U, dg, registry, formulation; ε = 1.0, μ = 1.0)
-    return add_maxwell_nonlinear_pml_source!(rhs, U, pml)
+    maxwell_rhs!(rhs, U, dg, registry, formulation; ε = ε, μ = μ)
+    return add_maxwell_nonlinear_pml_source!(rhs, U, pml; ε = ε, μ = μ)
+end
+
+function maxwell_nonlinear_pml_rhs!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    dg::DGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    maxwell_rhs!(rhs, U, dg, registry, formulation, materials)
+    return add_maxwell_nonlinear_pml_source!(rhs, U, pml, materials)
 end
 
 function maxwell_nonlinear_pml_rhs_periodic!(
@@ -320,6 +411,9 @@ function maxwell_nonlinear_pml_rhs_periodic!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
     maxwell_rhs_periodic!(
         rhs,
@@ -328,10 +422,10 @@ function maxwell_nonlinear_pml_rhs_periodic!(
         periodic,
         registry,
         formulation;
-        ε = 1.0,
-        μ = 1.0,
+        ε = ε,
+        μ = μ,
     )
-    return add_maxwell_nonlinear_pml_source!(rhs, U, pml)
+    return add_maxwell_nonlinear_pml_source!(rhs, U, pml; ε = ε, μ = μ)
 end
 
 function maxwell_nonlinear_pml_rhs!(
@@ -341,12 +435,47 @@ function maxwell_nonlinear_pml_rhs!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
-    maxwell_rhs!(rhs, U, distributed_dg, registry, formulation; ε = 1.0, μ = 1.0)
+    maxwell_rhs!(rhs, U, distributed_dg, registry, formulation; ε = ε, μ = μ)
     add_maxwell_nonlinear_pml_source!(
         rhs,
         U,
         pml;
+        ε = ε,
+        μ = μ,
+        elements = distributed_dg.distributed_mesh.partition.owned,
+    )
+    return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
+end
+
+function maxwell_nonlinear_pml_rhs!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+    ;
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
+)
+    maxwell_rhs!(
+        rhs,
+        U,
+        distributed_dg,
+        registry,
+        formulation,
+        materials;
+        boundary_data = boundary_data,
+    )
+    add_maxwell_nonlinear_pml_source!(
+        rhs,
+        U,
+        pml,
+        materials;
         elements = distributed_dg.distributed_mesh.partition.owned,
     )
     return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
@@ -360,6 +489,9 @@ function maxwell_nonlinear_pml_rhs_periodic!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
     maxwell_rhs_periodic!(
         rhs,
@@ -368,13 +500,44 @@ function maxwell_nonlinear_pml_rhs_periodic!(
         periodic,
         registry,
         formulation;
-        ε = 1.0,
-        μ = 1.0,
+        ε = ε,
+        μ = μ,
     )
     add_maxwell_nonlinear_pml_source!(
         rhs,
         U,
         pml;
+        ε = ε,
+        μ = μ,
+        elements = distributed_dg.distributed_mesh.partition.owned,
+    )
+    return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
+end
+
+function maxwell_nonlinear_pml_rhs_periodic!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    maxwell_rhs_periodic!(
+        rhs,
+        U,
+        distributed_dg,
+        periodic,
+        registry,
+        formulation,
+        materials,
+    )
+    add_maxwell_nonlinear_pml_source!(
+        rhs,
+        U,
+        pml,
+        materials;
         elements = distributed_dg.distributed_mesh.partition.owned,
     )
     return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
@@ -385,6 +548,9 @@ function make_maxwell_nonlinear_pml_rhs_function(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
     return (rhs, U) ->
         maxwell_nonlinear_pml_rhs!(
@@ -394,6 +560,28 @@ function make_maxwell_nonlinear_pml_rhs_function(
             registry,
             formulation,
             pml,
+            ;
+            ε = ε,
+            μ = μ,
+        )
+end
+
+function make_maxwell_nonlinear_pml_rhs_function(
+    dg::DGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    return (rhs, U) ->
+        maxwell_nonlinear_pml_rhs!(
+            rhs,
+            U,
+            dg,
+            registry,
+            formulation,
+            materials,
+            pml,
         )
 end
 
@@ -402,6 +590,9 @@ function make_distributed_maxwell_nonlinear_pml_rhs_function(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
     return (rhs, U) ->
         maxwell_nonlinear_pml_rhs!(
@@ -411,6 +602,30 @@ function make_distributed_maxwell_nonlinear_pml_rhs_function(
             registry,
             formulation,
             pml,
+            ;
+            ε = ε,
+            μ = μ,
+        )
+end
+
+function make_distributed_maxwell_nonlinear_pml_rhs_function(
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
+)
+    return (rhs, U) ->
+        maxwell_nonlinear_pml_rhs!(
+            rhs,
+            U,
+            distributed_dg,
+            registry,
+            formulation,
+            materials,
+            pml,
+            boundary_data = boundary_data,
         )
 end
 
@@ -419,6 +634,32 @@ function make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
     periodic::DistributedPeriodicMaxwellExchange,
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
+    pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    return (rhs, U) ->
+        maxwell_nonlinear_pml_rhs_periodic!(
+            rhs,
+            U,
+            distributed_dg,
+            periodic,
+            registry,
+            formulation,
+            pml,
+            ;
+            ε = ε,
+            μ = μ,
+        )
+end
+
+function make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
     pml::MaxwellNonlinearPML,
 )
     return (rhs, U) ->
@@ -429,6 +670,7 @@ function make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
             periodic,
             registry,
             formulation,
+            materials,
             pml,
         )
 end
@@ -442,12 +684,108 @@ function maxwell_nonlinear_pml_rk_step!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
     rhs_function! = make_maxwell_nonlinear_pml_rhs_function(
         dg,
         registry,
         formulation,
         pml,
+        ;
+        ε = ε,
+        μ = μ,
+    )
+    return rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function maxwell_nonlinear_pml_rk_step!(
+    U::MaxwellField,
+    work::MaxwellRKWorkspace,
+    scheme::ExplicitRKScheme,
+    dt::Float64,
+    dg::DGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    rhs_function! = make_maxwell_nonlinear_pml_rhs_function(
+        dg,
+        registry,
+        formulation,
+        materials,
+        pml,
+    )
+    return rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    dg::DGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation,
+    pml::MaxwellNonlinearPML;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    rhs_function! = make_maxwell_nonlinear_pml_rhs_function(
+        dg,
+        registry,
+        formulation,
+        pml;
+        ε = ε,
+        μ = μ,
+    )
+    return partitioned_symplectic_rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    dg::DGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    rhs_function! = make_maxwell_nonlinear_pml_rhs_function(
+        dg,
+        registry,
+        formulation,
+        materials,
+        pml,
+    )
+    return partitioned_symplectic_rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function distributed_maxwell_nonlinear_pml_rk_step!(
+    U::MaxwellField,
+    work::MaxwellRKWorkspace,
+    scheme::ExplicitRKScheme,
+    dt::Float64,
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    rhs_function! = make_distributed_maxwell_nonlinear_pml_rhs_function(
+        distributed_dg,
+        registry,
+        formulation,
+        pml,
+        ;
+        ε = ε,
+        μ = μ,
     )
     return rk_step!(U, work, scheme, dt, rhs_function!)
 end
@@ -460,15 +798,64 @@ function distributed_maxwell_nonlinear_pml_rk_step!(
     distributed_dg::DistributedDGDiscretization,
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
     pml::MaxwellNonlinearPML,
 )
     rhs_function! = make_distributed_maxwell_nonlinear_pml_rhs_function(
         distributed_dg,
         registry,
         formulation,
+        materials,
         pml,
     )
     return rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function distributed_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation,
+    pml::MaxwellNonlinearPML;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    rhs_function! = make_distributed_maxwell_nonlinear_pml_rhs_function(
+        distributed_dg,
+        registry,
+        formulation,
+        pml;
+        ε = ε,
+        μ = μ,
+    )
+    return partitioned_symplectic_rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function distributed_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+    ;
+    boundary_data::Union{Nothing, MaxwellBoundaryData} = nothing,
+)
+    rhs_function! = make_distributed_maxwell_nonlinear_pml_rhs_function(
+        distributed_dg,
+        registry,
+        formulation,
+        materials,
+        pml,
+        boundary_data,
+    )
+    return partitioned_symplectic_rk_step!(U, work, scheme, dt, rhs_function!)
 end
 
 function distributed_periodic_maxwell_nonlinear_pml_rk_step!(
@@ -481,6 +868,9 @@ function distributed_periodic_maxwell_nonlinear_pml_rk_step!(
     registry::MaxwellBoundaryRegistry,
     formulation::AbstractMaxwellDGFormulation,
     pml::MaxwellNonlinearPML,
+    ;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
 )
     rhs_function! =
         make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
@@ -488,6 +878,83 @@ function distributed_periodic_maxwell_nonlinear_pml_rk_step!(
             periodic,
             registry,
             formulation,
+            pml,
+            ;
+            ε = ε,
+            μ = μ,
+    )
+    return rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function distributed_periodic_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation,
+    pml::MaxwellNonlinearPML;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    rhs_function! =
+        make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
+            distributed_dg,
+            periodic,
+            registry,
+            formulation,
+            pml;
+            ε = ε,
+            μ = μ,
+        )
+    return partitioned_symplectic_rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function distributed_periodic_maxwell_nonlinear_pml_partitioned_symplectic_rk_step!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    rhs_function! =
+        make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
+            distributed_dg,
+            periodic,
+            registry,
+            formulation,
+            materials,
+            pml,
+        )
+    return partitioned_symplectic_rk_step!(U, work, scheme, dt, rhs_function!)
+end
+
+function distributed_periodic_maxwell_nonlinear_pml_rk_step!(
+    U::MaxwellField,
+    work::MaxwellRKWorkspace,
+    scheme::ExplicitRKScheme,
+    dt::Float64,
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange,
+    registry::MaxwellBoundaryRegistry,
+    formulation::AbstractMaxwellDGFormulation,
+    materials::MaxwellElementMaterials,
+    pml::MaxwellNonlinearPML,
+)
+    rhs_function! =
+        make_distributed_periodic_maxwell_nonlinear_pml_rhs_function(
+            distributed_dg,
+            periodic,
+            registry,
+            formulation,
+            materials,
             pml,
         )
     return rk_step!(U, work, scheme, dt, rhs_function!)
@@ -507,9 +974,9 @@ end
     )
 
 Advance the Poisson-bracket spatial discretization with the nonlinear PML
-source using a standard explicit Runge--Kutta method. The PML source couples
-the electric and magnetic partitions and is dissipative, so the conservative
-partitioned symplectic integrators are not applicable.
+source using a standard explicit Runge--Kutta method. The production
+Poisson-bracket drivers use the partitioned ESPRK PML wrappers; this helper is
+kept for experiments that intentionally want a non-partitioned RK update.
 """
 function run_maxwell_nonlinear_pml_time_steps!(
     U::MaxwellField,
@@ -522,7 +989,7 @@ function run_maxwell_nonlinear_pml_time_steps!(
     nsteps::Int,
     energy_every::Int = 1,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
     dt > 0.0 || throw(ArgumentError("PML time step must be positive."))
     nsteps >= 0 || throw(ArgumentError("PML step count must be non-negative."))
     energy_every >= 1 ||
@@ -594,7 +1061,7 @@ function run_distributed_maxwell_nonlinear_pml_time_steps!(
     nsteps::Int,
     energy_every::Int = 1,
 )
-    require_poisson_bracket_central_flux(formulation)
+    require_poisson_bracket_surface_flux(formulation)
     dt > 0.0 || throw(ArgumentError("PML time step must be positive."))
     nsteps >= 0 || throw(ArgumentError("PML step count must be non-negative."))
     energy_every >= 1 ||

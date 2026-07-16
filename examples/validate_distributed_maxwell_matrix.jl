@@ -29,6 +29,29 @@ const PERIODIC_DRIVER_SCRIPT =
     joinpath(VALIDATION_REPOSITORY_ROOT, "examples",
              "distributed_periodic_poisson_bracket_maxwell.jl")
 
+const MPI_TEST_SPECS = (
+    (name = "face-permutation",
+     script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
+                       "test_mpi_face_permutation.jl"),
+     ranks = (2,)),
+    (name = "distributed-maxwell",
+     script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
+                       "test_mpi_distributed_maxwell.jl"),
+     ranks = (2, 4)),
+    (name = "metis-partition",
+     script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
+                       "test_mpi_metis_partition.jl"),
+     ranks = (2, 4)),
+    (name = "physical-coverage",
+     script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
+                       "test_mpi_physical_coverage.jl"),
+     ranks = (2, 4)),
+    (name = "nonlinear-pml",
+     script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
+                       "test_mpi_nonlinear_pml.jl"),
+     ranks = (2,)),
+)
+
 const CAVITY_MESH =
     joinpath(VALIDATION_REPOSITORY_ROOT, "examples", "meshes", "tet_mesh.vtk")
 const PERIODIC_MESH =
@@ -45,6 +68,9 @@ const VALIDATION_CASE_ALIASES = Dict(
     "periodic" => :periodic,
     "periodic-plane-wave" => :periodic,
     "periodic_plane_wave" => :periodic,
+    "pml" => :pml,
+    "cavity-pml" => :pml,
+    "cavity_pml" => :pml,
 )
 
 const INVARIANT_REQUIRED_COLUMNS = [
@@ -97,8 +123,8 @@ const EXACT_PAIR_COLUMNS = [
 
 Base.@kwdef struct ValidationConfig
     profile::Symbol = :smoke
-    cases::Vector{Symbol} = [:cavity_pec, :cavity_pmc, :periodic]
-    ranks::Vector{Int} = [1, 2]
+    cases::Vector{Symbol} = [:cavity_pec, :cavity_pmc, :periodic, :pml]
+    ranks::Vector{Int} = [1, 2, 4]
     orders::Vector{Int} = [2]
     cavity_cells::Vector{Int} = [1, 2, 3]
     periodic_nx_targets::Vector{Int} = [2, 4]
@@ -116,8 +142,12 @@ Base.@kwdef struct ValidationConfig
     atol::Float64 = 1.0e-11
     diagnostic_error_max::Float64 = 1.0e-2
     field_error_max::Float64 = Inf
+    energy_drift_max::Float64 = 1.0e-7
+    pml_width::Float64 = 0.2
+    pml_sigma_max::Float64 = 8.0
     run_convergence::Bool = true
     run_invariants::Bool = true
+    run_mpi_tests::Bool = true
     dry_run::Bool = false
 end
 
@@ -147,6 +177,7 @@ function profile_defaults(profile::Symbol)
             cfl = 0.08,
             rate_policy = :fail,
             diagnostic_error_max = 1.0e-4,
+            energy_drift_max = 1.0e-6,
         )
     elseif profile == :strict
         return ValidationConfig(
@@ -159,6 +190,7 @@ function profile_defaults(profile::Symbol)
             cfl = 0.05,
             rate_policy = :fail,
             diagnostic_error_max = 1.0e-6,
+            energy_drift_max = 1.0e-7,
         )
     else
         throw(ArgumentError("--profile must be smoke, standard, or strict."))
@@ -216,8 +248,8 @@ Usage:
 
 Options:
   --profile=NAME              smoke, standard, or strict. Default: smoke
-  --cases=a,b                 cavity-pec,cavity-pmc,periodic by default
-  --ranks=a,b                 MPI rank counts. Default: 1,2
+  --cases=a,b                 cavity-pec,cavity-pmc,periodic,pml by default
+  --ranks=a,b                 MPI rank counts. Default: 1,2,4
   --orders=a,b                DG orders. Default depends on --profile
   --cavity-cells=a,b          Structured cavity convergence levels
   --periodic-nx-targets=a,b   Periodic Gmsh convergence levels
@@ -236,8 +268,13 @@ Options:
   --diagnostic-error-max=X    Max numerical-vs-exact invariant diagnostic
                               error. Default depends on --profile
   --field-error-max=X         Optional max field L2 error. Default: Inf
+  --energy-drift-max=X        Max conservative relative energy drift.
+                              Default depends on --profile
+  --pml-width=X               PML smoke layer width. Default: 0.2
+  --pml-sigma-max=X           PML smoke peak damping. Default: 8.0
   --run-convergence=BOOL      Enable convergence-rate runs. Default: true
   --run-invariants=BOOL       Enable production diagnostic runs. Default: true
+  --run-mpi-tests=BOOL        Enable standalone MPI regression tests. Default: true
   --dry-run                   Print commands and expected checks only
   --help                      Show this message
 
@@ -249,6 +286,10 @@ Checks:
     count, using the selected comparison mode.
   - Invariant diagnostics: production-driver CSVs must contain finite E/H
     errors, energy, charge, linear and angular momentum, and optical chirality.
+  - PML is a smoke/dissipation case: it skips exact invariant targets and
+    instead checks finite diagnostics plus non-increasing total energy.
+  - Standalone MPI regression tests are launched from this same orchestrator.
+  - The official machine-readable summary is validation_summary.json.
 """)
 end
 
@@ -333,6 +374,18 @@ function parse_validation_arguments(args::Vector{String})
             config = ValidationConfig(; pairs(merge_config(config,
                 field_error_max =
                     parse(Float64, split(arg, "=", limit = 2)[2])))...)
+        elseif startswith(arg, "--energy-drift-max=")
+            config = ValidationConfig(; pairs(merge_config(config,
+                energy_drift_max =
+                    parse(Float64, split(arg, "=", limit = 2)[2])))...)
+        elseif startswith(arg, "--pml-width=")
+            config = ValidationConfig(; pairs(merge_config(config,
+                pml_width =
+                    parse(Float64, split(arg, "=", limit = 2)[2])))...)
+        elseif startswith(arg, "--pml-sigma-max=")
+            config = ValidationConfig(; pairs(merge_config(config,
+                pml_sigma_max =
+                    parse(Float64, split(arg, "=", limit = 2)[2])))...)
         elseif startswith(arg, "--run-convergence=")
             config = ValidationConfig(; pairs(merge_config(config,
                 run_convergence =
@@ -340,6 +393,10 @@ function parse_validation_arguments(args::Vector{String})
         elseif startswith(arg, "--run-invariants=")
             config = ValidationConfig(; pairs(merge_config(config,
                 run_invariants =
+                    parse_bool(split(arg, "=", limit = 2)[2])))...)
+        elseif startswith(arg, "--run-mpi-tests=")
+            config = ValidationConfig(; pairs(merge_config(config,
+                run_mpi_tests =
                     parse_bool(split(arg, "=", limit = 2)[2])))...)
         elseif arg == "--dry-run"
             config = ValidationConfig(; pairs(merge_config(config,
@@ -398,6 +455,12 @@ function validate_config(config::ValidationConfig)
         throw(ArgumentError("--diagnostic-error-max must be non-negative."))
     config.field_error_max >= 0.0 ||
         throw(ArgumentError("--field-error-max must be non-negative."))
+    config.energy_drift_max >= 0.0 ||
+        throw(ArgumentError("--energy-drift-max must be non-negative."))
+    config.pml_width > 0.0 ||
+        throw(ArgumentError("--pml-width must be positive."))
+    config.pml_sigma_max > 0.0 ||
+        throw(ArgumentError("--pml-sigma-max must be positive."))
     return config
 end
 
@@ -405,8 +468,13 @@ function case_label(case::Symbol)
     case == :cavity_pec && return "cavity-pec"
     case == :cavity_pmc && return "cavity-pmc"
     case == :periodic && return "periodic"
+    case == :pml && return "pml"
     return string(case)
 end
+
+case_has_convergence(case::Symbol) = case != :pml
+case_has_exact_invariants(case::Symbol) = case != :pml
+case_is_pml(case::Symbol) = case == :pml
 
 function boundary_condition(case::Symbol)
     case == :cavity_pec && return "pec"
@@ -443,8 +511,13 @@ function run_or_print(config::ValidationConfig, command::Cmd, description::Strin
     println()
     println(description)
     println(display_command(command))
-    if !config.dry_run
+    config.dry_run && return true
+    try
         run(command)
+        return true
+    catch error
+        println(stderr, "Command failed: ", sprint(showerror, error))
+        return false
     end
 end
 
@@ -582,6 +655,16 @@ function invariant_command(config::ValidationConfig, case::Symbol, ranks::Int)
             common_args,
         )
         return validation_command(config, ranks, PERIODIC_DRIVER_SCRIPT, args)
+    elseif case == :pml
+        args = vcat(
+            ["--mesh=$(CAVITY_MESH)",
+             "--boundary-condition=pec",
+             "--pml-width=$(config.pml_width)",
+             "--pml-sigma-max=$(config.pml_sigma_max)",
+             "--pml-degree=2"],
+            common_args,
+        )
+        return validation_command(config, ranks, CAVITY_DRIVER_SCRIPT, args)
     end
     throw(ArgumentError("Unknown validation case $case."))
 end
@@ -653,6 +736,30 @@ function push_check!(
             status,
             message,
         ),
+    )
+end
+
+function push_command_check!(
+    checks::Vector{ValidationCheck},
+    case_name::String,
+    category::String,
+    ranks,
+    metric::String,
+    passed::Bool,
+    command::Cmd,
+)
+    push_check!(
+        checks,
+        case_name,
+        category,
+        ranks,
+        metric,
+        passed ? "completed" : "failed",
+        "exit code 0",
+        "",
+        passed ? :PASS : :FAIL,
+        passed ? "Command completed successfully." :
+                 "Command failed: $(display_command(command))",
     )
 end
 
@@ -921,27 +1028,137 @@ function add_invariant_schema_checks!(
         )
     end
 
-    for (value_column, exact_column) in EXACT_PAIR_COLUMNS
-        maximum_error = maximum(
-            abs(
-                parse_required_float(row, value_column) -
-                parse_required_float(row, exact_column),
+    if case_has_exact_invariants(case)
+        for (value_column, exact_column) in EXACT_PAIR_COLUMNS
+            maximum_error = maximum(
+                abs(
+                    parse_required_float(row, value_column) -
+                    parse_required_float(row, exact_column),
+                )
+                for row in rows
             )
-            for row in rows
-        )
-        passed = maximum_error <= config.diagnostic_error_max
+            passed = maximum_error <= config.diagnostic_error_max
+            push_check!(
+                checks,
+                case_label(case),
+                "diagnostic-error",
+                ranks,
+                value_column,
+                @sprintf("%.6e", maximum_error),
+                @sprintf("<= %.6e", config.diagnostic_error_max),
+                "",
+                passed ? :PASS : :FAIL,
+                passed ? "Numerical diagnostic matches its analytical reference." :
+                         "Numerical diagnostic differs from its analytical reference.",
+            )
+        end
+    else
         push_check!(
             checks,
             case_label(case),
             "diagnostic-error",
             ranks,
-            value_column,
-            @sprintf("%.6e", maximum_error),
-            @sprintf("<= %.6e", config.diagnostic_error_max),
+            "exact invariant targets",
+            "skipped",
+            "not meaningful for dissipative PML",
+            "",
+            :SKIP,
+            "PML damping intentionally changes the conservative exact invariants.",
+        )
+    end
+end
+
+function add_energy_history_checks!(
+    checks::Vector{ValidationCheck},
+    config::ValidationConfig,
+    case::Symbol,
+    ranks::Int,
+    csv_path::String,
+)
+    header, rows = read_simple_csv(csv_path)
+    for column in ("step", "time", "total", "relative_drift")
+        column in header ||
+            push_check!(
+                checks,
+                case_label(case),
+                "energy-history",
+                ranks,
+                "required energy columns",
+                "missing $column",
+                "present",
+                "",
+                :FAIL,
+                "Energy history is missing a required column.",
+            )
+    end
+    all(column -> column in header, ("step", "time", "total", "relative_drift")) ||
+        return
+    isempty(rows) &&
+        push_check!(
+            checks,
+            case_label(case),
+            "energy-history",
+            ranks,
+            "row-count",
+            0,
+            "> 0",
+            "",
+            :FAIL,
+            "Energy history contains no rows.",
+        )
+    isempty(rows) && return
+
+    totals = [parse_required_float(row, "total") for row in rows]
+    drifts = [parse_required_float(row, "relative_drift") for row in rows]
+    finite = all(isfinite, totals) && all(isfinite, drifts)
+    push_check!(
+        checks,
+        case_label(case),
+        "energy-history",
+        ranks,
+        "finite energy values",
+        finite ? "finite" : "non-finite",
+        "all finite",
+        "",
+        finite ? :PASS : :FAIL,
+        finite ? "Energy history values are finite." :
+                 "Energy history contains non-finite values.",
+    )
+    finite || return
+
+    if case_is_pml(case)
+        initial = first(totals)
+        final = last(totals)
+        tolerance = config.energy_drift_max * max(abs(initial), eps(Float64))
+        passed = final <= initial + tolerance
+        push_check!(
+            checks,
+            case_label(case),
+            "energy-dissipation",
+            ranks,
+            "final total energy",
+            @sprintf("%.6e", final),
+            @sprintf("<= %.6e", initial + tolerance),
+            @sprintf("absolute tolerance %.3e", tolerance),
+            passed ? :PASS : :FAIL,
+            passed ? "PML total energy is non-increasing." :
+                     "PML total energy increased beyond tolerance.",
+        )
+    else
+        maximum_drift = maximum(abs, drifts)
+        passed = maximum_drift <= config.energy_drift_max
+        push_check!(
+            checks,
+            case_label(case),
+            "energy-invariant",
+            ranks,
+            "max relative energy drift",
+            @sprintf("%.6e", maximum_drift),
+            @sprintf("<= %.6e", config.energy_drift_max),
             "",
             passed ? :PASS : :FAIL,
-            passed ? "Numerical diagnostic matches its analytical reference." :
-                     "Numerical diagnostic differs from its analytical reference.",
+            passed ? "Conservative energy drift is within tolerance." :
+                     "Conservative energy drift exceeds tolerance.",
         )
     end
 end
@@ -952,6 +1169,73 @@ function csv_escape(value)
         return "\"" * replace(text, "\"" => "\"\"") * "\""
     end
     return text
+end
+
+
+function json_escape(value)
+    text = string(value)
+    text = replace(text, '\\' => "\\\\")
+    text = replace(text, '"' => "\\\"")
+    text = replace(text, '\n' => "\\n")
+    text = replace(text, '\r' => "\\r")
+    text = replace(text, '\t' => "\\t")
+    return "\"" * text * "\""
+end
+
+function validation_counts(checks::Vector{ValidationCheck})
+    return Dict(status => count(check -> check.status == status, checks)
+                for status in (:PASS, :WARN, :FAIL, :SKIP))
+end
+
+function validation_overall_status(checks::Vector{ValidationCheck})
+    any(check -> check.status == :FAIL, checks) && return "FAIL"
+    any(check -> check.status == :WARN, checks) && return "WARN"
+    return "PASS"
+end
+
+function write_validation_summary_json(
+    path::String,
+    config::ValidationConfig,
+    checks::Vector{ValidationCheck};
+    matrix_path::String,
+)
+    mkpath(dirname(path))
+    counts = validation_counts(checks)
+    open(path, "w") do io
+        println(io, "{")
+        println(io, "  \"schema\": \"disco-gmpi-validation-summary/v1\",")
+        println(io, "  \"generated_at\": ", json_escape(string(Dates.now())), ",")
+        println(io, "  \"overall_status\": ", json_escape(validation_overall_status(checks)), ",")
+        println(io, "  \"profile\": ", json_escape(config.profile), ",")
+        println(io, "  \"cases\": [", join(json_escape.(case_label.(config.cases)), ", "), "],")
+        println(io, "  \"ranks\": [", join(config.ranks, ", "), "],")
+        println(io, "  \"orders\": [", join(config.orders, ", "), "],")
+        println(io, "  \"matrix_csv\": ", json_escape(matrix_path), ",")
+        println(io, "  \"counts\": {")
+        for (index, status) in enumerate((:PASS, :WARN, :FAIL, :SKIP))
+            comma = index == 4 ? "" : ","
+            println(io, "    ", json_escape(status), ": ", get(counts, status, 0), comma)
+        end
+        println(io, "  },")
+        println(io, "  \"checks\": [")
+        for (index, check) in enumerate(checks)
+            comma = index == length(checks) ? "" : ","
+            println(io, "    {")
+            println(io, "      \"case\": ", json_escape(check.case_name), ",")
+            println(io, "      \"category\": ", json_escape(check.category), ",")
+            println(io, "      \"ranks\": ", json_escape(check.ranks), ",")
+            println(io, "      \"metric\": ", json_escape(check.metric), ",")
+            println(io, "      \"value\": ", json_escape(check.value), ",")
+            println(io, "      \"expected\": ", json_escape(check.expected), ",")
+            println(io, "      \"tolerance\": ", json_escape(check.tolerance), ",")
+            println(io, "      \"status\": ", json_escape(check.status), ",")
+            println(io, "      \"message\": ", json_escape(check.message))
+            println(io, "    }", comma)
+        end
+        println(io, "  ]")
+        println(io, "}")
+    end
+    return path
 end
 
 function write_validation_matrix(path::String, checks::Vector{ValidationCheck})
@@ -1019,58 +1303,100 @@ end
 
 function validate_case!(checks::Vector{ValidationCheck}, config::ValidationConfig, case::Symbol)
     if config.run_convergence
-        for ranks in config.ranks
-            command = convergence_command(config, case, ranks)
-            run_or_print(
-                config,
-                command,
-                "Running convergence validation for $(case_label(case)) on $ranks rank(s)",
+        if !case_has_convergence(case)
+            push_check!(
+                checks,
+                case_label(case),
+                "convergence-rate",
+                comma_join(config.ranks),
+                "expected convergence rates",
+                "skipped",
+                "not meaningful for this smoke case",
+                "",
+                :SKIP,
+                "No convergence target is defined for the PML smoke case.",
             )
-            !config.dry_run &&
-                add_rate_checks!(
-                    checks,
+        else
+            successful_convergence_ranks = Int[]
+            for ranks in config.ranks
+                command = convergence_command(config, case, ranks)
+                passed = run_or_print(
                     config,
-                    case,
-                    ranks,
-                    convergence_output_path(config, case, ranks),
+                    command,
+                    "Running convergence validation for $(case_label(case)) on $ranks rank(s)",
                 )
-        end
+                push_command_check!(
+                    checks,
+                    case_label(case),
+                    "convergence-run",
+                    ranks,
+                    "driver command",
+                    passed,
+                    command,
+                )
+                if !config.dry_run && passed
+                    push!(successful_convergence_ranks, ranks)
+                    add_rate_checks!(
+                        checks,
+                        config,
+                        case,
+                        ranks,
+                        convergence_output_path(config, case, ranks),
+                    )
+                end
+            end
 
-        if !config.dry_run
-            reference = first(config.ranks)
-            for ranks in Iterators.drop(config.ranks, 1)
-                compare_csv_outputs!(
-                    checks,
-                    config,
-                    case,
-                    "convergence-rank-comparison",
-                    reference,
-                    ranks,
-                    convergence_output_path(config, case, reference),
-                    convergence_output_path(config, case, ranks);
-                    exclude_columns = Set([
-                        "mpi_ranks",
-                        "min_owned_elements",
-                        "max_owned_elements",
-                        "elapsed_seconds",
-                    ]),
-                )
+            if !config.dry_run && first(config.ranks) in successful_convergence_ranks
+                reference = first(config.ranks)
+                for ranks in Iterators.drop(config.ranks, 1)
+                    ranks in successful_convergence_ranks || continue
+                    compare_csv_outputs!(
+                        checks,
+                        config,
+                        case,
+                        "convergence-rank-comparison",
+                        reference,
+                        ranks,
+                        convergence_output_path(config, case, reference),
+                        convergence_output_path(config, case, ranks);
+                        exclude_columns = Set([
+                            "mpi_ranks",
+                            "min_owned_elements",
+                            "max_owned_elements",
+                            "elapsed_seconds",
+                        ]),
+                    )
+                end
             end
         end
     end
 
     if config.run_invariants
+        successful_invariant_ranks = Int[]
         for ranks in config.ranks
             command = invariant_command(config, case, ranks)
-            run_or_print(
+            passed = run_or_print(
                 config,
                 command,
                 "Running invariant validation for $(case_label(case)) on $ranks rank(s)",
             )
-            if !config.dry_run
+            push_command_check!(
+                checks,
+                case_label(case),
+                "invariant-run",
+                ranks,
+                "driver command",
+                passed,
+                command,
+            )
+            if !config.dry_run && passed
+                push!(successful_invariant_ranks, ranks)
                 diagnostics_path =
                     joinpath(invariant_output_dir(config, case, ranks),
                              "quadrature_diagnostics.csv")
+                energy_path =
+                    joinpath(invariant_output_dir(config, case, ranks),
+                             "energy.csv")
                 add_invariant_schema_checks!(
                     checks,
                     config,
@@ -1078,12 +1404,20 @@ function validate_case!(checks::Vector{ValidationCheck}, config::ValidationConfi
                     ranks,
                     diagnostics_path,
                 )
+                add_energy_history_checks!(
+                    checks,
+                    config,
+                    case,
+                    ranks,
+                    energy_path,
+                )
             end
         end
 
-        if !config.dry_run
+        if !config.dry_run && first(config.ranks) in successful_invariant_ranks
             reference = first(config.ranks)
             for ranks in Iterators.drop(config.ranks, 1)
+                ranks in successful_invariant_ranks || continue
                 compare_csv_outputs!(
                     checks,
                     config,
@@ -1096,9 +1430,49 @@ function validate_case!(checks::Vector{ValidationCheck}, config::ValidationConfi
                     joinpath(invariant_output_dir(config, case, ranks),
                              "quadrature_diagnostics.csv"),
                 )
+                compare_csv_outputs!(
+                    checks,
+                    config,
+                    case,
+                    "energy-rank-comparison",
+                    reference,
+                    ranks,
+                    joinpath(invariant_output_dir(config, case, reference),
+                             "energy.csv"),
+                    joinpath(invariant_output_dir(config, case, ranks),
+                             "energy.csv"),
+                )
             end
         end
     end
+end
+
+function mpi_test_command(config::ValidationConfig, script::String, ranks::Int)
+    return validation_command(config, ranks, script, String[])
+end
+
+function run_mpi_tests!(checks::Vector{ValidationCheck}, config::ValidationConfig)
+    config.run_mpi_tests || return nothing
+    for spec in MPI_TEST_SPECS
+        for ranks in spec.ranks
+            command = mpi_test_command(config, spec.script, ranks)
+            passed = run_or_print(
+                config,
+                command,
+                "Running MPI regression $(spec.name) on $ranks rank(s)",
+            )
+            push_command_check!(
+                checks,
+                "mpi-tests",
+                "mpi-test",
+                ranks,
+                spec.name,
+                passed,
+                command,
+            )
+        end
+    end
+    return nothing
 end
 
 function run_validation_matrix(config::ValidationConfig)
@@ -1111,13 +1485,14 @@ function run_validation_matrix(config::ValidationConfig)
     println("rate targets:     cavity E=N+1, cavity H=N; periodic E=N+1, H=N, Ez=N+1, Hy=N")
     println("rate policy:      ", config.rate_policy)
     println("comparison:       ", config.comparison)
+    println("MPI tests:        ", config.run_mpi_tests ? "enabled" : "disabled")
     println("output directory: ", config.output_dir)
     config.dry_run && println("dry run:          true")
 
     checks = ValidationCheck[]
     if config.dry_run
         for case in config.cases
-            if config.run_convergence
+            if config.run_convergence && case_has_convergence(case)
                 for ranks in config.ranks
                     command = convergence_command(config, case, ranks)
                     run_or_print(
@@ -1126,6 +1501,19 @@ function run_validation_matrix(config::ValidationConfig)
                         "Planned convergence validation for $(case_label(case)) on $ranks rank(s)",
                     )
                 end
+            elseif config.run_convergence
+                push_check!(
+                    checks,
+                    case_label(case),
+                    "convergence-rate",
+                    comma_join(config.ranks),
+                    "expected convergence rates",
+                    "skipped",
+                    "not meaningful for this smoke case",
+                    "",
+                    :SKIP,
+                    "No convergence target is defined for the PML smoke case.",
+                )
             end
             if config.run_invariants
                 for ranks in config.ranks
@@ -1138,6 +1526,7 @@ function run_validation_matrix(config::ValidationConfig)
                 end
             end
         end
+        run_mpi_tests!(checks, config)
         return checks
     end
 
@@ -1145,14 +1534,22 @@ function run_validation_matrix(config::ValidationConfig)
     for case in config.cases
         validate_case!(checks, config, case)
     end
+    run_mpi_tests!(checks, config)
 
     matrix_path = write_validation_matrix(
         joinpath(config.output_dir, "validation_matrix.csv"),
         checks,
     )
+    summary_path = write_validation_summary_json(
+        joinpath(config.output_dir, "validation_summary.json"),
+        config,
+        checks;
+        matrix_path = matrix_path,
+    )
     print_validation_summary(checks)
     println()
     println("Wrote validation matrix: ", matrix_path)
+    println("Wrote validation summary: ", summary_path)
 
     any(check -> check.status == :FAIL, checks) &&
         error("Validation matrix contains failing checks.")

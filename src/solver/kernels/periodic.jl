@@ -804,7 +804,9 @@ function estimate_maxwell_dt(
 
     c = maxwell_wave_speed(; ε = ε, μ = μ)
 
-    dt = CFL * sizes.hmin / ((2.0 * ref.N + 1.0) * c)
+    # dt = CFL * sizes.hmin / ((2.0 * ref.N + 1.0) * c)
+
+    dt = CFL * sizes.hmin / (ref.N * c)  # Alternative estimate
 
     return dt, sizes
 end

@@ -206,6 +206,408 @@ function maxwell_boundary_plus_trace(
     throw(ArgumentError("Boundary kind $kind does not define an exterior trace."))
 end
 
+struct MaxwellFaceWorkspace
+    Ex::Vector{Float64}
+    Ey::Vector{Float64}
+    Ez::Vector{Float64}
+    Hx::Vector{Float64}
+    Hy::Vector{Float64}
+    Hz::Vector{Float64}
+end
+
+function MaxwellFaceWorkspace(n::Integer)
+    values = Vector{Float64}(undef, n)
+    return MaxwellFaceWorkspace(
+        values,
+        similar(values),
+        similar(values),
+        similar(values),
+        similar(values),
+        similar(values),
+    )
+end
+
+struct MaxwellSurfaceWorkspace
+    minus::MaxwellFaceWorkspace
+    plus::MaxwellFaceWorkspace
+    flux::MaxwellFaceWorkspace
+    face_values::Vector{Float64}
+    lifted::Vector{Float64}
+    nfp::Int
+    nrows::Int
+end
+
+function MaxwellSurfaceWorkspace(
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    nfp = length(fops.face_nodes[1])
+    return MaxwellSurfaceWorkspace(
+        MaxwellFaceWorkspace(nfp),
+        MaxwellFaceWorkspace(nfp),
+        MaxwellFaceWorkspace(nfp),
+        Vector{Float64}(undef, nfp),
+        Vector{Float64}(undef, ref.Np),
+        nfp,
+        ref.Np,
+    )
+end
+
+function matches_workspace(
+    workspace::MaxwellSurfaceWorkspace,
+    ref::ReferenceTet,
+    fops::ReferenceTetFaceOperators,
+)
+    return workspace.nfp == length(fops.face_nodes[1]) &&
+           workspace.nrows == ref.Np
+end
+
+struct MaxwellBoundaryData
+    incident_electric::Dict{Int, Function}
+    time::Base.RefValue{Float64}
+end
+
+function MaxwellBoundaryData(;
+    incident_electric::AbstractDict{<:Integer, <:Function} =
+        Dict{Int, Function}(),
+    time::Real = 0.0,
+)
+    data = Dict{Int, Function}()
+    for (boundary_id, electric) in incident_electric
+        data[Int(boundary_id)] = electric
+    end
+    return MaxwellBoundaryData(data, Ref(Float64(time)))
+end
+
+empty_maxwell_boundary_data() = MaxwellBoundaryData()
+
+function incident_pec_boundary_data(
+    boundary_id::Integer,
+    incident_electric::Function;
+    time::Real = 0.0,
+)
+    return MaxwellBoundaryData(
+        incident_electric = Dict(Int(boundary_id) => incident_electric),
+        time = time,
+    )
+end
+
+function set_boundary_data_time!(
+    boundary_data::MaxwellBoundaryData,
+    time::Real,
+)
+    boundary_data.time[] = Float64(time)
+    return boundary_data
+end
+
+boundary_data_time(boundary_data::MaxwellBoundaryData) =
+    boundary_data.time[]
+
+boundary_data_time(::Nothing) = 0.0
+
+function incident_electric_function(
+    boundary_data::MaxwellBoundaryData,
+    boundary_id::Integer,
+)
+    return get(boundary_data.incident_electric, Int(boundary_id), nothing)
+end
+
+incident_electric_function(::Nothing, boundary_id::Integer) = nothing
+
+function gather_face_values!(
+    dest::MaxwellFaceWorkspace,
+    U::MaxwellField,
+    nodes::AbstractVector{Int},
+    elem::Int,
+)
+    @inbounds for q in eachindex(nodes)
+        node = nodes[q]
+        dest.Ex[q] = U.Ex[node, elem]
+        dest.Ey[q] = U.Ey[node, elem]
+        dest.Ez[q] = U.Ez[node, elem]
+        dest.Hx[q] = U.Hx[node, elem]
+        dest.Hy[q] = U.Hy[node, elem]
+        dest.Hz[q] = U.Hz[node, elem]
+    end
+
+    return dest
+end
+
+function gather_permuted_face_values!(
+    dest::MaxwellFaceWorkspace,
+    U::MaxwellField,
+    nodes::AbstractVector{Int},
+    permutation::AbstractVector{Int},
+    elem::Int,
+)
+    @inbounds for q in eachindex(permutation)
+        node = nodes[permutation[q]]
+        dest.Ex[q] = U.Ex[node, elem]
+        dest.Ey[q] = U.Ey[node, elem]
+        dest.Ez[q] = U.Ez[node, elem]
+        dest.Hx[q] = U.Hx[node, elem]
+        dest.Hy[q] = U.Hy[node, elem]
+        dest.Hz[q] = U.Hz[node, elem]
+    end
+
+    return dest
+end
+
+function interior_face_traces!(
+    workspace::MaxwellSurfaceWorkspace,
+    U::MaxwellField,
+    tr::InteriorTraceMap,
+)
+    gather_face_values!(
+        workspace.minus,
+        U,
+        tr.minus_nodes,
+        tr.minus_elem,
+    )
+    gather_permuted_face_values!(
+        workspace.plus,
+        U,
+        tr.plus_nodes,
+        tr.plus_to_minus_perm,
+        tr.plus_elem,
+    )
+    return workspace.minus, workspace.plus
+end
+
+function periodic_face_traces!(
+    workspace::MaxwellSurfaceWorkspace,
+    U::MaxwellField,
+    tr::PeriodicTraceMap,
+)
+    gather_face_values!(
+        workspace.minus,
+        U,
+        tr.minus_nodes,
+        tr.minus_elem,
+    )
+    gather_permuted_face_values!(
+        workspace.plus,
+        U,
+        tr.plus_nodes,
+        tr.plus_to_minus_perm,
+        tr.plus_elem,
+    )
+    return workspace.minus, workspace.plus
+end
+
+function boundary_face_minus_trace!(
+    workspace::MaxwellSurfaceWorkspace,
+    U::MaxwellField,
+    tr::BoundaryTraceMap,
+)
+    return gather_face_values!(
+        workspace.minus,
+        U,
+        tr.nodes,
+        tr.elem,
+    )
+end
+
+function pec_boundary_plus_trace!(
+    plus::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    n::NTuple{3, Float64},
+)
+    @inbounds for q in eachindex(minus.Ex)
+        plus.Ex[q], plus.Ey[q], plus.Ez[q] = reflect_pec_E(
+            minus.Ex[q],
+            minus.Ey[q],
+            minus.Ez[q],
+            n,
+        )
+        plus.Hx[q] = minus.Hx[q]
+        plus.Hy[q] = minus.Hy[q]
+        plus.Hz[q] = minus.Hz[q]
+    end
+
+    return plus
+end
+
+function pmc_boundary_plus_trace!(
+    plus::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    n::NTuple{3, Float64},
+)
+    @inbounds for q in eachindex(minus.Ex)
+        plus.Ex[q] = minus.Ex[q]
+        plus.Ey[q] = minus.Ey[q]
+        plus.Ez[q] = minus.Ez[q]
+        plus.Hx[q], plus.Hy[q], plus.Hz[q] = reflect_pec_E(
+            minus.Hx[q],
+            minus.Hy[q],
+            minus.Hz[q],
+            n,
+        )
+    end
+
+    return plus
+end
+
+function absorbing_boundary_plus_trace!(
+    plus::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    n::NTuple{3, Float64};
+    ε::Float64,
+    μ::Float64,
+)
+    Z = maxwell_impedance(; ε = ε, μ = μ)
+
+    @inbounds for q in eachindex(minus.Ex)
+        Ex = minus.Ex[q]
+        Ey = minus.Ey[q]
+        Ez = minus.Ez[q]
+        Hx = minus.Hx[q]
+        Hy = minus.Hy[q]
+        Hz = minus.Hz[q]
+
+        ndotE = n[1] * Ex + n[2] * Ey + n[3] * Ez
+        ndotH = n[1] * Hx + n[2] * Hy + n[3] * Hz
+
+        nxH1 = n[2] * Hz - n[3] * Hy
+        nxH2 = n[3] * Hx - n[1] * Hz
+        nxH3 = n[1] * Hy - n[2] * Hx
+
+        nxE1 = n[2] * Ez - n[3] * Ey
+        nxE2 = n[3] * Ex - n[1] * Ez
+        nxE3 = n[1] * Ey - n[2] * Ex
+
+        plus.Ex[q] = ndotE * n[1] - Z * nxH1
+        plus.Ey[q] = ndotE * n[2] - Z * nxH2
+        plus.Ez[q] = ndotE * n[3] - Z * nxH3
+
+        plus.Hx[q] = ndotH * n[1] + nxE1 / Z
+        plus.Hy[q] = ndotH * n[2] + nxE2 / Z
+        plus.Hz[q] = ndotH * n[3] + nxE3 / Z
+    end
+
+    return plus
+end
+
+function maxwell_boundary_plus_trace!(
+    plus::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    normal::NTuple{3, Float64},
+    kind::MaxwellBoundaryKind;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    if kind == MaxwellBC_PEC
+        return pec_boundary_plus_trace!(plus, minus, normal)
+    elseif kind == MaxwellBC_PMC
+        return pmc_boundary_plus_trace!(plus, minus, normal)
+    elseif kind == MaxwellBC_Absorbing
+        return absorbing_boundary_plus_trace!(
+            plus,
+            minus,
+            normal;
+            ε = ε,
+            μ = μ,
+        )
+    end
+
+    throw(ArgumentError("Boundary kind $kind does not define an exterior trace."))
+end
+
+function pec_incident_boundary_plus_trace!(
+    plus::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    mesh::RawVTUMesh,
+    ref::ReferenceTet,
+    tr::BoundaryTraceMap,
+    n::NTuple{3, Float64},
+    incident_electric::Function,
+    time::Float64,
+)
+    tet_nodes = @view mesh.tets[:, tr.elem]
+    @inbounds for q in eachindex(minus.Ex)
+        plus.Ex[q], plus.Ey[q], plus.Ez[q] = reflect_pec_E(
+            minus.Ex[q],
+            minus.Ey[q],
+            minus.Ez[q],
+            n,
+        )
+
+        local_node = tr.nodes[q]
+        x, y, z = map_to_physical(
+            mesh.points,
+            tet_nodes,
+            ref.r[local_node],
+            ref.s[local_node],
+            ref.t[local_node],
+        )
+        inc = incident_electric(x, y, z, time)
+        incx = Float64(inc[1])
+        incy = Float64(inc[2])
+        incz = Float64(inc[3])
+        ndot_inc = n[1] * incx + n[2] * incy + n[3] * incz
+
+        # Scattered-field PEC condition:
+        #   n x E_scat = - n x E_inc.
+        # The exterior trace is chosen so that the boundary average of
+        # E_scat has tangential part -E_inc,tan.
+        plus.Ex[q] -= 2.0 * (incx - ndot_inc * n[1])
+        plus.Ey[q] -= 2.0 * (incy - ndot_inc * n[2])
+        plus.Ez[q] -= 2.0 * (incz - ndot_inc * n[3])
+
+        plus.Hx[q] = minus.Hx[q]
+        plus.Hy[q] = minus.Hy[q]
+        plus.Hz[q] = minus.Hz[q]
+    end
+
+    return plus
+end
+
+function maxwell_boundary_plus_trace!(
+    plus::MaxwellFaceWorkspace,
+    minus::MaxwellFaceWorkspace,
+    mesh::Union{Nothing, RawVTUMesh},
+    ref::ReferenceTet,
+    tr::BoundaryTraceMap,
+    normal::NTuple{3, Float64},
+    kind::MaxwellBoundaryKind,
+    boundary_data::Union{Nothing, MaxwellBoundaryData};
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    if kind == MaxwellBC_PEC
+        incident_electric =
+            incident_electric_function(boundary_data, tr.boundary_id)
+        if incident_electric !== nothing
+            mesh === nothing &&
+                throw(
+                    ArgumentError(
+                        "Incident PEC boundary data requires the DG mesh so " *
+                        "the incident field can be evaluated at face nodes.",
+                    ),
+                )
+            return pec_incident_boundary_plus_trace!(
+                plus,
+                minus,
+                mesh,
+                ref,
+                tr,
+                normal,
+                incident_electric,
+                boundary_data_time(boundary_data),
+            )
+        end
+    end
+
+    return maxwell_boundary_plus_trace!(
+        plus,
+        minus,
+        normal,
+        kind;
+        ε = ε,
+        μ = μ,
+    )
+end
+
 function interpolate_maxwell_field(
     mesh::RawVTUMesh,
     ref::ReferenceTet,
@@ -754,6 +1156,42 @@ function unpermute_plus_face_values(
     return values_plus_order
 end
 
+function unpermute_plus_face_values!(
+    values_plus_order::AbstractVector{Float64},
+    values_minus_order::AbstractVector{Float64},
+    plus_to_minus_perm::AbstractVector{Int},
+)
+    @inbounds for i in eachindex(plus_to_minus_perm)
+        values_plus_order[plus_to_minus_perm[i]] = values_minus_order[i]
+    end
+
+    return values_plus_order
+end
+
+function add_lifted_face_contribution!(
+    rhs_component::Matrix{Float64},
+    elem::Int,
+    fops::ReferenceTetFaceOperators,
+    mappings::DGReferenceMapping,
+    local_face::Int,
+    face_values::AbstractVector{Float64},
+    physical_face_area::Float64,
+    lifted::AbstractVector{Float64},
+)
+    reference_area = reference_face_area(local_face)
+    surface_scale = physical_face_area / reference_area
+    volume_scale = mappings.tet_mappings[elem].absdetJ
+    scale = surface_scale / volume_scale
+
+    mul!(lifted, fops.face_lift[local_face], face_values)
+
+    @inbounds for i in axes(rhs_component, 1)
+        rhs_component[i, elem] += scale * lifted[i]
+    end
+
+    return nothing
+end
+
 function add_lifted_face_contribution!(
     rhs_component::Matrix{Float64},
     elem::Int,
@@ -765,17 +1203,17 @@ function add_lifted_face_contribution!(
     face_values::AbstractVector{Float64},
     physical_face_area::Float64,
 )
-    reference_area = reference_face_area(local_face)
-
-    surface_scale = physical_face_area / reference_area
-    volume_scale = mappings.tet_mappings[elem].absdetJ
-
-    face_rhs = fops.face_mass[local_face] * face_values
-
-    embedded = zeros(Float64, ref.Np)
-    embedded[face_nodes] .= face_rhs
-
-    rhs_component[:, elem] .+= (surface_scale / volume_scale) .* (ref.M \ embedded)
+    lifted = Vector{Float64}(undef, ref.Np)
+    add_lifted_face_contribution!(
+        rhs_component,
+        elem,
+        fops,
+        mappings,
+        local_face,
+        face_values,
+        physical_face_area,
+        lifted,
+    )
 
     return nothing
 end

@@ -14,22 +14,6 @@ const PERIODIC_CONVERGENCE_RATE_TOLERANCE = 0.5
 const PERIODIC_COMPONENT_RATE_ERROR_FLOOR = 1e-12
 const PERIODIC_REFERENCE_TET_VOLUME = 4.0 / 3.0
 
-struct DistributedPeriodicConvergenceConfig
-    mesh_family::Symbol
-    nx_targets::Vector{Int}
-    orders::Vector{Int}
-    final_time::Float64
-    periods::Union{Nothing, Float64}
-    cfl::Float64
-    cfl_divisor::Float64
-    epsilon::Float64
-    mu::Float64
-    wave_number::Float64
-    geo_path::String
-    mesh_dir::String
-    output::String
-end
-
 # struct DistributedPeriodicConvergenceResult
 #     mpi_ranks::Int
 #     boundary_condition::Symbol
@@ -79,6 +63,7 @@ end
 struct DistributedPeriodicConvergenceResult
     mpi_ranks::Int
     boundary_condition::Symbol
+    flux::String
     mesh_family::Symbol
     order::Int
     esprk_order::Int
@@ -205,6 +190,8 @@ Options:
   --mu=X              Magnetic permeability. The analytical wave requires 1.
                       Default: 1.0
   --wave-number=K     Positive x-directed wave number. Default: 2*pi
+  --flux=NAME         Poisson-bracket surface flux: centered or alternating.
+                      Default: centered
   --output=PATH       Output CSV. Default:
                       output/convergence_distributed_periodic_poisson_bracket.csv
   --help              Show this message.
@@ -214,7 +201,7 @@ Method:
   - periodic boundary pairs 1<->2, 3<->4, and 5<->6
   - x-directed analytical plane wave
   - structured or unstructured mesh family with target h, h/2, h/4, and h/8
-  - PoissonBracketFormulation with centered flux
+  - PoissonBracketFormulation with selectable centered/alternating flux
   - H-first ESPRK with time order = DG order + 1
   - Jaskowiec-Sukumar cubature order max(2, 2N + 4)
   - continuous aggregate and component-wise L2 errors
@@ -244,6 +231,7 @@ function parse_periodic_convergence_arguments(args::Vector{String})
     epsilon = 1.0
     mu = 1.0
     wave_number = DEFAULT_WAVE_NUMBER
+    flux_kind = MaxwellFlux_Central
     geo_path = joinpath(
         @__DIR__,
         "meshes",
@@ -304,6 +292,8 @@ function parse_periodic_convergence_arguments(args::Vector{String})
             mu = parse(Float64, split(arg, "=", limit = 2)[2])
         elseif startswith(arg, "--wave-number=")
             wave_number = parse(Float64, split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--flux=")
+            flux_kind = parse_maxwell_flux_kind(split(arg, "=", limit = 2)[2])
         elseif startswith(arg, "--output=")
             output = split(arg, "=", limit = 2)[2]
         else
@@ -369,6 +359,8 @@ function parse_periodic_convergence_arguments(args::Vector{String})
         throw(ArgumentError("--mu must be positive."))
     wave_number > 0.0 ||
         throw(ArgumentError("--wave-number must be positive."))
+    flux_kind in (MaxwellFlux_Central, MaxwellFlux_Alternating) ||
+        throw(ArgumentError("--flux must be centered or alternating."))
     isapprox(epsilon, 1.0; rtol = 0.0, atol = 1e-14) ||
         throw(
             ArgumentError(
@@ -405,6 +397,7 @@ function parse_periodic_convergence_arguments(args::Vector{String})
         epsilon,
         mu,
         wave_number,
+        flux_kind,
         geo_path,
         mesh_dir,
         abspath(output),
@@ -436,92 +429,17 @@ function generate_periodic_convergence_mesh(
     return mesh_path, load_periodic_mesh(mesh_path)
 end
 
-function periodic_convergence_node_id(
-    i::Int,
-    j::Int,
-    k::Int,
-    nx::Int,
-    ny::Int,
-)
-    return 1 + i + (nx + 1) * (j + (ny + 1) * k)
-end
-
-function build_structured_periodic_convergence_points(nx::Int)
-    nx >= 2 && iseven(nx) ||
-        throw(ArgumentError("Structured periodic nx must be even and at least 2."))
-    ny = nx ÷ 2
-    nz = nx ÷ 2
-    points = zeros(Float64, 3, (nx + 1) * (ny + 1) * (nz + 1))
-
-    for k in 0:nz, j in 0:ny, i in 0:nx
-        node = periodic_convergence_node_id(i, j, k, nx, ny)
-        points[:, node] .= (2.0 * i / nx, j / ny, k / nz)
-    end
-    return points
-end
-
-function build_structured_periodic_convergence_tets(nx::Int)
-    nx >= 2 && iseven(nx) ||
-        throw(ArgumentError("Structured periodic nx must be even and at least 2."))
-    ny = nx ÷ 2
-    nz = nx ÷ 2
-    tetrahedra = NTuple{4, Int}[]
-
-    for k in 0:(nz - 1), j in 0:(ny - 1), i in 0:(nx - 1)
-        v000 = periodic_convergence_node_id(i, j, k, nx, ny)
-        v100 = periodic_convergence_node_id(i + 1, j, k, nx, ny)
-        v010 = periodic_convergence_node_id(i, j + 1, k, nx, ny)
-        v110 = periodic_convergence_node_id(i + 1, j + 1, k, nx, ny)
-        v001 = periodic_convergence_node_id(i, j, k + 1, nx, ny)
-        v101 = periodic_convergence_node_id(i + 1, j, k + 1, nx, ny)
-        v011 = periodic_convergence_node_id(i, j + 1, k + 1, nx, ny)
-        v111 = periodic_convergence_node_id(i + 1, j + 1, k + 1, nx, ny)
-
-        append!(
-            tetrahedra,
-            (
-                (v000, v100, v110, v111),
-                (v000, v110, v010, v111),
-                (v000, v010, v011, v111),
-                (v000, v011, v001, v111),
-                (v000, v001, v101, v111),
-                (v000, v101, v100, v111),
-            ),
-        )
-    end
-    return reduce(hcat, collect.(tetrahedra))
-end
-
 function build_structured_periodic_convergence_mesh(nx::Int)
-    points = build_structured_periodic_convergence_points(nx)
-    tets = build_structured_periodic_convergence_tets(nx)
-    box = periodic_box(points)
-    tolerance = max(1e-10, 1e-10 * maximum(periodic_box_lengths(box)))
-    tris = build_boundary_tris(tets)
-    ntets = size(tets, 2)
-    ntris = size(tris, 2)
-    tet_cell_ids = collect(1:ntets)
-    tri_cell_ids = collect((ntets + 1):(ntets + ntris))
-    boundary_ids = zeros(Int, ntets + ntris)
-    for triangle in axes(tris, 2)
-        boundary_ids[ntets + triangle] = periodic_boundary_id(
-            points,
-            @view(tris[:, triangle]);
-            box = box,
-            tolerance = tolerance,
-        )
-    end
-
-    mesh = RawVTUMesh(
-        points,
-        tets,
-        tris,
-        tet_cell_ids,
-        tri_cell_ids,
-        Dict{String, Any}("boundary_id" => boundary_ids),
+    nx >= 2 && iseven(nx) ||
+        throw(ArgumentError("Structured periodic nx must be even and at least 2."))
+    return structured_box_mesh(
+        nx,
+        nx ÷ 2,
+        nx ÷ 2;
+        lower = (0.0, 0.0, 0.0),
+        upper = (2.0, 1.0, 1.0),
+        boundary_id = periodic_box_boundary_id,
     )
-    check_mesh_consistency(mesh)
-    return mesh
 end
 
 function root_periodic_convergence_mesh(
@@ -552,53 +470,10 @@ function root_periodic_convergence_mesh(
     return mesh_path, mesh
 end
 
-function periodic_balanced_spatial_partition(
-    mesh::RawVTUMesh,
-    nranks::Int,
-)
-    nelements = size(mesh.tets, 2)
-    nelements >= nranks ||
-        throw(
-            ArgumentError(
-                "Mesh has $nelements tetrahedra for $nranks MPI ranks.",
-            ),
-        )
-
-    centroids = Vector{NTuple{3, Float64}}(undef, nelements)
-    for elem in 1:nelements
-        nodes = @view mesh.tets[:, elem]
-        centroids[elem] = (
-            sum(@view mesh.points[1, nodes]) / 4.0,
-            sum(@view mesh.points[2, nodes]) / 4.0,
-            sum(@view mesh.points[3, nodes]) / 4.0,
-        )
-    end
-
-    order = sortperm(1:nelements; by = elem -> centroids[elem])
-    partition = zeros(Int, nelements)
-    for (position, elem) in enumerate(order)
-        partition[elem] =
-            min(div((position - 1) * nranks, nelements), nranks - 1)
-    end
-    return partition
-end
-
 function periodic_distributed_characteristic_h(
     distributed_dg::DistributedDGDiscretization,
 )
-    local_volume = 0.0
-    for elem in distributed_dg.distributed_mesh.partition.owned
-        local_volume +=
-            PERIODIC_REFERENCE_TET_VOLUME *
-            distributed_dg.dg.mappings.tet_mappings[elem].absdetJ
-    end
-    global_volume = MPI.Allreduce(local_volume, +, distributed_dg.comm)
-    nelements = MPI.Allreduce(
-        length(distributed_dg.distributed_mesh.partition.owned),
-        +,
-        distributed_dg.comm,
-    )
-    return (global_volume / nelements)^(1.0 / 3.0)
+    return distributed_mesh_characteristic_h(distributed_dg)
 end
 
 function tetrahedron_diameter(
@@ -703,12 +578,13 @@ function advance_distributed_periodic_convergence_case!(
     epsilon::Float64,
     mu::Float64,
     wave::PlaneWaveParameters,
+    flux_kind::MaxwellFluxKind,
     cubature_order::Int,
     track_time_l2_maxima::Bool = true,
     compute_time_error_norms::Bool = false,
 )
     workspace = MaxwellPartitionedRKWorkspace(U, scheme)
-    formulation = PoissonBracketFormulation()
+    formulation = PoissonBracketFormulation(flux_kind)
     max_l2_electric = NaN
     max_l2_magnetic = NaN
     max_l2_total = NaN
@@ -828,7 +704,7 @@ function run_distributed_periodic_convergence_case(
     nranks = MPI.Comm_size(comm)
     root_partition =
         rank == 0 ?
-        periodic_balanced_spatial_partition(root_mesh, nranks) :
+        balanced_spatial_partition(root_mesh, nranks) :
         nothing
     nelements = MPI.bcast(
         rank == 0 ? size(root_mesh.tets, 2) : 0,
@@ -929,6 +805,7 @@ function run_distributed_periodic_convergence_case(
             epsilon = config.epsilon,
             mu = config.mu,
             wave = wave,
+            flux_kind = config.flux_kind,
             cubature_order = cubature_order,
             track_time_l2_maxima = track_time_l2_maxima,
             compute_time_error_norms = time_error_norms_out !== nothing,
@@ -991,6 +868,7 @@ function run_distributed_periodic_convergence_case(
     result = DistributedPeriodicConvergenceResult(
         nranks,
         :periodic,
+        maxwell_flux_kind_label(config.flux_kind),
         config.mesh_family,
         polynomial_order,
         esprk_order,
@@ -1065,27 +943,18 @@ function run_distributed_periodic_convergence_case(
     return result
 end
 
-# function periodic_convergence_rate(
-#     fine_error::Float64,
-#     coarse_error::Float64,
-#     fine_h::Float64,
-#     coarse_h::Float64,
-# )
-#     fine_error > 0.0 && coarse_error > 0.0 || return missing
-#     return log(coarse_error / fine_error) / log(coarse_h / fine_h)
-# end
-
 function periodic_convergence_rate(
-    fine_error::Float64,
     coarse_error::Float64,
-    fine_h::Float64,
+    fine_error::Float64,
     coarse_h::Float64,
+    fine_h::Float64,
 )
-    fine_error > 0.0 && coarse_error > 0.0 || return missing
-    fine_h > 0.0 && coarse_h > 0.0 || return missing
-    coarse_h != fine_h || return missing
-
-    return log(coarse_error / fine_error) / log(coarse_h / fine_h)
+    return observed_convergence_rate(
+        coarse_error,
+        fine_error,
+        coarse_h,
+        fine_h,
+    )
 end
 
 function add_periodic_convergence_rates(
@@ -1223,6 +1092,7 @@ function add_periodic_convergence_rates(
                 DistributedPeriodicConvergenceResult(
                     result.mpi_ranks,
                     result.boundary_condition,
+                    result.flux,
                     result.mesh_family,
                     result.order,
                     result.esprk_order,
@@ -1499,7 +1369,7 @@ end
 
 function periodic_convergence_csv_header()
     return (
-        "mpi_ranks,boundary_condition,mesh_family,order,esprk_order,cubature_order,mesh_level," *
+        "mpi_ranks,boundary_condition,flux,mesh_family,order,esprk_order,cubature_order,mesh_level," *
         "nx_target,target_h,nelements,min_owned_elements,max_owned_elements," *
         "characteristic_h,h_min,h_max,h_ratio,volume_min,volume_max," *
         "volume_total,volume_ratio,edge_min,edge_max,edge_ratio," *
@@ -1531,6 +1401,7 @@ function write_periodic_convergence_results(
             values = (
                 result.mpi_ranks,
                 result.boundary_condition,
+                result.flux,
                 result.mesh_family,
                 result.order,
                 result.esprk_order,
@@ -1696,6 +1567,7 @@ function run_periodic_convergence_study(
         println("effective CFL:      ", effective_periodic_convergence_cfl(config))
         println("wave number:        ", config.wave_number)
         println("boundary condition: periodic")
+        println("flux:               ", maxwell_flux_kind_label(config.flux_kind))
         println("ESPRK rule:         order N+1, H-first")
         println("cubature rule:      Jaskowiec-Sukumar max(2,2N+4)")
         println("analytical mode:    traveling plane wave along +x")
