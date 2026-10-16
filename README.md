@@ -4,6 +4,13 @@ DiscoGMPI is the distributed-memory version of DiscoG3D. It is a separate
 Julia package and Git repository, so development here does not overwrite or
 remove the original DiscoG3D codebase.
 
+The [mixed-order Maxwell API](docs/numerics/mixed_order_dg.md) evolves
+`E ∈ [P_p]^3` and `H ∈ [P_(p+1)]^3` with rectangular quadrature operators,
+centered/alternating fluxes, PEC/periodic boundaries, and MPI trace exchange.
+Use `MixedDGDiscretization` or `build_distributed_mixed_dg_from_root` and
+`examples/convergence_mixed_order.jl`; the existing drivers retain their
+equal-order discretization.
+
 The package currently combines:
 
 - The serial and threaded DG/Maxwell solver inherited from DiscoG3D.

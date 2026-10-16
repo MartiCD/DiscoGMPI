@@ -101,8 +101,7 @@ function initialize_field_from_potential!(
     ref === ws.target || throw(ArgumentError("Workspace belongs to a different reference element."))
     size(mesh.tets, 1) == 4 || throw(ArgumentError("Only affine four-vertex tetrahedra are supported."))
     ne = size(mesh.tets, 2)
-    all(size(component) == (ref.Np, ne) for component in
-        (U.Ex, U.Ey, U.Ez, U.Hx, U.Hy, U.Hz)) ||
+    all(size(component) == (ref.Np, ne) for component in components) ||
         throw(ArgumentError("Field dimensions do not match the mesh/reference."))
     length(mappings.tet_mappings) == ne || throw(ArgumentError("Mapping count mismatch."))
     validate_maxwell_materials(materials, ne)
