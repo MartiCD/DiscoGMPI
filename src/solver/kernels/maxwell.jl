@@ -974,6 +974,54 @@ function maxwell_volume_rhs!(
     return rhs
 end
 
+function maxwell_poisson_volume_partition_rhs!(
+    rhs::MaxwellRHS,
+    U::MaxwellField,
+    ref::ReferenceTet,
+    physops::DGPhysicalOperators,
+    partition::Symbol;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+    reset::Bool = true,
+    workspace = nothing,
+    elements = axes(U.Ex, 2),
+)
+    partition in (:E, :H) ||
+        throw(ArgumentError("Maxwell partition must be :E or :H."))
+    reset && fill_maxwell_rhs!(rhs, 0.0)
+    scratch = workspace === nothing ? MaxwellElementScratch(size(U.Ex, 1)) : workspace.work[1]
+    mass_factor = workspace === nothing || workspace.mass_factor === nothing ?
+                  cholesky(ref.M) : workspace.mass_factor
+
+    for e in elements
+        @views begin
+            op = physops.elements[e]
+            Sx, Sy, Sz = physical_weak_derivative_matrices(op)
+            if partition == :E
+                weak_curl_element!(scratch.curl_x, scratch.curl_y, scratch.curl_z,
+                    scratch.tmp, U.Hx[:, e], U.Hy[:, e], U.Hz[:, e], Sx, Sy, Sz)
+                ldiv!(mass_factor, scratch.curl_x)
+                ldiv!(mass_factor, scratch.curl_y)
+                ldiv!(mass_factor, scratch.curl_z)
+                rhs.rhsEx[:, e] .+= scratch.curl_x ./ ε
+                rhs.rhsEy[:, e] .+= scratch.curl_y ./ ε
+                rhs.rhsEz[:, e] .+= scratch.curl_z ./ ε
+            else
+                SxT, SyT, SzT = physical_weak_derivative_transpose_matrices(op)
+                weak_curl_element!(scratch.curl_x, scratch.curl_y, scratch.curl_z,
+                    scratch.tmp, U.Ex[:, e], U.Ey[:, e], U.Ez[:, e], SxT, SyT, SzT)
+                ldiv!(mass_factor, scratch.curl_x)
+                ldiv!(mass_factor, scratch.curl_y)
+                ldiv!(mass_factor, scratch.curl_z)
+                rhs.rhsHx[:, e] .+= scratch.curl_x ./ μ
+                rhs.rhsHy[:, e] .+= scratch.curl_y ./ μ
+                rhs.rhsHz[:, e] .+= scratch.curl_z ./ μ
+            end
+        end
+    end
+    return rhs
+end
+
 function maxwell_volume_rhs!(
     rhs::MaxwellRHS,
     U::MaxwellField,
@@ -1003,16 +1051,18 @@ function maxwell_volume_rhs!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
     reset::Bool = true,
+    workspace = nothing,
+    elements = axes(U.Ex, 2),
 )
     if reset
         fill_maxwell_rhs!(rhs, 0.0)
     end
 
-    ne = size(U.Ex, 2)
-    scratch = MaxwellElementScratch(size(U.Ex, 1))
-    mass_factor = cholesky(ref.M)
+    scratch = workspace === nothing ? MaxwellElementScratch(size(U.Ex, 1)) : workspace.work[1]
+    mass_factor = workspace === nothing || workspace.mass_factor === nothing ?
+                  cholesky(ref.M) : workspace.mass_factor
 
-    for e in 1:ne
+    for e in elements
         @views begin
             op = physops.elements[e]
             Sx, Sy, Sz = physical_weak_derivative_matrices(op)

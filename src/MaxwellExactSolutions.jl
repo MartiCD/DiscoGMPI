@@ -275,6 +275,33 @@ function exact_periodic_wave_functions(
     return electric, magnetic
 end
 
+"""
+Cartesian potential for the periodic wave: curl(A) = mu*H.
+The y component is -d_x A_z = mu*H0*sin(k*(x-x0)-omega*t).
+"""
+function periodic_magnetic_vector_potential(x, y, z, time; mu::Real, wave::PlaneWaveParameters)
+    isfinite(mu) && mu > 0 || throw(ArgumentError("mu must be finite and positive."))
+    isfinite(wave.wave_number) && wave.wave_number > 0 ||
+        throw(ArgumentError("wave number must be finite and positive."))
+    phase = wave.wave_number * (x - wave.x_origin) - wave.angular_frequency * time
+    return (0.0, 0.0, mu * wave.magnetic_amplitude / wave.wave_number * cos(phase))
+end
+
+"""
+Cartesian electric potential with curl(A_E)=epsilon*E for the periodic wave.
+A_E,y=H0/omega*cos(k*(x-x0)-omega*t), so d_x A_E,y=epsilon*E_z.
+The explicit epsilon factor cancels the 1/epsilon in the benchmark E field.
+"""
+function periodic_electric_vector_potential(x, y, z, time; epsilon::Real, wave::PlaneWaveParameters)
+    isfinite(epsilon) && epsilon > 0 || throw(ArgumentError("epsilon must be finite and positive."))
+    isfinite(wave.wave_number) && wave.wave_number > 0 ||
+        throw(ArgumentError("wave number must be finite and positive."))
+    isfinite(wave.angular_frequency) && wave.angular_frequency > 0 ||
+        throw(ArgumentError("angular frequency must be finite and positive."))
+    phase = wave.wave_number * (x - wave.x_origin) - wave.angular_frequency * time
+    return (0.0, wave.magnetic_amplitude / wave.angular_frequency * cos(phase), 0.0)
+end
+
 function exact_periodic_wave_curl_functions(
     time::Float64;
     epsilon::Float64,

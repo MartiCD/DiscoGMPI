@@ -14,6 +14,7 @@ PERIODIC_DEFAULTS = (
     "--summary-output=output/periodic_cuboid_af_invariants_panel.pdf",
     "--components-output=output/periodic_cuboid_af_momentum_components_panel.pdf",
     "--error-output=output/periodic_cuboid_af_invariants_error_panel.pdf",
+    "--divergence-output=output/periodic_cuboid_af_divergence_constraints_panel.pdf",
 )
 
 

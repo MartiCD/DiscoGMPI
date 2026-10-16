@@ -1,0 +1,220 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{hyperref}
+
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\bbE}{\mathbf{E}}
+\newcommand{\bbH}{\mathbf{H}}
+\newcommand{\bbP}{\mathbf{P}}
+\newcommand{\bbL}{\mathbf{L}}
+\newcommand{\bbx}{\mathbf{x}}
+\newcommand{\calH}{\mathcal{H}}
+
+\begin{document}
+
+\subsection{Conserved quantities}
+\label{subsec:results_conserved_quantities}
+
+\paragraph{Claim.}
+The three-dimensional Poisson-bracket DG discretization preserves the
+Hamiltonian character of the lossless Maxwell problem in the sense relevant for
+long-time computation: the electromagnetic energy remains non-drifting over many
+periods, the discrete divergence constraints remain at roundoff level, and the
+errors in the additional integral diagnostics decrease systematically under
+$p$- and $h$-refinement.  The quantities monitored in this experiment are global
+integrals, not volume averages,
+\begin{align}
+  \calH_h(t)
+    &= \frac12 \int_{\Omega}
+       \left(\varepsilon |\bbE_h|^2 + \mu |\bbH_h|^2 \right)\dd \bbx, \\
+  Q_{E,h}(t)
+    &= \int_{\Omega} \nabla\cdot(\varepsilon \bbE_h)\dd \bbx,
+  &
+  Q_{H,h}(t)
+    &= \int_{\Omega} \nabla\cdot(\mu \bbH_h)\dd \bbx, \\
+  \bbP_h(t)
+    &= \int_{\Omega} \bbE_h\times \bbH_h \dd \bbx,
+  &
+  \bbL_h(t)
+    &= \int_{\Omega} \bbx\times(\bbE_h\times \bbH_h)\dd \bbx, \\
+  \chi_h(t)
+    &= \frac12\int_{\Omega}
+       \left(\varepsilon \bbE_h\cdot\nabla\times\bbE_h
+       + \mu \bbH_h\cdot\nabla\times\bbH_h\right)\dd \bbx .
+\end{align}
+For scalar diagnostics the plotted error is the absolute difference from the
+analytical value.  For momentum diagnostics the plotted error is the Euclidean
+norm of the difference between the three integrated components, for example
+$\|\bbP-\bbP_h\|_2$ and $\|\bbL-\bbL_h\|_2$.
+
+\paragraph{Experiment.}
+The test is a periodic travelling wave in the cuboid
+\[
+  \Omega = [0,2]\times[0,1]\times[0,1],
+\]
+with periodic identifications on all opposite faces.  The material parameters
+are constant, $\varepsilon=\mu=1$, and the analytical fields are
+\begin{align}
+  \bbE(\bbx,t) &= \left(0,0,-\sin(kx-\omega t)\right), \\
+  \bbH(\bbx,t) &= \left(0,\sin(kx-\omega t),0\right),
+\end{align}
+with $k=\omega=2\pi$.  Hence the exact optical chirality and both charges are
+zero.  Since the wave propagates in the positive $x$ direction, the exact
+integrated linear momentum is $\bbP=(1,0,0)$; with the coordinate origin at the
+lower corner of the cuboid, the exact integrated angular momentum is
+$\bbL=(0,1/2,-1/2)$.
+
+All runs use the distributed periodic Poisson-bracket Maxwell driver with
+centered numerical fluxes, a magnetic-first explicit symplectic partitioned
+Runge--Kutta rule, CFL number $0.8$, and the Jaskowiec--Sukumar tetrahedral
+cubature rule used by the diagnostics.  The $p$-refinement study uses the
+structured mesh
+\texttt{examples/meshes/periodic\_box\_structured\_2x1x1.vtk}, final time
+$T=1000$, and polynomial orders $p=1,2,3,4$ with ESPRK order $p+1$.  The
+corresponding run script is
+\texttt{examples/run\_periodic\_cuboid\_centered\_flux\_p\_convergence.sh}.
+The stored metadata for the visible $p=1$ and $p=2$ runs report one MPI rank,
+768 tetrahedra, $h_{\min}=4.4960164\times 10^{-2}$, and time steps
+$3.5967342\times10^{-2}$ and $1.7983994\times10^{-2}$, respectively.
+
+The $h$-refinement study fixes $p=1$ and ESPRK order $2$, runs on four MPI
+ranks, and refines the structured periodic mesh by factors of two.  The
+published panels use the three complete final-time levels shown in
+Table~\ref{tab:conserved_h_runs}.  A fourth level, $h_0/8$, is present in the
+run directory but its metadata mark it as incomplete; it is therefore not used
+for the claims below.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Reproducibility data for the $h$-refinement conserved-quantity
+  experiment.  The data are taken from the run metadata in
+  \texttt{output/periodic\_cuboid\_cf\_structured\_p1\_h*}.}
+  \label{tab:conserved_h_runs}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{lccccc}
+    \toprule
+    Level & Mesh file & Elements & $h_{\min}$ & $\Delta t$ & Status \\
+    \midrule
+    $h_0$
+      & \texttt{periodic\_box\_structured\_2x1x1.vtk}
+      & 768 & $4.4960{\times}10^{-2}$ & $3.5967{\times}10^{-2}$ & complete \\
+    $h_0/2$
+      & \texttt{periodic\_box\_structured\_nx16\_ny8\_nz8.vtk}
+      & 6144 & $2.2480{\times}10^{-2}$ & $1.7984{\times}10^{-2}$ & complete \\
+    $h_0/4$
+      & \texttt{periodic\_box\_structured\_nx32\_ny16\_nz16.vtk}
+      & 49152 & $1.1240{\times}10^{-2}$ & $8.9920{\times}10^{-3}$ & complete \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\paragraph{Evidence.}
+Figures~\ref{fig:conserved_p_invariants}--\ref{fig:conserved_p_errors} show the
+$p$-refinement experiment.  The total electromagnetic energy is flat in time for
+all polynomial orders over $T=100$, while the deviation from the analytical
+energy decreases by several orders of magnitude as the order is increased.  The
+same trend is observed for the linear and angular momenta.  The electric and
+magnetic charge errors remain close to floating-point roundoff throughout the
+run, which is consistent with the discrete periodic cancellation of the
+divergence constraints.  The optical chirality is analytically zero for this
+linearly polarized plane wave; the numerical value oscillates visibly at low
+order and is strongly reduced by increasing $p$.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{../../output/1_invariants/plane_wave_strucutred/p_convergence/periodic_cuboid_cf_strcutred_invariants_panel.pdf}
+  \caption{$p$-refinement study for the periodic travelling wave using centered
+  fluxes.  The panels show the time evolution of total energy, optical
+  chirality, linear momentum norm, angular momentum norm, and electric and
+  magnetic charges.}
+  \label{fig:conserved_p_invariants}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{../../output/1_invariants/plane_wave_strucutred/p_convergence/periodic_cuboid_cf_strcutred_components_panel.pdf}
+  \caption{$p$-refinement study for the component-wise linear and angular
+  momenta.  The exact travelling wave has dominant $P_x$ and angular components
+  $L_y$ and $L_z$; the remaining momentum components are expected to vanish.}
+  \label{fig:conserved_p_components}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{../../output/1_invariants/plane_wave_strucutred/p_convergence/periodic_cuboid_cf_structured_invariants_error_panel.pdf}
+  \caption{$p$-refinement errors for the conserved-quantity diagnostics.  Scalar
+  quantities are plotted as absolute errors, while momentum quantities are
+  plotted as Euclidean errors of the integrated component vectors.}
+  \label{fig:conserved_p_errors}
+\end{figure}
+
+Figures~\ref{fig:conserved_h_invariants}--\ref{fig:conserved_h_errors} show the
+corresponding $h$-refinement experiment.  With $p=1$ fixed, reducing the mesh
+size from $h_0$ to $h_0/4$ reduces the maximum-in-time energy error from about
+$3.3\times10^{-1}$ to about $2.5\times10^{-2}$.  Over the same refinement range,
+the maximum Euclidean error in the integrated linear momentum decreases from
+about $6.2\times10^{-1}$ to about $2.7\times10^{-2}$, and the corresponding
+angular-momentum error decreases from about $4.5\times10^{-1}$ to about
+$1.9\times10^{-2}$.  Electric-charge errors stay below $5\times10^{-13}$ and
+magnetic-charge errors stay below $10^{-10}$ on the plotted complete levels.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{../../output/1_invariants/plane_wave_strucutred/h_convergence/periodic_cuboid_cf_h_convergence_invariants_panel.pdf}
+  \caption{$h$-refinement study for the periodic travelling wave at fixed
+  $p=1$.  The plotted levels correspond to $h_0$, $h_0/2$, and $h_0/4$.}
+  \label{fig:conserved_h_invariants}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{../../output/1_invariants/plane_wave_strucutred/h_convergence/periodic_cuboid_cf_h_convergence_momentum_components_panel.pdf}
+  \caption{$h$-refinement study for the component-wise linear and angular
+  momenta at fixed $p=1$.  Mesh refinement reduces the spurious transverse
+  momentum components and stabilizes the expected nonzero components.}
+  \label{fig:conserved_h_components}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{../../output/1_invariants/plane_wave_strucutred/h_convergence/periodic_cuboid_cf_h_convergence_invariants_error_panel.pdf}
+  \caption{$h$-refinement errors for the conserved-quantity diagnostics at fixed
+  $p=1$.  Energy and momentum errors decrease under mesh refinement; charge
+  errors remain at roundoff scale.}
+  \label{fig:conserved_h_errors}
+\end{figure}
+
+\paragraph{Interpretation.}
+These experiments separate exact discrete conservation from accuracy of a
+particular diagnostic.  The energy is the quadratic Hamiltonian of the linear
+lossless Maxwell system and is the quantity most directly tied to the
+skew-symmetry of the Poisson-bracket semi-discretization and to the symplectic
+partitioned time integrator.  The observed non-drifting energy histories are
+therefore the primary structure-preservation result.
+
+The remaining diagnostics are global physical quantities evaluated from the
+computed polynomial fields.  They are not all enforced as algebraic invariants
+of the discrete bracket with the same strength as the Hamiltonian.  Their errors
+therefore measure the quality of the discrete electromagnetic field, the
+periodic face pairing, the quadrature evaluation, and the phase accuracy of the
+long-time wave propagation.  The systematic reduction of the momentum and
+chirality errors under both $p$- and $h$-refinement shows that these quantities
+are recovered consistently as the DG approximation improves.  The charge
+diagnostics being near roundoff is a stronger test of the distributed periodic
+topology: it indicates that the periodic face contributions cancel globally and
+that no artificial boundary leakage is introduced by the partitioned mesh.
+
+Overall, the conserved-quantity study supports the central numerical claim of
+the method: in a fully three-dimensional distributed-memory setting, the
+Poisson-bracket DG formulation combined with ESPRK time integration delivers
+long-time non-drifting energy behavior, while the physically relevant momentum,
+charge, and chirality diagnostics converge toward their analytical values under
+resolution refinement.
+
+\end{document}

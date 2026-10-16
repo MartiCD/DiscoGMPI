@@ -1,0 +1,1058 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=25mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,microtype}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{xurl,hyperref}
+\usepackage{listings}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,columns=fullflexible}
+\setlength{\emergencystretch}{3em}
+\newcommand{\E}{\mathbf E}
+\newcommand{\HH}{\mathbf H}
+\newcommand{\n}{\mathbf n}
+\newcommand{\curl}{\nabla\times}
+\newcommand{\divg}{\nabla\cdot}
+\newcommand{\R}{\mathbb R}
+\newcommand{\ip}[2]{\left(#1,#2\right)}
+\newcommand{\src}[3]{\par\smallskip\noindent\textbf{Source.} \path{#1}, \path{#2}, lines #3.\par\smallskip}
+\newcommand{\kernel}{\texttt{src/solver/kernels/}}
+\newtheorem{proposition}{Proposition}[section]
+\title{The Implemented Three-Dimensional Maxwell Poisson-Bracket Operator in DiscoGMPI\\[0.5em]\large A source-based reconstruction and independent algebraic audit}
+\author{Implementation snapshot: branch \texttt{main} with local changes}
+\date{21 September 2026}
+\begin{document}
+\maketitle
+\begin{abstract}
+This report reconstructs the spatial Maxwell operator actually executed by
+DiscoGMPI on affine tetrahedra, rather than prescribing a generic discontinuous
+Galerkin method. Starting with the monomial Gram construction, nodal bases,
+physical mappings and face restrictions, it derives the asymmetric electric
+and magnetic volume terms, centered and orientation-selected alternating
+traces, mass-weighted global system, and finite-dimensional bracket. It then
+identifies the assumptions under which this bracket is constant and skew,
+and separates those mathematical properties from floating-point identities,
+time integration, and monitored divergence diagnostics. MPI realization and
+boundary forcing are traced to executable routines. In particular, different
+dispatch paths do not always honor the same flux request: a material-aware
+wrapper defaults to centered traces even when alternating flux is requested.
+Independent small-matrix and distributed checks accompany the reconstruction;
+no production operator has been altered.
+\end{abstract}
+\tableofcontents
+\newpage
+
+\section{Scope, evidence and executable path}\label{sec:scope}
+The baseline commit is
+\path{e5bd7abe249efab7806acfb197af1141313523f9}, on branch \texttt{main}.
+The working tree is not clean. In particular the nodal/face constructors,
+distributed DG support, diagnostics, driver support and example drivers have
+local changes; magnetic initialization is an untracked source addition at
+inspection time. Thus the commit alone cannot reproduce this report.
+The accompanying provenance file records source hashes and working-tree state.
+No applicable \path{AGENTS.md} was found in the repository or its ancestor
+directories. Line references refer to this working-tree snapshot.
+
+Three evidence classes are used throughout. \emph{Source} identifies executed
+array operations and dispatch. \emph{Derivation} identifies consequences in
+exact real arithmetic under explicitly stated assumptions. \emph{Verification}
+identifies finite, executed numerical checks, whose domains do not constitute
+general proofs. Observed inconsistencies are retained, not silently corrected.
+
+The main thread is \path{PoissonBracketFormulation}, not
+\path{HesthavenWarburtonFormulation}. Both coexist in the same module. The
+latter uses strong volume curls for both fields and permits upwind penalties;
+the former uses an adjoint magnetic volume operator and permits centered or
+alternating interface fluxes on its homogeneous-coefficient path. There is
+no active \path{rhs_hamiltonian_H!} or \path{FaceCommPlan} API on this path.
+\path{src/TraceMaps.jl} contains a separate generic trace-exchange facility;
+the Maxwell runtime instead uses \path{DistributedMaxwellExchange}.
+\src{src/DiscoGMPI.jl}{include chain}{352--417}
+\src{src/solver/data_containers.jl}{AbstractMaxwellDGFormulation; PoissonBracketFormulation}{438--454}
+
+\subsection{Representative call graph}
+The periodic driver provides a particularly direct, unforced realization:
+\begin{lstlisting}
+examples/distributed_periodic_poisson_bracket_maxwell.jl
+  main -> run_experiment -> load_or_prepare_distributed_dg
+    load_periodic_box_mesh -> read_mesh_file_tet_vtk
+    prepare_distributed_mesh_partition[_collective]
+    build_distributed_dg_from_partition
+      build_distributed_dg_from_local_mesh -> DGDiscretization
+        topology -> geometry -> mappings -> reference tet
+        face operators -> physical operators -> trace maps -> flux faces
+  build_distributed_periodic_maxwell_exchange
+  interpolate_maxwell_field [optional curl-potential replacement of H]
+  distributed_periodic_partitioned_symplectic_rk_step!
+    partitioned_symplectic_rk_step! -> RHS callback
+      maxwell_rhs_periodic!
+        ordinary ghost exchange; periodic trace exchange
+        volume; ordinary faces; periodic faces; physical boundaries
+        zero_ghost_maxwell_rhs!
+\end{lstlisting}
+The representative driver calls the scalar \(\varepsilon,\mu\) overload, not
+the element-material overload. Its optional curl initializer does not change
+that evolution dispatch. Its diagnostic cubature setting does not control
+the evolution mass or stiffness matrices.
+\src{examples/distributed_periodic_poisson_bracket_maxwell.jl}{load_or_prepare_distributed_dg; run_experiment}{534--595, 704--753, 1006--1018}
+\src{src/solver/kernels/dg_discretization.jl}{DGDiscretization}{5--42}
+
+\section{Continuous fields and conventions}\label{sec:continuous}
+Consider a stationary mesh of affine tetrahedra \(\mathcal T_h\) covering
+\(\Omega\subset\R^3\). Materials are positive, time-independent scalar
+constants on each element, \(\varepsilon_K,\mu_K>0\). The baseline source-free
+equations represented by the conservative spatial operator are
+\begin{equation}\label{eq:maxwell}
+ \varepsilon\partial_t\E=\curl\HH,\qquad
+ \mu\partial_t\HH=-\curl\E,\qquad
+ \mathbf D=\varepsilon\E,\quad\mathbf B=\mu\HH.
+\end{equation}
+There is no general volume current supplied to the baseline RHS. The PML adds
+separate source terms, and incident PEC data add boundary forcing; neither is
+part of the closed homogeneous Hamiltonian system below.
+
+\begin{longtable}{p{0.24\linewidth}p{0.69\linewidth}}
+\toprule Symbol & Meaning\\\midrule
+\(\widehat K,\widehat x=(r,s,t)\) & Reference tetrahedron and reference coordinates; physical time is denoted \(\tau\) when confusion with coordinate \(t\) is possible.\\
+\(K,x=\Phi_K(\widehat x)\) & Physical element and its affine map.\\
+\(\n_K\), \(\n\) & Outward physical unit normal of an element; on a two-sided face, \(\n\) points out of the chosen minus element.\\
+\(v^-,v^+\) & Values at the same physical face point, or translated periodic point, in minus ordering.\\
+\(\Delta v=v^--v^+\) & Componentwise scalar/vector difference; no hidden normal factor.\\
+\(j_n(v)=\n\cdot\Delta v\) & Normal jump relative to the chosen normal.\\
+\(j_t(v)=\n\times\Delta v\) & Tangential vector jump, with this cross-product order.\\
+\(\{v\}=(v^-+v^+)/2\) & Arithmetic mean, not an impedance-weighted mean.\\
+\(\ip{u}{v}_K\) & \(\int_K u\cdot v\,dx\), or ordinary scalar product for scalar functions.\\
+\(\langle u,v\rangle_f\) & Face integral \(\int_f u\cdot v\,dS\).\\
+\(R_f,P_f\) & Nodal face restriction and plus-to-minus permutation matrix.\\
+\(N(\n)\) & The \(3\times3\) matrix such that \(N(\n)v=\n\times v\); \(N^T=-N\).\\
+\(M_0,M_E,M_H\) & Global unweighted vector mass and its electric/magnetic material-weighted counterparts.\\
+\bottomrule
+\end{longtable}
+The curl sign follows
+\((\partial_y v_z-\partial_z v_y,\partial_z v_x-\partial_x v_z,
+\partial_x v_y-\partial_y v_x)\). In particular,
+\begin{equation}\label{eq:curlgreen}
+ (\curl u,v)_K=(u,\curl v)_K+\langle\n_K\times u,v\rangle_{\partial K}.
+\end{equation}
+This fixes the signs of every subsequent boundary term.
+
+\subsection{Hamiltonian and functional derivatives}
+The electromagnetic Hamiltonian is
+\begin{equation}\label{eq:contenergy}
+ \mathcal H=\frac12\int_\Omega(\varepsilon|\E|^2+\mu|\HH|^2)\,dx.
+\end{equation}
+For a differentiable functional \(F\), let \(F_E,F_H\) be its
+\emph{unweighted} \(L^2\) gradients. Its material-weighted gradients are
+\(F_E^w=\varepsilon^{-1}F_E\), \(F_H^w=\mu^{-1}F_H\).
+Thus \(\mathcal H_E=\varepsilon\E\),
+\(\mathcal H_H=\mu\HH\), while \(\mathcal H_E^w=\E\),
+\(\mathcal H_H^w=\HH\). A relevant continuous bulk bracket is
+\begin{equation}\label{eq:contbracket}
+ \{F,G\}_{\rm bulk}=
+ (F_E^w,\curl G_H^w)_\Omega
+ -(F_H^w,\curl G_E^w)_\Omega.
+\end{equation}
+The symmetric part is a boundary pairing:
+\begin{equation}\label{eq:bracketboundary}
+ \{F,G\}_{\rm bulk}+\{G,F\}_{\rm bulk}
+ =\int_{\partial\Omega}\n\cdot
+ (G_H^w\times F_E^w+F_H^w\times G_E^w)\,dS.
+\end{equation}
+Periodicity or compatible homogeneous PEC/PMC domains for the gradients
+remove this term. Otherwise one needs boundary power/ports, not a claim of
+a closed antisymmetric bulk bracket. For smooth solutions,
+\begin{equation}
+ \dot{\mathcal H}=-\int_{\partial\Omega}\n\cdot(\E\times\HH)\,dS.
+\end{equation}
+For discontinuous materials these equations and integrations are interpreted
+piecewise, with compatible interface transmission. The DG bracket will be
+defined from its actual matrix blocks, not inferred merely from
+\eqref{eq:contbracket}.
+
+\section{Reference polynomials and nodal representation}\label{sec:reference}
+The reference vertices, in \emph{geometric vertex numbering}, are
+\begin{equation}
+ v_1=(-1,-1,-1),\quad v_2=(1,-1,-1),\quad
+ v_3=(-1,1,-1),\quad v_4=(-1,-1,1).
+\end{equation}
+The volume is \(4/3\). Face numbering and oriented vertex triples are
+\begin{center}
+\begin{tabular}{ccccc}\toprule
+Face & Vertices & Plane & Reference outward normal & Area\\\midrule
+1 & (2,3,4) & \(r+s+t=-1\) & \((1,1,1)/\sqrt3\) & \(2\sqrt3\)\\
+2 & (1,4,3) & \(r=-1\) & \((-1,0,0)\) & 2\\
+3 & (1,2,4) & \(s=-1\) & \((0,-1,0)\) & 2\\
+4 & (1,3,2) & \(t=-1\) & \((0,0,-1)\) & 2\\\bottomrule
+\end{tabular}
+\end{center}
+\src{src/solver/data_containers.jl}{TET_FACES; REF_TET_VERTEX_COORDS; REF_TET_FACE_VERTEX_IDS}{27--32, 152--164}
+
+The scalar space is the complete total-degree space \(P_p(\widehat K)\),
+not a tensor-product polynomial space. Its volume and face dimensions are
+\begin{equation}\label{eq:dimensions}
+ N_p=\binom{p+3}{3},\qquad N_{fp}=\binom{p+2}{2}.
+\end{equation}
+Degree zero is supported by the reference-volume constructor, but the
+ordinary face-node-extraction discretization requires nodes on faces. Its
+centroid-only degree-zero node cannot supply those traces; this report does
+not claim a working production \(p=0\) DG face discretization.
+
+\subsection{Equispaced and warp-blend nodes}
+The default equispaced loop is \(i=0{:}p\), then \(j=0{:}p-i\), then
+\(k=0{:}p-i-j\), with \(l=p-i-j-k\). It sets
+\begin{equation}
+ (\lambda_1,\lambda_2,\lambda_3,\lambda_4)=(i,j,k,l)/p,
+ \qquad(r,s,t)=(-1+2\lambda_2,-1+2\lambda_3,-1+2\lambda_4).
+\end{equation}
+Consequently the \(p=1\) solver nodes are \(v_4,v_3,v_2,v_1\), not
+\(v_1,v_2,v_3,v_4\). For \(p=0\) the node is \((-1/2,-1/2,-1/2)\).
+\src{src/solver/kernels/reference_tet.jl}{num_tet_nodes; equispaced_tet_nodes}{6--55}
+
+The alternative \path{warp_blend_tet_nodes} uses its own equispaced seed
+ordering, transforms to an equilateral tetrahedron, accumulates face shifts
+in two tangential directions, and maps back. Edge targets are
+Gauss--Lobatto--Legendre points: endpoints and roots of \(P_p'\), computed
+by Newton iteration. The degree-dependent blending parameter is the stored
+\path{WARP_BLEND_TET_ALPHA} table (degrees 1--15), with fallback 1 above
+that range. The construction does not sort its output into the default
+equispaced ordering.
+
+More explicitly, the two-dimensional face shift combines the three edge
+warps with factors \(4L_bL_c(1+(\alpha L_a)^2)\) in directions at angles
+\(0,2\pi/3,4\pi/3\). For a tetrahedral face opposite barycentric coordinate
+\(L_a\), its interior extension uses
+\begin{equation}
+ b_f=\frac{(1+(\alpha L_a)^2)L_bL_cL_d}
+ {(L_b+L_a/2)(L_c+L_a/2)(L_d+L_a/2)}.
+\end{equation}
+The code treats small denominators and face edges separately with tolerance
+\(10^{-10}\); the implemented branch logic, not this rational expression
+alone, defines edge values. These are interpolation nodes, not volume
+integration points.
+\src{src/solver/kernels/reference_tet.jl}{gauss_lobatto_legendre_nodes; eval_shift_2d; warp_blend_tet_nodes}{115--230, 276--388}
+
+\subsection{The actual modal basis: Gram orthonormalization}
+The internal basis is not implemented as a direct Jacobi/Dubiner recurrence.
+Let \(m_a=r^{a_1}s^{a_2}t^{a_3}\), ordered first by total degree, then
+increasing \(a_1\), then increasing \(a_2\). The exact-in-real-arithmetic
+monomial Gram matrix is \(G_{ab}=\int_{\widehat K}m_am_b\).
+For unit-simplex coordinates \((u,v,w)\),
+\begin{equation}
+ \int_{u,v,w\ge0,\ u+v+w\le1}u^iv^jw^k\,du\,dv\,dw
+ =\frac{i!j!k!}{(i+j+k+3)!}.
+\end{equation}
+Binomial expansion of \(r=2u-1,s=2v-1,t=2w-1\), multiplied by 8,
+gives the moments used in \(G\). Computation is Float64 even though factorials
+are first formed as big integers. Cancellation in these moments can therefore
+limit high-degree conditioning.
+
+The Cholesky factor is \(G=U^TU\). With \(C=U^{-1}\), the modal row vector is
+\(\psi(\widehat x)=m(\widehat x)C\), so
+\begin{equation}
+ C^TGC=I,\qquad V_{ia}=\psi_a(\widehat x_i),\qquad
+ \ell(\widehat x)=\psi(\widehat x)V^{-1}.
+\end{equation}
+Hence \(\ell_j(\widehat x_i)=\delta_{ij}\), nodal values \(u\) map to modal
+coefficients \(V^{-1}u\), and quadrature values are \(V_qV^{-1}u\).
+The matrices explicitly store both \(V\) and \(V^{-1}\).
+\src{src/solver/kernels/reference_tet.jl}{monomial_exponents_3d; ref_tet_monomial_integral; build_orthonormal_tet_basis}{426--440, 522--582, 616--646}
+
+Differentiating the monomials before transforming gives
+\begin{equation}\label{eq:refmatrices}
+ D_r=V_rV^{-1},\quad D_s=V_sV^{-1},\quad D_t=V_tV^{-1},
+ \quad M=V^{-T}V^{-1},\quad S_a=MD_a.
+\end{equation}
+Thus \((S_a)_{ij}=\int\ell_i\partial_a\ell_j\): row \(i\) is the test index,
+column \(j\) the trial index. The derivative is on the \emph{column} basis.
+All these matrices are \(N_p\times N_p\). The older nested-loop analytic
+mass/stiffness helpers remain in the file, but are not invoked by
+\path{build_reference_tet}.
+\src{src/solver/kernels/reference_tet.jl}{orthonormal_grad_vandermonde_tet; build_reference_tet}{596--614, 769--848}
+
+\section{Face integration, restriction and lifting}\label{sec:faces}
+For a face \(f\), \(R_f\in\R^{N_{fp}\times N_p}\) selects the ordered
+face nodes. On equispaced meshes they are reordered to the reference
+triangle's order. On warp-blend faces, a separate triangular basis is built
+from the actual extracted face coordinates. The mappings to the reference
+triangle of area 2 are \((s,t),(t,s),(r,t),(s,r)\), respectively for faces
+1 through 4. This is why a face-node permutation must be applied consistently
+to values and face mass matrices.
+
+The triangular modal Gram/Cholesky construction gives
+\(M_\triangle=V_\triangle^{-T}V_\triangle^{-1}\). The active reference face
+matrix is
+\begin{equation}\label{eq:facemass}
+ W_f=\frac{|\widehat f|}{2}M_{\triangle,f},\quad
+ B_f=R_f^TW_fR_f,\quad L_f=M^{-1}R_f^TW_f.
+\end{equation}
+Here \(W_f\) is \(N_{fp}\times N_{fp}\), \(B_f\) is \(N_p\times N_p\), and
+the precomputed \path{face_lift[f]} is \(N_p\times N_{fp}\).
+The additional \path{Emat} and \path{LIFT} fields hold
+\(\sum_fB_f\) and \(M^{-1}\sum_fB_f\). Maxwell face loops use the individual
+\(L_f\), not the combined matrix.
+\src{src/solver/kernels/face_operators.jl}{build_reference_tri_from_nodes; build_reference_face_mass_from_tri}{644--684, 734--737}
+\src{src/solver/kernels/face_operators.jl}{ordered_reference_face_nodes; build_reference_face_operators}{792--848, 871--972}
+\src{src/solver/kernels/face_operators.jl}{build_reference_face_lift_matrices}{243--268}
+
+\subsection{Which quadrature is actually used?}
+The baseline volume and active face matrices above use analytic polynomial
+moments through orthonormalization; they are not nodal mass lumping or a
+Jaskowiec--Sukumar assembly. The mass is full, symmetric positive definite
+in exact arithmetic, and is factored/solved, not approximated as diagonal.
+The volume RHS factors \(M\) with Cholesky once per RHS invocation, before
+the element loop; that factor is not cached across calls on this path.
+Face lifting solves against \(M\) during construction and subsequently
+multiplies precomputed matrices, with no mass solve inside the face loop.
+
+A separate face quadrature implementation uses a Duffy transform of a tensor
+Gauss--Legendre rule, with \(n=\lceil(d+2)/2\rceil\) points per direction
+for target degree \(d\). On \([0,1]^2\), \((u,v)\mapsto(u,(1-u)v)\), so
+weights acquire \(1-u\). Their sum is \(1/2\), then multiplying by
+\(2|\widehat f|\) gives surface weights. Taking \(d=2p\) is polynomially
+exact for face basis products. However, its old nodal-evaluation helper
+currently throws a shape error in the audit; it is not the production
+face constructor. The audit independently evaluates the modal matrix at the
+same quadrature points to check \eqref{eq:facemass}.
+\src{src/solver/kernels/face_operators.jl}{triangle_quadrature_gauss; reference_face_quadrature; eval_nodal_basis_at_points}{80--137, 173--240}
+
+Diagnostic volume cubature uses tabulated Jaskowiec--Sukumar rules of orders
+2--20. Tabulated coordinates are transformed by \(2x-1\), and weights by
+\(8/6\); final weights sum to \(4/3\). Physical diagnostic weights are
+\(|\det J_K|w_q\). The default diagnostic order is \(\max(2,2p+4)\), subject
+to availability. These rules integrate polynomial products to their stated
+degree, not trigonometric analytical errors exactly. Solution nodes and
+cubature points are distinct.
+\src{src/solver/kernels/JaskowiecSukumar.jl}{get_JaskowiecSukumar_cubature}{1--2694; coordinate/weight transformation at 2683--2694}
+\src{src/MaxwellDriverSupport.jl}{resolved_maxwell_cubature_order}{414--430}
+
+\subsection{Discrete integration by parts}
+For representable polynomials and exact moment/face integration,
+\begin{equation}\label{eq:sbp}
+ S_a+S_a^T=\sum_f\widehat n_{f,a}B_f,\qquad a=r,s,t.
+\end{equation}
+This follows entry by entry from
+\(\partial_a(\ell_i\ell_j)\) and the divergence theorem. It is not a
+pointwise product rule for arbitrary interpolated nonlinear functions.
+The stored Float64 matrices satisfy it only to construction roundoff;
+Section~\ref{sec:verification} measures that residual.
+
+\section{Affine geometry and physical fields}\label{sec:geometry}
+Let the physical vertices be \(x_1,\ldots,x_4\). The executable map is
+\begin{equation}\label{eq:map}
+ \Phi_K(r,s,t)=\sum_{a=1}^4\lambda_a(r,s,t)x_a,
+ \quad J_K=\frac12[x_2-x_1\;x_3-x_1\;x_4-x_1],
+ \quad j_K=|\det J_K|.
+\end{equation}
+The stored inverse is \(J_K^{-1}\); gradients use \(J_K^{-T}\). Thus
+\begin{equation}\label{eq:physicalD}
+ D_{K,x}=\sum_{a=1}^3(J_K^{-1})_{a1}D_a,
+ \quad D_{K,y}=\sum_a(J_K^{-1})_{a2}D_a,
+ \quad D_{K,z}=\sum_a(J_K^{-1})_{a3}D_a.
+\end{equation}
+Using rows instead of columns of \(J^{-1}\) here would be incorrect.
+Signed determinants are retained for orientation diagnostics; positive
+\(j_K\) is used for integration. A negative determinant is not, by itself,
+rejected: the normal is oriented independently with the owner centroid.
+The mapping rejects \(|\det J_K|\le\epsilon_{\rm mach}\), an absolute
+degeneracy threshold rather than a scale-invariant quality test.
+\src{src/solver/kernels/metrics.jl}{ref_tet_shape_functions; build_tet_mapping; reference_gradient_to_physical}{7--98}
+
+The physical scalar mass is \(M_K=j_KM\). The stored physical stiffness is
+\(S_{K,a}=MD_{K,a}\), \emph{without} the determinant; its actual physical
+integral is \(j_KS_{K,a}\). The omitted factor cancels with \(M_K\) during
+volume inversion. The componentwise vector mass is \(I_3\otimes M_K\).
+\src{src/solver/kernels/physical_operators.jl}{physical_derivative_matrices; physical_stiffness_matrices; build_physical_element_operator}{6--63}
+
+For a face, code computes the triangle cross product, area and outward unit
+normal, flipping the normal if it points toward the owner centroid. Define
+\(s_{Kf}=|f|/|\widehat f|\). Then
+\begin{equation}\label{eq:geomlift}
+ M_K^{-1}R_f^T(s_{Kf}W_f)g
+ =\frac{s_{Kf}}{j_K}L_fg.
+\end{equation}
+Normals are \emph{unit}, not area-scaled; area appears only in
+\(s_{Kf}\). The signed map and outward orientation imply the physical version
+\(j_K(S_{K,a}+S_{K,a}^T)=\sum_fs_{Kf}n_{Kf,a}B_f\).
+\src{src/solver/kernels/geometry.jl}{raw_triangle_normal_area; oriented_face_geometry}{113--148}
+\src{src/solver/kernels/maxwell.jl}{add_lifted_face_contribution!}{1171--1220}
+
+The vector space is \(V_h=[P_p(\mathcal T_h)]^3\), with Cartesian components
+mapped as scalar polynomials:
+\begin{equation}
+ \E_h|_K=\sum_{i=1}^{N_p}\mathbf e_{K,i}\ell_i\circ\Phi_K^{-1},
+ \qquad \HH_h|_K=\sum_i\mathbf h_{K,i}\ell_i\circ\Phi_K^{-1}.
+\end{equation}
+There is no covariant or contravariant Piola transformation and no built-in
+\(H(\mathrm{curl})\) or \(H(\mathrm{div})\) conformity. Curved CAD objects
+are represented here by straight tetrahedra and planar boundary triangles.
+
+\subsection{Storage and materials}
+\path{MaxwellField} stores six Float64 matrices \path{Ex,Ey,Ez,Hx,Hy,Hz},
+each \(N_p\times N_{\rm local}\); \path{MaxwellRHS} mirrors these arrays.
+For example \path{U.Hy[3,7]} is the y-component at local interpolation node
+3 of local element 7, not a modal coefficient or global node value. DG
+coefficients remain distinct even when physical coordinates coincide.
+\src{src/solver/data_containers.jl}{MaxwellField; MaxwellRHS; MaxwellElementMaterials}{337--401}
+
+Both scalar homogeneous parameters and element-indexed material vectors
+exist. They divide the local electric and magnetic residuals by
+\(\varepsilon_K\) and \(\mu_K\), equivalent to inversion of
+\(\varepsilon_KM_K\) and \(\mu_KM_K\) for constant coefficients. The
+Poisson-bracket flux does not use impedance weighting from the neighboring
+material. No anisotropic tensor or spatially varying within-element weighted
+mass is represented by this API. Material-ID lookup is merely a means of
+constructing elementwise scalar arrays.
+\src{src/PhysicalCoverage.jl}{maxwell_element_materials; maxwell_volume_rhs!}{1--79, 332--401}
+
+\section{Exact electric and magnetic residuals}\label{sec:residual}
+Define, for three scalar derivative/stiffness matrices,
+\begin{equation}\label{eq:curlblock}
+ \mathcal C(X,Y,Z)=
+ \begin{bmatrix}0&-Z&Y\\Z&0&-X\\-Y&X&0\end{bmatrix},
+ \qquad K_K=j_K\mathcal C(S_{K,x},S_{K,y},S_{K,z}).
+\end{equation}
+The transpose identity is
+\(\mathcal C(X^T,Y^T,Z^T)=-\mathcal C(X,Y,Z)^T\), because the cross-component
+signs also transpose. The magnetic code has a \emph{positive} addition of
+the curl built from \(S^T\), and this is exactly \(-K_K^T\), not \(+K_K^T\).
+\src{src/solver/kernels/maxwell.jl}{weak_curl_element!; maxwell_volume_rhs!(PoissonBracketFormulation)}{841--866, 997--1066}
+
+Write \(T_f=I_3\otimes R_f\),
+\(W_f^K=I_3\otimes(s_{Kf}W_f)\), and let \(N_f\) act nodewise as
+\(\n_K\times\). The complete local coefficient equations are
+\begin{align}
+ \varepsilon_K(I_3\otimes M_K)\dot e_K
+ &=K_Kh_K+\sum_f T_f^TW_f^K N_f(\widehat H-H^-),\label{eq:localE}\\
+ \mu_K(I_3\otimes M_K)\dot h_K
+ &=-K_K^Te_K-\sum_f T_f^TW_f^K N_f\widehat E.\label{eq:localH}
+\end{align}
+Here \(\widehat E,\widehat H\) denote vectors of face-node values. Stored flux
+buffers already include \(\varepsilon_K^{-1}\) or \(\mu_K^{-1}\); equations
+\eqref{eq:localE}--\eqref{eq:localH} have multiplied those factors back to
+the left. The lifting subsequently applies \eqref{eq:geomlift} once.
+
+Testing these matrices against coefficient vectors gives the exact weak
+description (under the integral/matrix consistency assumptions above):
+\begin{align}
+ (\varepsilon\dot\E_h,v)_K
+ &=(\curl\HH_h,v)_K+
+ \langle\n_K\times(\widehat\HH_h-\HH_h^-),v\rangle_{\partial K}\notag\\
+ &=(\HH_h,\curl v)_K+\langle\n_K\times\widehat\HH_h,v\rangle_{\partial K},\label{eq:weakE}\\
+ (\mu\dot\HH_h,w)_K
+ &=-(\E_h,\curl w)_K-\langle\n_K\times\widehat\E_h,w\rangle_{\partial K}\notag\\
+ &=-(\E_h,\curl w)_K+\langle\widehat\E_h,\n_K\times w\rangle_{\partial K}.\label{eq:weakH}
+\end{align}
+The second electric line uses \eqref{eq:curlgreen}. The magnetic surface
+term contains the full electric trace, not its jump correction, because
+the magnetic volume was already weak. Equivalently, using integration by
+parts on \eqref{eq:weakH} gives strong magnetic curl plus
+\(-\n\times(\widehat\E-\E^-)\). Mixing this strong correction with the
+implemented weak volume would count a boundary term incorrectly.
+
+\subsection{Centered and alternating traces}\label{sec:traces}
+Both supported conservative choices can be written with
+\(\alpha=1-\theta\):
+\begin{equation}\label{eq:hats}
+ \widehat\E=\alpha\E^-+\theta\E^+,\qquad
+ \widehat\HH=\theta\HH^-+\alpha\HH^+.
+\end{equation}
+Centered flux sets \(\theta=1/2\). The homogeneous alternating implementation
+sets
+\begin{equation}\label{eq:theta}
+ \theta(\n)=\begin{cases}1,&n_x+n_y+n_z>0,\\
+ 0,&n_x+n_y+n_z<0,\\1/2,&n_x+n_y+n_z=0.\end{cases}
+\end{equation}
+Thus faces with exactly zero sum revert to centered traces; the comparison
+has no tolerance. This is a fixed spatial orientation selection, not
+alternation in time and not selection by MPI rank or element number.
+There is no independently adjustable \(C_{12}\) or \(\beta\) parameter.
+One can derive \(\widehat\E=\{\E\}+(1/2-\theta)\Delta\E\) and
+\(\widehat\HH=\{\HH\}-(1/2-\theta)\Delta\HH\), but this does not introduce
+a new implemented user parameter.
+
+The actual buffer values are
+\begin{equation}\label{eq:buffers}
+ g_E=-\frac{\alpha}{\varepsilon_K}\n\times(\HH^--\HH^+),
+ \qquad g_H=-\frac1{\mu_K}\n\times(\alpha\E^-+\theta\E^+).
+\end{equation}
+\src{src/solver/kernels/maxwell_fluxes.jl}{poisson_bracket_alternating_theta; maxwell_poisson_bracket_surface_flux_values!}{167--180, 251--306}
+
+\subsection{Worked two-sided interface and permutation}
+Let \(\n=(1,0,0)\) point from element minus to plus. For alternating flux,
+\(\theta^-=1\), so \(\widehat E=E^+\), \(\widehat H=H^-\).
+The minus electric face buffer vanishes, while
+\(g_H^-=-\mu_-^{-1}(0,-E_z^+,E_y^+)\).
+On the plus side \(\n^+=-\n\), \(\theta^+=0\), and its own minus state is
+the original plus state. Hence
+\(g_E^+=\varepsilon_+^{-1}\n\times(H^+-H^-)\) and
+\(g_H^+=\mu_+^{-1}\n\times E^+\). The same physical traces were selected
+from both sides, with opposite surface orientation.
+
+If \(P_{ij}=1\) when \(j=\texttt{perm}[i]\), then plus values in minus
+ordering are \(P R_+u_+\). The code computes both sides in that ordering,
+then scatters the plus buffer using the inverse action \(P^T\), before the
+plus lift. In exact arithmetic a matching physical face satisfies
+\(s_-W_-=s_+PW_+P^T\). This is the face-mass compatibility needed below.
+\src{src/solver/kernels/trace_maps.jl}{match_face_node_permutation; build_dg_trace_maps}{54--170}
+\src{src/solver/kernels/maxwell.jl}{interior_face_traces!; unpermute_plus_face_values!}{356--376, 1159--1169}
+\src{src/solver/kernels/maxwell_fluxes.jl}{maxwell_interior_surface_face_rhs!(PoissonBracketFormulation)}{882--948}
+
+\subsection{Dispatch discrepancy: material-aware traces}\label{sec:dispatch}
+The wrappers \path{maxwell_material_face_flux!} and its allocating counterpart
+accept \path{PoissonBracketFormulation} but omit
+\path{flux_kind = formulation.flux_kind} when calling the Poisson-bracket
+flux routine. Its default is centered. Therefore the element-material path
+uses \(\theta=1/2\) even when its formulation object requests alternating
+flux. The same wrapper is called by material interior, boundary and
+distributed-periodic surface assembly. This affects constant material arrays
+as well as heterogeneous arrays. It does not affect the scalar homogeneous
+periodic path, which passes the selector explicitly.
+
+The report describes both executed operators. It does not silently insert
+the missing keyword. In particular, tests using the material overload under
+an alternating label are not evidence that true alternating traces passed.
+\src{src/PhysicalCoverage.jl}{maxwell_material_face_flux!; maxwell_material_face_flux}{254--274, 421--437}
+\src{src/PhysicalCoverage.jl}{add_material_interior_surface_rhs!; add_distributed_periodic_surface_rhs!}{439--508, 1361--1447}
+
+\section{Boundary conditions and forcing}\label{sec:bc}
+All boundary traces below use the outward normal of the computational
+material domain, including cavity/obstacle faces. Write
+\(v_t=v-\n(\n\cdot v)\) and \(Z=\sqrt{\mu/\varepsilon}\).
+\begin{longtable}{p{0.15\linewidth}p{0.75\linewidth}}
+\toprule Kind & Executed exterior state or action\\\midrule
+PEC & \(E^+=\n(\n\cdot E^-)-E_t^-\), \(H^+=H^-\).\\
+PMC & \(E^+=E^-\), \(H^+=\n(\n\cdot H^-)-H_t^-\).\\
+Absorbing & \(E^+=\n(\n\cdot E^-)-Z\n\times H^-\),
+\(H^+=\n(\n\cdot H^-)+Z^{-1}\n\times E^-\).\\
+None & No boundary face residual is added. This is not an outgoing or transparent boundary condition.\\
+\bottomrule
+\end{longtable}
+\src{src/solver/kernels/maxwell.jl}{pec_boundary_plus_trace!; pmc_boundary_plus_trace!; absorbing_boundary_plus_trace!}{411--514}
+
+\subsection{Homogeneous PEC and PMC}
+With centered traces, PEC gives \(\n\times\widehat E=0\) and
+\(\widehat H=H^-\). Both face buffers in \eqref{eq:buffers} vanish.
+PEC is still represented: the magnetic equation retains its weak volume,
+equivalent to the strong boundary correction \(+\n\times E^-\).
+Setting buffers to zero is not the same as removing PEC from a strong-form
+magnetic operator. The homogeneous scalar alternating boundary routine also
+returns immediately for PEC, overriding the interior orientation formula.
+
+Centered PMC gives \(\widehat E=E^-\),
+\(\n\times\widehat H=0\), so buffers are
+\(-\varepsilon^{-1}\n\times H^-\) and
+\(-\mu^{-1}\n\times E^-\). The homogeneous scalar alternating path rejects
+PMC and absorbing boundaries. By contrast the material path does not apply
+this restriction and uses centered traces because of Section~\ref{sec:dispatch}.
+These are dispatch-dependent facts, not an assertion of general alternating
+PMC support.
+\src{src/solver/kernels/maxwell_fluxes.jl}{maxwell_boundary_surface_face_rhs!(PoissonBracketFormulation)}{1199--1274}
+
+\subsection{Absorbing boundary power}
+Substitution of the absorbing ghost into centered flux gives
+\begin{align}
+ \varepsilon g_E&=-\tfrac12\n\times H^- -\tfrac1{2Z}E_t^-,\\
+ \mu g_H&=-\tfrac12\n\times E^- -\tfrac Z2H_t^-.
+\end{align}
+The skew cross terms cancel in the energy pairing, leaving boundary loss
+\begin{equation}\label{eq:absorbing}
+ \dot{\mathcal H}_h\big|_{\rm absorbing}
+ =-\int_{\partial\Omega_{\rm abs}}
+ \left(\frac{|E_t^-|^2}{2Z}+\frac Z2|H_t^-|^2\right)dS\le0.
+\end{equation}
+Integration here is the face mass pairing of the nodal tangential fields.
+This is a dissipative termination, not a closed skew bracket.
+
+\subsection{Incident-aware PEC and time dependence}
+On a scattered-field PEC boundary, the supplied incident electric field
+changes the exterior state by \(-2E_{{\rm inc},t}\). Therefore centered
+\(\widehat E_t=-E_{{\rm inc},t}\), \(\widehat H=H^-\), and the magnetic
+buffer gains \(\mu^{-1}\n\times E_{\rm inc}\). This weakly imposes
+\(\n\times(E_{\rm scat}+E_{\rm inc})=0\); it is not a nodal constraint
+on the interior polynomial. Boundary power is
+\(\int H^-\cdot(\n\times E_{\rm inc})\,dS\).
+
+Incident data are evaluated at physical face nodes at the mutable time
+in \path{MaxwellBoundaryData}; the face mass integrates their degree-p
+interpolant, not exact trigonometric boundary data. Scattering drivers use
+the material-aware RHS with these data. An alternating label there currently
+inherits the centered dispatch discrepancy, rather than proving a distinct
+incident alternating implementation.
+\src{src/solver/kernels/maxwell.jl}{MaxwellBoundaryData; pec_incident_boundary_plus_trace!}{265--315, 516--609}
+\src{src/PhysicalCoverage.jl}{add_material_boundary_surface_rhs!; maxwell_rhs!}{510--640}
+
+The generic ESPRK object stores composition weights, not classical RK
+abscissas. Its generic step repeatedly evaluates the full RHS and updates
+only the active field partition. It carries no physical-time argument.
+The sphere driver's timed wrapper maintains two clocks. Before the first
+partition's stage \(i\), it sets
+\(\tau_a=\tau_n+\Delta\tau\sum_{j<i}a_j\); before the second partition it
+sets \(\tau_b=\tau_n+\Delta\tau\sum_{j<i}b_j\). Each clock advances after
+its own nonzero update. For H-first splitting these are respectively the
+H and E clocks. Their values need not be monotone if weights are negative.
+The wrapper resets boundary time to \(\tau_n+\Delta\tau\) at the end.
+No classical \(c_i\) table should be inferred from these weights.
+\src{src/solver/kernels/time_integration.jl}{partitioned_symplectic_rk_step!}{535--578}
+\src{examples/distributed_metallic_sphere_scattering.jl}{timed_partitioned_symplectic_rk_step!}{1288--1335}
+
+\subsection{Periodic boundaries and PML are different mechanisms}
+Periodic boundaries are paired interfaces: no physical exterior state is
+manufactured. Plus points are translated to minus coordinates. Cartesian
+field components are unchanged by that translation. General rotations,
+nonmatching interpolation/mortars and curved periodic mappings are not
+implemented by this pairing. Periodic IDs must have kind None in the
+physical-boundary registry to avoid adding a second boundary residual.
+
+The nonlinear PML is a separate nodal source addition to the Maxwell RHS,
+not a periodic trace or a new face boundary enum. Its coefficients and
+nonlinearity invalidate the closed constant-bracket argument for the full
+PML dynamics. This report reconstructs the Maxwell spatial part used inside
+that path, without assigning Hamiltonian conservation to the PML sources.
+\src{src/PhysicalCoverage.jl}{pair_distributed_periodic_descriptors; maxwell_rhs_periodic!}{995--1070, 1449--1560}
+\src{src/NonlinearPML.jl}{add_maxwell_nonlinear_pml_source!; maxwell_nonlinear_pml_rhs!}{280--482}
+
+\section{Global assembly, bracket and energy}\label{sec:global}
+Let \(m=3N_pN_K\) count vector coefficients on all \emph{owned global}
+elements, without duplicate ghosts, and \(u=(e,h)\in\R^{2m}\). With
+consistent matching faces, homogeneous PEC/PMC or periodic closure, and
+either the true conservative trace pair or the actually executed centered
+material pair, the assembled system is
+\begin{equation}\label{eq:global}
+ \mathcal M\dot u=\mathcal A u,\quad
+ \mathcal M=\begin{bmatrix}M_E&0\\0&M_H\end{bmatrix},\quad
+ \mathcal A=\begin{bmatrix}0&C\\-C^T&0\end{bmatrix}.
+\end{equation}
+Here \(M_E=\operatorname{blockdiag}_K(\varepsilon_K I_3\otimes j_KM)\),
+similarly for \(M_H\); storage ordering can differ by a fixed permutation.
+\(C\) is the complete electric mass-weighted volume-plus-face operator,
+not an unweighted differentiation matrix. In the user's \(C_{HE}\) notation,
+\(C_{HE}=-C^T\). Boundary forcing adds a vector \(f(\tau)\) on the right;
+absorbing boundaries additionally add symmetric negative blocks.
+
+\begin{proposition}[Closed-interface energy identity]\label{prop:energy}
+Assume affine geometry, positive elementwise scalar materials, a fixed
+conforming mesh with matching face masses/permutations, consistent opposite
+normals, and homogeneous PEC/PMC or translational periodic closure.
+For the trace pair \eqref{eq:hats} with \(\theta(-\n)=1-\theta(\n)\), the
+real-arithmetic operator satisfies \(\mathcal A^T=-\mathcal A\).
+\end{proposition}
+\begin{proof}
+Volume blocks already have the pairing \((K_K,-K_K^T)\), so their energy
+production cancels without further integration by parts. On one interior
+face, align all values in minus ordering. Set \(\Delta H=H^--H^+\).
+The sum of electric face power from both elements is
+\begin{equation}
+ -\langle\alpha E^-+\theta E^+,\n\times\Delta H\rangle_f
+ =-\langle\widehat E,\n\times\Delta H\rangle_f.
+\end{equation}
+Magnetic face power is
+\(-\langle\Delta H,\n\times\widehat E\rangle_f
+=\langle\widehat E,\n\times\Delta H\rangle_f\), and cancels it.
+The equal physical face pairing on both sides is essential. The same proof
+applies across translated periodic interfaces. PEC face buffers vanish.
+PMC cross terms cancel pointwise. Since the operator is linear and its
+quadratic energy production vanishes for every coefficient vector, its
+symmetric part vanishes; the already explicit complementary field coupling
+then yields the block identity in \eqref{eq:global}.
+\end{proof}
+This argument separates algebraic energy cancellation from the stronger
+geometric integration-by-parts identities needed for consistency with the
+continuous differential operator. Floating-point material division and
+mass solves perturb both statements slightly.
+
+\subsection{Gradients and the finite-dimensional Poisson tensor}
+The implemented mass Hamiltonian is
+\begin{equation}\label{eq:hamiltonian}
+ \mathcal H_h(u)=\tfrac12u^T\mathcal M u,
+ \qquad \nabla_u\mathcal H_h=\mathcal M u.
+\end{equation}
+If a functional has coefficient gradient \(\nabla_e F\), the coefficients
+of its unweighted discrete \(L^2\) gradient are \(M_0^{-1}\nabla_e F\),
+and those of its material-weighted gradient are \(M_E^{-1}\nabla_e F\).
+The corresponding magnetic conversion uses \(M_H^{-1}\). This follows
+by equating \(dF=\nabla_eF^T\delta e\) to the chosen mass inner product.
+
+The correct coefficient Poisson tensor is therefore
+\begin{equation}\label{eq:J}
+ J_h=\mathcal M^{-1}\mathcal A\mathcal M^{-1}
+ =\begin{bmatrix}
+ 0&M_E^{-1}CM_H^{-1}\\
+ -M_H^{-1}C^TM_E^{-1}&0
+ \end{bmatrix},\quad
+ \dot u=J_h\nabla_u\mathcal H_h.
+\end{equation}
+It is not \(\mathcal M^{-1}\mathcal A\) itself. Define
+\(\{F,G\}_h=\nabla_u F^TJ_h\nabla_u G\).
+For \(L=\mathcal M^{-1}\mathcal A\), the equivalent weighted adjoint
+identity is \(\mathcal ML+L^T\mathcal M=0\).
+\src{src/solver/kernels/maxwell.jl}{maxwell_energy; maxwell_energy_rate}{1868--1921, 2011--2037}
+\src{src/PhysicalCoverage.jl}{maxwell_energy; distributed_maxwell_energy}{712--799}
+
+\begin{proposition}[Jacobi under fixed closed linear assumptions]
+Under Proposition~\ref{prop:energy}, with coefficients, geometry and face
+selection fixed independently of \(u\), \eqref{eq:J} defines a constant
+skew matrix. Its finite-dimensional bracket satisfies the Jacobi identity.
+\end{proposition}
+\begin{proof}
+The coordinate Jacobi condition is
+\(\sum_\ell(J_{i\ell}\partial_\ell J_{jk}
++J_{j\ell}\partial_\ell J_{ki}+J_{k\ell}\partial_\ell J_{ij})=0\).
+Every derivative is zero because the matrix is constant. Skew-symmetry,
+bilinearity and the Leibniz rule follow directly from the coefficient bracket.
+\end{proof}
+This is a conditional reconstruction of the fixed linear discretization,
+not a proof that every feature bearing the name Poisson bracket, including
+nonlinear PML or open boundaries, has this structure. The floating-point
+stored/evaluated operator need only approximate a skew matrix. A numerical
+skew check by itself is not a proof of a state-dependent Jacobi identity.
+
+\subsection{What time stepping can and cannot inherit}
+The conservative ESPRK update composes electric and magnetic shears.
+For the autonomous block system, each subflow changes only its own field
+using the opposite field, consistent with a split Hamiltonian. Exact
+preservation of quadratic energy by the \emph{composition} does not follow
+from semidiscrete skew-adjointness. Symplectic/Poisson structure, truncation
+error, long-time bounded energy oscillation and exact energy conservation
+are distinct assertions. Conversely, an exact linear null invariant of each
+partition survives exact-arithmetic linear updates; Float64 updates can
+accumulate small signed residuals. Dissipative source additions do not acquire
+symplecticity merely by using the same stepping routine.
+
+\section{Distributed-memory realization}\label{sec:mpi}
+\subsection{Mesh and ownership}
+The legacy VTK loader extracts four-vertex tetrahedra. The periodic driver
+reconstructs boundary triangles by counting sorted triples of tetrahedron
+vertices, infers box bounds, and labels xmin/xmax/ymin/ymax/zmin/zmax as
+1/2/3/4/5/6. It does not rely on a special PBC tag in the VTK file. Mesh
+partition files contain zero-based rank assignments, distinct from Julia's
+one-based local indices. Root distribution and cached per-rank mesh loading
+are both implemented.
+\src{src/MetisIO.jl}{read_mesh_file_tet_vtk}{27--163}
+\src{src/MaxwellDriverSupport.jl}{load_periodic_box_mesh; periodic_box_specs}{250--310}
+\src{src/DistributedIO.jl}{prepare_distributed_mesh_partition; build_distributed_dg_from_partition}{218--288, 365--385}
+
+An element belongs to one rank. Each rank also stores a face-adjacent halo.
+Local stored elements are sorted by global element ID, so owned elements
+must be accessed through \path{partition.owned}, not assumed to be the first
+columns. Vertex order within a copied tetrahedron is preserved. Local topology
+is rebuilt on owned and halo elements; ordinary partition interfaces then
+appear as local interior faces between an owned and ghost element. The
+distributed and solver face-numbering tables are reconciled by sorted global
+vertex keys, not by assuming equal face IDs.
+\src{src/DistributedMesh3D.jl}{build_ghost_global_elements_face_halo; build_distributed_mesh}{291--319, 762--823}
+\src{src/DistributedDG.jl}{local_mesh_from_distributed_mesh; find_solver_face; build_distributed_maxwell_exchange}{81--232}
+
+\subsection{An ordinary remote face, end to end}
+Suppose rank A owns element \(K\), and its neighbor \(L\) is owned by B.
+The exchange table identifies their common face by the sorted global vertex
+triple. Neighbor face lists are sorted by this key. Rank B packs, face by
+face, all six Cartesian field components, each in its native face-node order:
+\begin{equation}
+ [E_x(1{:}N_{fp}),E_y(1{:}N_{fp}),E_z(1{:}N_{fp}),
+ H_x(1{:}N_{fp}),H_y(1{:}N_{fp}),H_z(1{:}N_{fp})].
+\end{equation}
+Thus each directed interface transmits \(6N_{fp}\) Float64 values, not full
+element coefficients and not just tangential components. Rank A receives
+them into the same face-node ordering of its copied halo element \(L\).
+The ordinary local trace map then applies \(P\) to align \(L\)'s values with
+\(K\)'s face. This separation explains why unpacking itself has no extra
+permutation: the copied element has the original vertex ordering, and the
+solver trace map handles cross-element orientation.
+
+All receives and sends are nonblocking MPI calls with tag 24017, followed
+by \path{MPI.Waitall} before residual evaluation. There is no overlap of
+this exchange with volume computation in this path. The face kernel adds
+both local-element contributions, possibly including one ghost contribution.
+After assembly, all ghost RHS columns are zeroed. Only the owned contribution
+represents a global degree of freedom; no residual scatter-add to the other
+rank is required because that rank assembles its own owned side.
+\src{src/DistributedDG.jl}{pack_maxwell_interface!; unpack_maxwell_interface!; exchange_maxwell_ghost_traces!; zero_ghost_maxwell_rhs!}{620--731}
+
+\subsection{Periodic remote faces}
+Periodic descriptors are gathered to root and paired by translated
+centroids; node matching then constructs a bijective permutation, with
+area compatibility checked. Default tolerances are \(10^{-9}\) for
+centroids/nodes and relative \(10^{-10}\) for area. Pairing is broadcast.
+These routines store normals but do not explicitly reject nonopposite
+normals in the pairing function: the mathematical cancellation assumes
+valid oriented translated faces, and the independent checks must test it.
+
+Each rank stores directed descriptors only for its owned periodic faces.
+Same-rank partners are gathered directly. Remote partners communicate the
+same six face-component arrays, ordered by pair ID, with tag 24018 and
+offset \((i-1)6N_{fp}+1\). The received values are permuted into local
+face order before evaluating \eqref{eq:buffers}; only the local owned side
+is lifted. The inverse permutation is stored for the opposite side.
+If using material arrays, partner material values are included in setup
+metadata rather than exchanged every RHS.
+\src{src/PhysicalCoverage.jl}{build_distributed_periodic_maxwell_exchange; exchange_distributed_periodic_traces!; distributed_periodic_plus_trace!}{1083--1287, 1323--1359}
+
+Every RHS evaluation exchanges both E and H traces, even when an ESPRK
+substep will use only one field's RHS. The distributed periodic RHS performs
+ordinary exchange, periodic exchange, volume, ordinary faces, periodic
+faces, physical boundaries and ghost zeroing in that order. Global diagnostic
+sums include only owned elements and use MPI reductions. Equivalent global
+algebra across partitions is not a promise of bitwise reproducibility:
+summation order, face ordering and reduction trees can change rounding.
+\src{src/PhysicalCoverage.jl}{maxwell_rhs_periodic!}{1449--1560}
+
+\section{Divergence, charge, skeleton terms and null invariants}\label{sec:charge}
+Define the broken magnetic divergence coefficient map on each element as
+\begin{equation}
+ D_{b,K}h_K=\mu_K[D_{K,x}\;D_{K,y}\;D_{K,z}]h_K.
+\end{equation}
+Its squared L2 norm is \(\sum_K(D_{b,K}h_K)^Tj_KM(D_{b,K}h_K)\).
+Production quadrature diagnostics interpolate the same strong derivatives
+to integration points, sum squared values, and take a square root. Their
+reported infinity norm is a sampled maximum, not a certified continuous
+supremum. Neither derivative includes a numerical normal-flux lift.
+
+The signed magnetic-charge functional is exactly
+\begin{equation}\label{eq:charge}
+ Q_H=\sum_K\mu_Kj_K\mathbf1^TM
+ [D_{K,x}\;D_{K,y}\;D_{K,z}]h_K=c_H^Th=q_H^TM_Hh,
+ \qquad q_H=M_H^{-1}c_H.
+\end{equation}
+This is what \path{distributed_strong_magnetic_charge} computes, followed
+by an owned-element MPI sum. Evaluating the same routine on the magnetic
+RHS gives
+\begin{equation}\label{eq:qnull}
+ \dot Q_H=c_H^TM_H^{-1}C_{HE}e=q_H^TC_{HE}e.
+\end{equation}
+The global null condition is \(q_H^TC_{HE}=0\); the much stronger local
+condition is \(D_bM_H^{-1}C_{HE}=0\). A small value of the signed expression
+for a few electric states does not prove either full matrix identity.
+\src{src/MaxwellDiagnostics.jl}{local_strong_magnetic_charge_from_components; distributed_strong_magnetic_charge_derivative}{217--297}
+
+By elementwise divergence theorem, \eqref{eq:charge} can alternatively be
+written as the sum of interior/periodic \emph{normal jumps} plus physical
+boundary normal fields. This is a representation of the same signed
+functional, not an additional correction that should be added to it. A
+different DG divergence defined through a single-valued numerical normal
+trace is not specified by the tangential Maxwell flux routines. It must
+not be invented and then attributed to the implementation.
+
+The RHS breakdown separately applies this signed functional to the volume,
+ordinary-face, periodic-face and physical-boundary RHS pieces. Its ``face
+contributions'' are contributions to \(\dot Q_H\), not an independently
+defined skeleton charge that repairs \(Q_H\). It currently uses the material
+overload, so the flux-dispatch caveat also applies to alternating-labeled
+breakdown tests.
+\src{src/MaxwellDiagnostics.jl}{distributed_magnetic_charge_rhs_breakdown}{299--415}
+
+\subsection{What would qualify as a Casimir?}
+For a coefficient-linear functional \(C_0(u)=c^Tu\), being a Casimir of
+\eqref{eq:J} requires \(c^TJ_h=0\), independently of the Hamiltonian.
+Conservation only along a particular trajectory is weaker. Conservation for
+\emph{all} states under the quadratic Hamiltonian here, however, means
+\(c^TJ_h\mathcal M u=0\) for every \(u\); because \(\mathcal M\) is
+invertible, it implies \(c^TJ_h=0\) under the closed constant-skew assumptions.
+The distinction is therefore between a verified full identity and a few
+observed trajectories, as well as between closed and forced/dissipative paths.
+This report calls the monitored quantity a \emph{candidate null invariant}
+unless that identity is established for the stated mesh and operator.
+
+Curl-potential initialization imposes \(D_bh(0)\simeq0\) on affine elements
+but does not change \(D_bM_H^{-1}C_{HE}\). The long-time run documented in
+\path{docs/numerics/magnetic_charge_longtime_analysis.md} exhibits precisely
+this distinction: local divergence grows to order one while signed charge
+drifts only slightly. That report's checkpoint/replay numbers are separate
+evidence, not rerun measurements in this operator audit.
+\src{src/MaxwellInitialization.jl}{initialize_magnetic_from_potential!; magnetic_initialization_diagnostics}{41--169}
+
+Momentum, angular momentum and chirality use further quadratic/derivative
+functionals, not just the Hamiltonian matrix. Their preservation requires
+their own algebraic identities. In the quadrature diagnostics momentum is
+the integral of \(\varepsilon\mu\E\times\HH\), angular momentum includes
+the position cross product, and chirality uses the broken curls in
+\(\tfrac12(\varepsilon\E\cdot\curl\E+\mu\HH\cdot\curl\HH)\).
+Antisymmetry of \(J_h\) alone does not preserve these functionals. Position
+weighting also requires care with periodic-cell boundary fluxes.
+
+\section{A fully explicit degree-one example}\label{sec:p1}
+Use the equispaced ordering \(v_4,v_3,v_2,v_1\). The nodal row basis is
+\begin{equation}
+ \ell=\tfrac12(t+1,\ s+1,\ r+1,\ -1-r-s-t).
+\end{equation}
+Its reference matrices, derived by simplex moments, are
+\begin{equation}\label{eq:p1mass}
+ M=\frac1{15}\begin{bmatrix}2&1&1&1\\1&2&1&1\\1&1&2&1\\1&1&1&2\end{bmatrix},
+ \quad M^{-1}=15I-3\mathbf1\mathbf1^T,
+\end{equation}
+\begin{equation}
+ D_r=\mathbf1[0,0,1/2,-1/2],\quad
+ D_s=\mathbf1[0,1/2,0,-1/2],\quad
+ D_t=\mathbf1[1/2,0,0,-1/2].
+\end{equation}
+Each row of \(S_r=MD_r\) is \([0,0,1/6,-1/6]\), similarly for the other
+directions. Notice the factor \(1/3\) from the mass row sum.
+
+For face 4, the ordered volume node IDs are \((3,2,4)\), corresponding to
+triangle nodes \((a,b)=(-1,1),(1,-1),(-1,-1)\). Its matrices are
+\begin{equation}
+ R_4=\begin{bmatrix}0&0&1&0\\0&1&0&0\\0&0&0&1\end{bmatrix},\quad
+ W_4=\frac16\begin{bmatrix}2&1&1\\1&2&1\\1&1&2\end{bmatrix},\quad
+ L_4=\begin{bmatrix}-2&-2&-2\\1/2&3&1/2\\3&1/2&1/2\\1/2&1/2&3\end{bmatrix}.
+\end{equation}
+For example \(L_4\mathbf1=(-6,4,4,4)^T\); a constant face forcing affects
+all four volume coefficients, including the off-face node.
+
+Take physical vertices \((0,0,0),(2,0,0),(0,1,0),(0,0,1)\). Then
+\(J=\operatorname{diag}(1,1/2,1/2)\), \(j=1/4\),
+\(D_x=D_r,D_y=2D_s,D_z=2D_t\), and \(M_K=M/4\).
+Face 4 has physical area 1, so \(s_{K4}=1/2\) and its physical lift is
+\(2L_4\). All these numbers are hand-derived for this mapping.
+
+For \(H=(0,0,y)\), the nodal \(H_z\) values are \((0,1,0,0)^T\).
+The electric x-volume residual is
+\(\varepsilon^{-1}M^{-1}(2S_s)H_z
+=\varepsilon^{-1}\mathbf1\), agreeing with \(\curl H=(1,0,0)\).
+For \(E=(0,0,y)\), the weak magnetic x-volume residual is instead
+\begin{equation}
+ \mu^{-1}M^{-1}(2S_s^T)E_z
+ =\mu^{-1}(0,5,0,-5)^T.
+\end{equation}
+It must \emph{not} be mistaken for the complete negative strong curl.
+If the numerical electric trace equals the interior trace on all faces,
+the missing surface terms change this vector to
+\(-\mu^{-1}\mathbf1\), by \eqref{eq:sbp}. This explicit example exposes
+why the magnetic volume and surface terms must be audited together.
+
+\section{Independent verification}\label{sec:verification}
+The accompanying \path{verify_operator.jl} is a diagnostic, not a production
+replacement. It constructs the matrices in \eqref{eq:localE}--\eqref{eq:localH}
+independently of the production flux and lift routines, then applies the
+actual matrix-free RHS to every coefficient basis vector on six- and
+twelve-tetrahedron unit cubes. The assembled comparison is \(\mathcal ML_{\rm actual}\) versus
+the independently reconstructed \(\mathcal A\). This checks every column
+for these small problems, rather than a single random vector.
+
+Reference checks cover both nodal families at degrees 1--4, constants,
+coordinates, positive mass eigenvalues, integration by parts, face moments,
+and skew affine maps with both determinant signs. Diagnostic cubature checks
+cover all unit-simplex monomials up to orders 2, 4 and 8. Small global checks
+cover degrees 1 and 2, periodic centered/alternating, PEC centered/alternating,
+PMC centered, and absorbing centered on six tetrahedra. The twelve-element
+periodic cases add interior faces on which the alternating selector is
+noncentral; a degree-one heterogeneous PEC case checks material-weighted
+mass inversion. Distributed checks use twelve tetrahedra, degrees 1--3,
+and compare all owned
+RHS coefficients against serial execution with poisoned ghost coefficients,
+using both nodal families and true homogeneous flux selections. They also
+measure the material-wrapper discrepancy separately. The serial comparisons
+are globally reduced maxima; material-dispatch difference rows in the CSV
+are measurements on rank zero's local arrays, not global maxima.
+
+Reference residual tolerances are
+\(2000\epsilon_{\rm mach}\max(1,\kappa_2(V)^2)\), increased by five for the
+skew physical-map checks. Matrix reconstruction and skew tests use
+\(3\times10^{-12}\) after scaling by \(\max(1,\|\mathcal A\|_\infty)\).
+The MPI owned-entry maximum difference has tolerance \(2\times10^{-10}\).
+These are deliberately conservative small-test tolerances, not measured
+errors. The charge row residual is normalized by
+\(\max(1,\|c_H^T\|_1\|L_{HE}\|_\infty)\); local divergence uses the
+unscaled induced infinity norm \(\|D_bL_{HE}\|_\infty\).
+Measured values and execution status are recorded in the CSV files and audit.
+A CSV tolerance of NaN denotes a measurement, not a pass/fail criterion;
+the corresponding \texttt{pass=true} is vacuous and must not be read as
+an assertion that, for example, the broken divergence operator is null.
+The pre-existing reference-node test file also passed all 761 assertions.
+It emitted a modal-orthonormality warning of \(1.38\times10^{-9}\) during
+its higher-degree construction; the saved log retains that warning.
+\input{verification_summary.tex}
+
+\section{Discrepancies and limitations}\label{sec:limitations}
+\begin{enumerate}
+\item Material-aware alternating requests execute centered traces because
+the wrapper omits the flux selector. Production code was intentionally left
+unchanged. Earlier alternating-labeled material tests cannot establish true
+alternating behavior.
+\item The alternative face-quadrature helper attempts to broadcast a row
+matrix into a vector slice in \path{eval_nodal_basis_at_points}. The audit
+records the resulting \path{DimensionMismatch}. Active face mass construction
+uses triangular Gram matrices instead and does not call that helper.
+\item The older \path{docs/math/maxwell_poisson_bracket_formulation.tex},
+line 134, says alternating is not an exposed production option. The current
+scalar path does expose it. This report supersedes that particular statement,
+without rewriting unrelated documentation.
+\item No within-element anisotropic material, curved metric, nonmatching
+periodic mortar or Piola-conforming field representation is reconstructed
+because none is implemented on this path.
+\item Pairing verifies translated nodes/area but not a separate opposite-normal
+condition. Valid mesh geometry remains an assumption; passing small MPI tests
+does not certify arbitrary supplied meshes.
+\item The monitored signed charge and local broken divergence are different
+functionals. No universal local divergence-preservation claim follows from
+energy or signed-charge cancellation. General-mesh charge-null proofs remain
+separate from the finite meshes tested here.
+\item Closed, constant-coefficient-matrix Jacobi follows from a derivation;
+PML, absorbing termination and externally forced evolution are not covered
+by that closed Poisson claim. Fully discrete energy conservation is not
+claimed for ESPRK.
+\end{enumerate}
+
+\appendix
+\section{Mathematical-object-to-code map}
+All paths below are relative to the repository root. Earlier source blocks
+give function names and exact ranges; this table is a compact navigation aid.
+\small
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.27\linewidth}p{0.65\linewidth}}
+\toprule Object / operation & Executable location\\\midrule\endhead
+Reference vertices, field layouts & \path{src/solver/data_containers.jl}, 88--164, 337--401.\\
+Gram, basis, mass, stiffness & \path{src/solver/kernels/reference_tet.jl}, 426--646, 769--848.\\
+Face restriction, face mass, lift & \path{src/solver/kernels/face_operators.jl}, 243--268, 734--972.\\
+Affine metrics, physical derivatives & \path{src/solver/kernels/metrics.jl}, 7--98; \path{src/solver/kernels/physical_operators.jl}, 6--80.\\
+Normal orientation and areas & \path{src/solver/kernels/geometry.jl}, 113--148.\\
+Volume curl and adjoint curl & \path{src/solver/kernels/maxwell.jl}, 841--866, 997--1066.\\
+Conservative trace pair & \path{src/solver/kernels/maxwell_fluxes.jl}, 102--180, 251--320.\\
+Two-sided assembly & \path{src/solver/kernels/maxwell_fluxes.jl}, 882--948, 1042--1108.\\
+Boundary ghosts and incident forcing & \path{src/solver/kernels/maxwell.jl}, 411--609.\\
+Material dispatch & \path{src/PhysicalCoverage.jl}, 254--274, 421--640.\\
+Ordinary MPI halo exchange & \path{src/DistributedDG.jl}, 181--232, 620--731.\\
+Periodic pairing and assembly & \path{src/PhysicalCoverage.jl}, 995--1560.\\
+Signed charge and split RHS diagnostics & \path{src/MaxwellDiagnostics.jl}, 217--415.\\
+Diagnostic cubature and invariants & \path{src/MaxwellDiagnostics.jl}, 417--780; \path{src/solver/kernels/JaskowiecSukumar.jl}.\\
+ESPRK partition updates & \path{src/solver/kernels/time_integration.jl}, 291--369, 535--578.\\
+Timed incident data & \path{examples/distributed_metallic_sphere_scattering.jl}, 1288--1335.\\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\clearpage
+\section{Reproducibility and interpretation of the audit}
+The accompanying files are \path{implementation_audit.md},
+\path{verify_operator.jl}, \path{checks_rank1.csv}, \path{checks_rank2.csv},
+\path{checks_rank4.csv}, and \path{provenance.txt}. The hash inventory covers
+the source files on which the derivation depends; local modifications are
+part of the snapshot. No repository source or test was repaired for this
+report. The diagnostic's own development corrections do not modify the
+operator under audit.
+
+The executed environment was Julia 1.10.11, MPI.jl 0.20.23 with MPICH 4.3.1
+(ch3/nemesis), and ILP64 OpenBLAS. Julia and BLAS each used one thread per
+MPI process. The provenance can be refreshed, without modifying solver
+files, using the included \path{capture_provenance.py} script; doing so
+creates a new snapshot rather than reproducing the old one.
+
+From the repository root, with a matching MPI launcher:
+\begin{lstlisting}
+export OPENBLAS_NUM_THREADS=1 JULIA_NUM_THREADS=1 OMP_NUM_THREADS=1
+julia --project=. --compiled-modules=no \
+  docs/math/poisson_bracket_implementation/verify_operator.jl /tmp/pb_rank1.csv
+julia --project=. --compiled-modules=no -e '
+using MPI
+run(`$(MPI.mpiexec()) -n 2 $(Base.julia_cmd()) --project=. --compiled-modules=no docs/math/poisson_bracket_implementation/verify_operator.jl /tmp/pb_rank2.csv`)
+'
+# Repeat with -n 4 for the four-rank comparison.
+\end{lstlisting}
+Compile from the document directory with
+\begin{lstlisting}
+pdflatex -interaction=nonstopmode -halt-on-error poisson_bracket_implementation.tex
+pdflatex -interaction=nonstopmode -halt-on-error poisson_bracket_implementation.tex
+\end{lstlisting}
+These checks audit a fixed linear spatial operator. They are not a full
+convergence study, a PML validation, a high-degree conditioning survey or a
+proof for every admissible tetrahedral mesh. Numerical verification supports
+the source derivation only within its explicitly recorded scope.
+\end{document}

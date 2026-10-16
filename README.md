@@ -22,6 +22,25 @@ The package currently combines:
 
 ## Layout
 
+Optional elementwise divergence-free magnetic initialization is available in
+the periodic experiment and convergence drivers with
+`--magnetic-initialization=curl-potential`. The default remains `interpolate`.
+The independent electric counterpart is `--electric-initialization=curl-potential`,
+constructing `D=curl(A_E)` and `E=D/epsilon`. Both options can be enabled together;
+they ensure only elementwise divergence-free initialization, not preservation
+during time evolution.
+See [the construction, MPI behavior, and limitations](docs/numerics/magnetic_curl_initialization.md).
+
+The optional [periodic invariant audit](docs/numerics/maxwell_invariant_audit.md)
+separates broken divergence, normal jumps, weak gradient functionals, RHS
+residuals, ESPRK updates and diagnostic arithmetic. It includes fixed-time and
+fixed-step campaigns, Float64/BigFloat operator checks, MPI tests and signed
+drift plots, without changing the production numerical method.
+
+Quadrature histories also include the six [integrated D/B components](docs/numerics/integrated_field_diagnostics.md).
+These test the fields against constant Cartesian vectors; they are not
+divergence-based charges and do not replace the existing charge diagnostics.
+
 - `src/solver/`: serial/threaded solver kernels migrated from DiscoG3D.
 - `src/DistributedMesh3D.jl`: distributed mesh and halo topology.
 - `src/TraceMaps.jl`: MPI trace communication and face permutations.
@@ -178,6 +197,16 @@ mpiexec -n 2 julia --project=. \
   --nx-targets=4,8,16 --orders=2,3,4 --periods=1 \
   --output=output/convergence_distributed_periodic_poisson_bracket.csv
 ```
+
+The convergence drivers support configurable error sampling. Use
+`--error-mode=final` for the usual final-time spatial convergence norm, or
+`--error-mode=max-time --error-every=N` to approximate the maximum-in-time
+norm from samples every `N` steps (the initial and final states are always
+included). A single order and mesh may be run as an independent scheduler job,
+for example `--orders=4 --nx-targets=16`; the resulting one-row CSV has a
+`NO_PAIR` rate and can be merged with the other levels by
+`postprocess_distributed_convergence.py`. The cavity driver analogously accepts
+a single `--cells=N`, or `--mesh-levels=L` for an unstructured mesh.
 
 Rank zero invokes Gmsh on
 `examples/meshes/periodic_box_unstructured.geo` with the requested

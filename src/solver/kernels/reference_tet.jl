@@ -52,6 +52,377 @@ function equispaced_tet_nodes(N::Int)
     return r, s, t
 end
 
+const WARP_BLEND_TET_ALPHA = [
+    0.0,
+    0.0,
+    0.0,
+    0.1002,
+    1.1332,
+    1.5608,
+    1.3413,
+    1.2577,
+    1.1603,
+    1.10153,
+    0.6080,
+    0.4523,
+    0.8856,
+    0.8717,
+    0.9655,
+]
+
+function canonical_tet_nodal_set(nodal_set::Symbol)
+    if nodal_set in (:equispaced, :equi, :uniform)
+        return :equispaced
+    elseif nodal_set in (:warp_blend, :warpblend, :hesthaven_warburton)
+        return :warp_blend
+    else
+        throw(
+            ArgumentError(
+                "Unknown tetrahedral nodal set $nodal_set. " *
+                "Use :equispaced or :warp_blend.",
+            ),
+        )
+    end
+end
+
+function warp_blend_tet_alpha(N::Int)
+    N <= 0 && return 0.0
+    N <= length(WARP_BLEND_TET_ALPHA) && return WARP_BLEND_TET_ALPHA[N]
+    return 1.0
+end
+
+function legendre_p_and_derivative(N::Int, x::Float64)
+    if N < 0
+        throw(ArgumentError("Legendre degree must be nonnegative."))
+    elseif N == 0
+        return 1.0, 0.0
+    elseif N == 1
+        return x, 1.0
+    end
+
+    pnm2 = 1.0
+    pnm1 = x
+
+    for n in 2:N
+        pn = ((2n - 1) * x * pnm1 - (n - 1) * pnm2) / n
+        pnm2, pnm1 = pnm1, pn
+    end
+
+    dPn = N * (pnm2 - x * pnm1) / (1.0 - x^2)
+    return pnm1, dPn
+end
+
+function gauss_lobatto_legendre_nodes(N::Int)
+    if N < 0
+        throw(ArgumentError("Gauss-Lobatto-Legendre order must be nonnegative."))
+    elseif N == 0
+        return [0.0]
+    elseif N == 1
+        return [-1.0, 1.0]
+    end
+
+    nodes = Vector{Float64}(undef, N + 1)
+    nodes[1] = -1.0
+    nodes[end] = 1.0
+
+    for i in 1:(N - 1)
+        x = -cospi(i / N)
+
+        for _ in 1:50
+            Pn, dPn = legendre_p_and_derivative(N, x)
+            ddPn = (2.0 * x * dPn - N * (N + 1) * Pn) / (1.0 - x^2)
+            dx = dPn / ddPn
+            x -= dx
+
+            abs(dx) <= 64eps(Float64) * max(1.0, abs(x)) && break
+        end
+
+        nodes[i + 1] = x
+    end
+
+    sort!(nodes)
+    return nodes
+end
+
+function hesthaven_warburton_equi_tet_nodes(N::Int)
+    Np = num_tet_nodes(N)
+
+    r = Vector{Float64}(undef, Np)
+    s = Vector{Float64}(undef, Np)
+    t = Vector{Float64}(undef, Np)
+
+    if N == 0
+        r[1] = -0.5
+        s[1] = -0.5
+        t[1] = -0.5
+        return r, s, t
+    end
+
+    sk = 1
+    for n in 1:(N + 1)
+        for m in 1:(N + 2 - n)
+            for q in 1:(N + 3 - n - m)
+                r[sk] = -1.0 + 2.0 * (q - 1) / N
+                s[sk] = -1.0 + 2.0 * (m - 1) / N
+                t[sk] = -1.0 + 2.0 * (n - 1) / N
+                sk += 1
+            end
+        end
+    end
+
+    return r, s, t
+end
+
+function edge_warp_factor(N::Int, xnodes::Vector{Float64}, xout::Vector{Float64})
+    warp = zeros(Float64, length(xout))
+    N <= 0 && return warp
+
+    xeq = [-1.0 + 2.0 * (N + 1 - i) / N for i in 1:(N + 1)]
+
+    for i in 1:(N + 1)
+        d = fill(xnodes[i] - xeq[i], length(xout))
+
+        for j in 2:N
+            if i != j
+                d .*= (xout .- xeq[j]) ./ (xeq[i] - xeq[j])
+            end
+        end
+
+        if i != 1
+            d .*= -1.0 / (xeq[i] - xeq[1])
+        end
+
+        if i != (N + 1)
+            d .*= 1.0 / (xeq[i] - xeq[end])
+        end
+
+        warp .+= d
+    end
+
+    return warp
+end
+
+function eval_shift_2d(N::Int, alpha::Float64, L1, L2, L3)
+    gaussX = -gauss_lobatto_legendre_nodes(N)
+
+    blend1 = L2 .* L3
+    blend2 = L1 .* L3
+    blend3 = L1 .* L2
+
+    warpfactor1 = 4.0 .* edge_warp_factor(N, gaussX, L3 .- L2)
+    warpfactor2 = 4.0 .* edge_warp_factor(N, gaussX, L1 .- L3)
+    warpfactor3 = 4.0 .* edge_warp_factor(N, gaussX, L2 .- L1)
+
+    warp1 = blend1 .* warpfactor1 .* (1.0 .+ (alpha .* L1).^2)
+    warp2 = blend2 .* warpfactor2 .* (1.0 .+ (alpha .* L2).^2)
+    warp3 = blend3 .* warpfactor3 .* (1.0 .+ (alpha .* L3).^2)
+
+    dx =
+        warp1 .+
+        cos(2.0 * pi / 3.0) .* warp2 .+
+        cos(4.0 * pi / 3.0) .* warp3
+    dy =
+        sin(2.0 * pi / 3.0) .* warp2 .+
+        sin(4.0 * pi / 3.0) .* warp3
+
+    return dx, dy
+end
+
+function normalize_tuple3(v::NTuple{3, Float64})
+    nrm = sqrt(v[1]^2 + v[2]^2 + v[3]^2)
+    nrm > 0.0 || throw(ArgumentError("Cannot normalize a zero vector."))
+    return (v[1] / nrm, v[2] / nrm, v[3] / nrm)
+end
+
+function equilateral_to_reference_tet(
+    X::Vector{Float64},
+    Y::Vector{Float64},
+    Z::Vector{Float64},
+)
+    v1 = (-1.0, -1.0 / sqrt(3.0), -1.0 / sqrt(6.0))
+    v2 = (1.0, -1.0 / sqrt(3.0), -1.0 / sqrt(6.0))
+    v3 = (0.0, 2.0 / sqrt(3.0), -1.0 / sqrt(6.0))
+    v4 = (0.0, 0.0, 3.0 / sqrt(6.0))
+
+    A = [
+        0.5 * (v2[1] - v1[1]) 0.5 * (v3[1] - v1[1]) 0.5 * (v4[1] - v1[1])
+        0.5 * (v2[2] - v1[2]) 0.5 * (v3[2] - v1[2]) 0.5 * (v4[2] - v1[2])
+        0.5 * (v2[3] - v1[3]) 0.5 * (v3[3] - v1[3]) 0.5 * (v4[3] - v1[3])
+    ]
+
+    offset = 0.5 .* (
+        (
+            v2[1] + v3[1] + v4[1] - v1[1],
+            v2[2] + v3[2] + v4[2] - v1[2],
+            v2[3] + v3[3] + v4[3] - v1[3],
+        )
+    )
+
+    Np = length(X)
+    r = Vector{Float64}(undef, Np)
+    s = Vector{Float64}(undef, Np)
+    t = Vector{Float64}(undef, Np)
+
+    for n in 1:Np
+        rst = A \ [X[n] - offset[1], Y[n] - offset[2], Z[n] - offset[3]]
+        r[n] = rst[1]
+        s[n] = rst[2]
+        t[n] = rst[3]
+    end
+
+    return r, s, t
+end
+
+function warp_blend_tet_nodes(N::Int)
+    if N < 0
+        error("Polynomial order N must be nonnegative.")
+    elseif N == 0
+        return equispaced_tet_nodes(N)
+    end
+
+    alpha = warp_blend_tet_alpha(N)
+    r, s, t = hesthaven_warburton_equi_tet_nodes(N)
+
+    L1 = (1.0 .+ t) ./ 2.0
+    L2 = (1.0 .+ s) ./ 2.0
+    L3 = .-(1.0 .+ r .+ s .+ t) ./ 2.0
+    L4 = (1.0 .+ r) ./ 2.0
+
+    v1 = (-1.0, -1.0 / sqrt(3.0), -1.0 / sqrt(6.0))
+    v2 = (1.0, -1.0 / sqrt(3.0), -1.0 / sqrt(6.0))
+    v3 = (0.0, 2.0 / sqrt(3.0), -1.0 / sqrt(6.0))
+    v4 = (0.0, 0.0, 3.0 / sqrt(6.0))
+
+    Np = length(r)
+    X = Vector{Float64}(undef, Np)
+    Y = Vector{Float64}(undef, Np)
+    Z = Vector{Float64}(undef, Np)
+
+    for n in 1:Np
+        X[n] = L3[n] * v1[1] + L4[n] * v2[1] + L2[n] * v3[1] + L1[n] * v4[1]
+        Y[n] = L3[n] * v1[2] + L4[n] * v2[2] + L2[n] * v3[2] + L1[n] * v4[2]
+        Z[n] = L3[n] * v1[3] + L4[n] * v2[3] + L2[n] * v3[3] + L1[n] * v4[3]
+    end
+
+    t1 = [
+        normalize_tuple3((v2[1] - v1[1], v2[2] - v1[2], v2[3] - v1[3])),
+        normalize_tuple3((v2[1] - v1[1], v2[2] - v1[2], v2[3] - v1[3])),
+        normalize_tuple3((v3[1] - v2[1], v3[2] - v2[2], v3[3] - v2[3])),
+        normalize_tuple3((v3[1] - v1[1], v3[2] - v1[2], v3[3] - v1[3])),
+    ]
+
+    t2 = [
+        normalize_tuple3((v3[1] - 0.5 * (v1[1] + v2[1]), v3[2] - 0.5 * (v1[2] + v2[2]), v3[3] - 0.5 * (v1[3] + v2[3]))),
+        normalize_tuple3((v4[1] - 0.5 * (v1[1] + v2[1]), v4[2] - 0.5 * (v1[2] + v2[2]), v4[3] - 0.5 * (v1[3] + v2[3]))),
+        normalize_tuple3((v4[1] - 0.5 * (v2[1] + v3[1]), v4[2] - 0.5 * (v2[2] + v3[2]), v4[3] - 0.5 * (v2[3] + v3[3]))),
+        normalize_tuple3((v4[1] - 0.5 * (v1[1] + v3[1]), v4[2] - 0.5 * (v1[2] + v3[2]), v4[3] - 0.5 * (v1[3] + v3[3]))),
+    ]
+
+    shiftX = zeros(Float64, Np)
+    shiftY = zeros(Float64, Np)
+    shiftZ = zeros(Float64, Np)
+    tol = 1e-10
+
+    for face in 1:4
+        if face == 1
+            La, Lb, Lc, Ld = L1, L2, L3, L4
+        elseif face == 2
+            La, Lb, Lc, Ld = L2, L1, L3, L4
+        elseif face == 3
+            La, Lb, Lc, Ld = L3, L1, L4, L2
+        else
+            La, Lb, Lc, Ld = L4, L1, L3, L2
+        end
+
+        warp1, warp2 = eval_shift_2d(N, alpha, Lb, Lc, Ld)
+
+        blend = Lb .* Lc .* Ld
+        denom = (Lb .+ 0.5 .* La) .* (Lc .+ 0.5 .* La) .* (Ld .+ 0.5 .* La)
+
+        for n in 1:Np
+            if denom[n] > tol
+                blend[n] =
+                    (1.0 + (alpha * La[n])^2) * blend[n] / denom[n]
+            end
+        end
+
+        for n in 1:Np
+            bx = blend[n] * warp1[n]
+            by = blend[n] * warp2[n]
+            shiftX[n] += bx * t1[face][1] + by * t2[face][1]
+            shiftY[n] += bx * t1[face][2] + by * t2[face][2]
+            shiftZ[n] += bx * t1[face][3] + by * t2[face][3]
+        end
+
+        for n in 1:Np
+            nonzero_face_coords =
+                (Lb[n] > tol ? 1 : 0) +
+                (Lc[n] > tol ? 1 : 0) +
+                (Ld[n] > tol ? 1 : 0)
+
+            if La[n] < tol && nonzero_face_coords < 3
+                shiftX[n] = warp1[n] * t1[face][1] + warp2[n] * t2[face][1]
+                shiftY[n] = warp1[n] * t1[face][2] + warp2[n] * t2[face][2]
+                shiftZ[n] = warp1[n] * t1[face][3] + warp2[n] * t2[face][3]
+            end
+        end
+    end
+
+    X .+= shiftX
+    Y .+= shiftY
+    Z .+= shiftZ
+
+    return equilateral_to_reference_tet(X, Y, Z)
+end
+
+function tetrahedral_nodes(N::Int; nodal_set::Symbol = :equispaced)
+    family = canonical_tet_nodal_set(nodal_set)
+
+    if family == :equispaced
+        return equispaced_tet_nodes(N)
+    elseif family == :warp_blend
+        return warp_blend_tet_nodes(N)
+    end
+
+    error("Unhandled tetrahedral nodal set $nodal_set.")
+end
+
+function reference_tet_nodes_are_equispaced(ref::ReferenceTet; tol::Float64 = 1e-10)
+    if ref.N == 0
+        return ref.Np == 1 &&
+               abs(ref.r[1] + 0.5) <= tol &&
+               abs(ref.s[1] + 0.5) <= tol &&
+               abs(ref.t[1] + 0.5) <= tol
+    end
+
+    seen = Set{NTuple{4, Int}}()
+
+    for node in 1:ref.Np
+        lambda2_float = ref.N * (ref.r[node] + 1.0) / 2.0
+        lambda3_float = ref.N * (ref.s[node] + 1.0) / 2.0
+        lambda4_float = ref.N * (ref.t[node] + 1.0) / 2.0
+
+        lambda2 = round(Int, lambda2_float)
+        lambda3 = round(Int, lambda3_float)
+        lambda4 = round(Int, lambda4_float)
+        lambda1 = ref.N - lambda2 - lambda3 - lambda4
+
+        if abs(lambda2_float - lambda2) > tol ||
+           abs(lambda3_float - lambda3) > tol ||
+           abs(lambda4_float - lambda4) > tol ||
+           lambda1 < 0 ||
+           lambda2 < 0 ||
+           lambda3 < 0 ||
+           lambda4 < 0
+            return false
+        end
+
+        push!(seen, (lambda1, lambda2, lambda3, lambda4))
+    end
+
+    return length(seen) == ref.Np
+end
+
 function monomial_exponents_3d(N::Int)
     exps = NTuple{3, Int}[]
 
@@ -395,10 +766,10 @@ function build_reference_stiffness_matrix(
     return S
 end
 
-function build_reference_tet(N::Int)
+function build_reference_tet(N::Int; nodal_set::Symbol = :equispaced)
     Np = num_tet_nodes(N)
 
-    r, s, t = equispaced_tet_nodes(N)
+    r, s, t = tetrahedral_nodes(N; nodal_set = nodal_set)
 
     # exponents = monomial_exponents_3d(N)
     basis = build_orthonormal_tet_basis(N)

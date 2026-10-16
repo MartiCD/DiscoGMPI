@@ -39,6 +39,9 @@ function dummy_iso_result(case::PeriodicIsoresolutionCase, errors)
         1.0,
         1.0,
         0.0,
+        0.1,
+        0.2,
+        2.0,
     )
 end
 
@@ -147,22 +150,23 @@ end
         dummy_iso_result(coarse_case, coarse_errors),
         dummy_iso_result(fine_case, fine_errors),
     ]
-    add_periodic_isoresolution_rates!(results)
+    config = parse_periodic_isoresolution_arguments(["--dry-run"])
+    add_periodic_isoresolution_rates!(results, config)
 
     @test results[2].rates_time_linf_space_l2[1] ≈ 3.0
     @test results[2].rates_time_linf_space_l2[2] ≈ 2.0
     @test results[2].rates_time_linf_space_l2[6] ≈ 3.0
     @test results[2].rates_time_linf_space_l2[8] ≈ 2.0
-    pass, messages = periodic_isoresolution_verdict(results, 0.0)
-    @test pass
-    @test occursin("P2M1", only(messages))
+    rows = rate_maxwell_convergence_rows([isoresolution_convergence_row(r, config) for r in results])
+    @test maxwell_convergence_verdict(rows)
+    @test rows[2].status_ex == "SKIP_ROUNDOFF"
 end
 
 @testset "Periodic isoresolution CSV and LaTeX output" begin
     header = periodic_isoresolution_csv_header()
     @test occursin("linf_time_l2_space_ez_error", header)
-    @test occursin("rate_linf_time_l2_space_hy", header)
-    @test occursin("physical_rate_verdict", header)
+    @test occursin("rate_hy", header)
+    @test occursin("rate_verdict", header)
 
     config = parse_periodic_isoresolution_arguments([
         "--output=output/custom.csv",
@@ -174,7 +178,7 @@ end
         dummy_iso_result(coarse_case, ntuple(_ -> 1.0, 9)),
         dummy_iso_result(fine_case, ntuple(_ -> 0.5, 9)),
     ]
-    add_periodic_isoresolution_rates!(results)
+    add_periodic_isoresolution_rates!(results, config)
     directory = mktempdir()
     path = joinpath(directory, "tables.tex")
     write_periodic_isoresolution_latex(path, results, config)

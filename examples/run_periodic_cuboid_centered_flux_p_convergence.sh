@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 MPIEXEC="${MPIEXEC:-mpiexec}"
-ORDERS=(1)
+ORDERS=(1 2 3 4)
 
 for order in "${ORDERS[@]}"; do
     esprk_order=$((order + 1))
@@ -19,8 +19,9 @@ for order in "${ORDERS[@]}"; do
         --order="${order}" \
     	--mesh=examples/meshes/periodic_box_structured_2x1x1.vtk \
         --esprk-order="${esprk_order}" \
-        --final-time=100.0 \
+        --final-time=1000.0 \
         --cfl=0.8 \
         --flux=centered \
+	--paraview-every=10000 \
         --output-dir="${output_dir}"
 done

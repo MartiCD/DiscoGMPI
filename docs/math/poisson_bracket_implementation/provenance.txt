@@ -1,0 +1,167 @@
+DiscoGMPI Poisson-bracket reconstruction provenance
+Captured: 2026-09-21T12:43:49.969099+00:00
+Repository: /home/mcircuns/CODE/DiscoGMPI
+Platform: Linux-6.8.0-138-generic-x86_64-with-glibc2.35
+
+$ git branch --show-current
+main
+
+$ git log -1 --format=%H%n%cI%n%s
+e5bd7abe249efab7806acfb197af1141313523f9
+2026-07-16T10:24:50+02:00
+Added New Feautres
+
+$ git status --short
+ M .gitignore
+ M Manifest.toml
+ M Project.toml
+ M README.md
+ M docs/DiscoGMPI_User_Guide.pdf
+ M docs/numerics/dg_numerics.md
+ M docs/numerics/dg_numerics.pdf
+ M docs/rcs/rcs_theory_and_discretization.pdf
+ M examples/convergence_distributed_periodic_isoresolution.jl
+ M examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl
+ M examples/convergence_distributed_poisson_bracket_maxwell.jl
+ M examples/distributed_metallic_sphere_scattering.jl
+ M examples/distributed_periodic_poisson_bracket_maxwell.jl
+ M examples/plot_pec_box_alternating_flux_panel.py
+ M examples/plot_periodic_cuboid_alternating_flux_panel.py
+ M examples/plot_periodic_cuboid_centered_flux_h_convergence_panel.py
+ M examples/postprocess_distributed_convergence.py
+ D examples/run_periodic_cuboid_alternating_flux.sh
+ M examples/run_periodic_cuboid_centered_flux_h_convergence.sh
+ M examples/run_periodic_cuboid_centered_flux_p_convergence.sh
+ M examples/validate_distributed_maxwell_matrix.jl
+ M src/DiscoGMPI.jl
+ M src/DistributedDG.jl
+ M src/MaxwellDiagnostics.jl
+ M src/MaxwellDriverSupport.jl
+ M src/MaxwellExactSolutions.jl
+ M src/solver/kernels/dg_discretization.jl
+ M src/solver/kernels/face_operators.jl
+ M src/solver/kernels/reference_tet.jl
+ M test/runtests.jl
+ M test/test_mpi_periodic_isoresolution.jl
+ M test/test_periodic_isoresolution.jl
+ M test/test_validation_matrix.jl
+?? benchmark/AustinCEMBenchmarks/
+?? docs/DiscoGMPI_Distributed_Memory_Technical_Report.pdf
+?? docs/DiscoGMPI_Distributed_Memory_Technical_Report.tex
+?? docs/numerics/conserved_quantities_results_subsection.pdf
+?? docs/numerics/conserved_quantities_results_subsection.tex
+?? docs/numerics/magnetic_charge_longtime_analysis.md
+?? docs/numerics/magnetic_curl_initialization.md
+?? examples/distributed_pec_almond_austin_monostatic_rcs.jl
+?? examples/distributed_pec_almond_scattering.jl
+?? examples/distributed_periodic_ricker_pulse_3d.jl
+?? examples/meshes/generate_pec_almond_scattering_mesh.sh
+?? examples/meshes/mesh_ricker_2.png
+?? examples/meshes/pec-sphere_50k_tet.png
+?? examples/meshes/pec_almond_scattering.geo
+?? examples/meshes/pec_almond_scattering_fx1_epw4.vtk
+?? examples/plot_dispersion_branches.py
+?? examples/plot_leapfrog_dispersion.py
+?? examples/plot_reference_tet_nodes.jl
+?? examples/plot_ricker_probe_signal.py
+?? examples/postprocess_pec_almond_austin_monostatic_rcs.py
+?? examples/postprocess_pec_almond_phi0_h.py
+?? examples/postprocess_pec_almond_rcs.py
+?? examples/run_nasa_almond_austin_monostatic_rcs.slurm
+?? examples/run_nasa_almond_rcs.slurm
+?? examples/run_pec_sphere_bistatic_rcs_50k.slurm
+?? examples/run_periodic_cuboid_alternating_flux_p_refinement.sh
+?? examples/run_periodic_cuboid_centered_flux_p_convergence_test.sh
+?? examples/semidiscrete_dispersion.py
+?? examples/semidiscrete_flux_study.py
+?? examples/semidiscrete_phase_error.py
+?? examples/validate_pec_almond_boundary_residual.jl
+?? examples/validate_pec_almond_rcs_smoke.jl
+?? figures/
+?? periodic_box_1x125x125_f10_epw4_structured.vtk
+?? phase_error_results/
+?? semidiscrete_results/
+?? src/MaxwellConvergence.jl
+?? src/MaxwellInitialization.jl
+?? test/test_magnetic_curl_initialization.jl
+?? test/test_maxwell_convergence.jl
+?? test/test_mpi_convergence_nodal_sets.jl
+?? test/test_mpi_magnetic_charge_null_invariant.jl
+?? test/test_mpi_magnetic_curl_initialization.jl
+?? test/test_pec_almond_boundary_residual_gate.jl
+?? test/test_pec_almond_rcs_smoke_gate.jl
+?? test/test_reference_tet_nodes.jl
+
+$ git diff --stat -- src examples test Project.toml Manifest.toml
+ Manifest.toml                                      |  111 +-
+ Project.toml                                       |    2 +
+ ...nvergence_distributed_periodic_isoresolution.jl |  294 ++---
+ ...distributed_periodic_poisson_bracket_maxwell.jl |  899 ++--------------
+ ...vergence_distributed_poisson_bracket_maxwell.jl |  446 +-------
+ examples/distributed_metallic_sphere_scattering.jl |  135 ++-
+ ...distributed_periodic_poisson_bracket_maxwell.jl |   18 +
+ examples/plot_pec_box_alternating_flux_panel.py    |  386 ++++++-
+ .../plot_periodic_cuboid_alternating_flux_panel.py |    1 +
+ ...dic_cuboid_centered_flux_h_convergence_panel.py |   74 +-
+ examples/postprocess_distributed_convergence.py    | 1137 +++++---------------
+ examples/run_periodic_cuboid_alternating_flux.sh   |   26 -
+ ..._periodic_cuboid_centered_flux_h_convergence.sh |    6 +-
+ ..._periodic_cuboid_centered_flux_p_convergence.sh |    5 +-
+ examples/validate_distributed_maxwell_matrix.jl    |   45 +-
+ src/DiscoGMPI.jl                                   |   30 +-
+ src/DistributedDG.jl                               |    6 +
+ src/MaxwellDiagnostics.jl                          |  256 ++++-
+ src/MaxwellDriverSupport.jl                        |    8 +
+ src/MaxwellExactSolutions.jl                       |   12 +
+ src/solver/kernels/dg_discretization.jl            |    5 +-
+ src/solver/kernels/face_operators.jl               |   97 +-
+ src/solver/kernels/reference_tet.jl                |  375 ++++++-
+ test/runtests.jl                                   |    5 +
+ test/test_mpi_periodic_isoresolution.jl            |    4 +-
+ test/test_periodic_isoresolution.jl                |   18 +-
+ test/test_validation_matrix.jl                     |    5 +
+ 27 files changed, 1936 insertions(+), 2470 deletions(-)
+
+SHA-256  repository-relative-path
+395ee9d1935ee9cecde42dec8c397237a7b50c54f9fa73619e29a75c48d36a5a src/DiscoGMPI.jl
+716c8c222cd39dbdea7f9f0abd8a832dd82d60d8caa814af6f0d5dde3fe6c966 src/DistributedDG.jl
+1645f6133fd1ed50a3351ffb62818019cb14934bee4bfd8676308aee3f2f0ad4 src/DistributedIO.jl
+b5efa10ac8852428d82116edd3ddad2ccdd0d2b55a828617c8a16198ad4b6b70 src/DistributedMesh3D.jl
+83c021bc65ebf1db325a445138c05535447f02540369ba7931722b67cac2237f src/MaxwellConvergence.jl
+dc6a4b550c3eb70767a84f6d906194c13a0f516fc15aa3f6af871422d6c24d92 src/MaxwellDiagnostics.jl
+779954424a88ede7c49bd4ef447cd53b9e5e41a86d0544618da1c5105bcee52e src/MaxwellDriverSupport.jl
+99dfc66da29a3cbfa146ba677ab9497d81fa3567ea9a8b516db8c3ae9efa6a4a src/MaxwellExactSolutions.jl
+c1ffca83b26dcf951a1bcbeee011b05efe13184ef1c01aaef5b9da63399ec2c9 src/MaxwellInitialization.jl
+4bdc5adeb01c9cdb59fac36505d1dbe3acc53d0f7d7f2206d81c610cbfa97a16 src/MaxwellOutput.jl
+3975cfbe57c1005ef4418641d154c40297419f56f28d32e373e03f9066082305 src/MetisIO.jl
+3e425c1f1406c416b6978934d28424ebc881e112b1221900fcc3dfad735e32f7 src/NonlinearPML.jl
+818e1f4fa7d42c0cae6bcb6ac637ca7f6209eb5344a8b2fbe32d2db7dbfde31f src/PartitionVTK.jl
+dfc65957ae0170c49a78a4c9e43686269988174c3bbdcb59087bccd0a0c11e5d src/PhysicalCoverage.jl
+ca308e06aca9fcb03267c45e96fec4f5f793d9b34f4e9425877ec091399e4a4f src/RunLayout.jl
+87c89bd86ba5adaaf6208e873da9f916af855ca7f15b1d9261bef29590b7c80e src/TraceMaps.jl
+2e84b9603b71545343a23c1c7b8a2edb59c5e4b1152354bc28f5d991d5b47af9 src/rhs.jl
+0554141d5ddfb5aa0cb039763e1cf4e204ef8e889700f752c76106f896c71853 src/solver/data_containers.jl
+424225e3961eebfba8a08dde1c2285f61ec4dc0e45b072777526b5f4919042c7 src/solver/kernels/JaskowiecSukumar.jl
+8b31b896befe22f48561999301365c47d8aaf987b4a230518835d17c37bfcdd6 src/solver/kernels/dg_discretization.jl
+755003c308b2984a5a0eae1ffae99dca014e274c96f9cecd3aace669ecff3456 src/solver/kernels/face_operators.jl
+3f0f5f92d7e434c55d4dde0c783e944e8bb6c160e1fd09b474b7dded7c440e9b src/solver/kernels/flux_faces.jl
+7196fc894cca6550d253e9ffedc2e9ed4ac2902b17a6cc2c38464654066cf3e0 src/solver/kernels/geometry.jl
+507eff017634f9368c2e9100a242fee2004e8884b26d27dbb3e8a5d16eb3cbaf src/solver/kernels/maxwell.jl
+edb0067794e5c230285fe8f7903361c9a0decfb8e8471b04a5416b0b5c04775d src/solver/kernels/maxwell_fluxes.jl
+e5c2e5ab3ecd41d7313998c8f074dcceafb4cedfcea77481fb1710868d13041a src/solver/kernels/mesh_io.jl
+15149483576d3c391222d0ce58ace6a627ac4ce98c8e6422945e71c4ea372446 src/solver/kernels/metrics.jl
+66350f2c0fc0f0d92208adf4d2da0ea865bbfdfb3a787925b7d87686ed63d60d src/solver/kernels/periodic.jl
+9ecfa754c9a255643b4e4ce7c9fc4204b5bc1d879a3cff20fb24ef84ebd7333c src/solver/kernels/physical_operators.jl
+9493b03a2a610c0845ac85ea66c3c90468cc79df5894a79f7e75edeecb6da794 src/solver/kernels/reference_tet.jl
+3ab1d70fa6cd1c0389b83716eb7c7565c6f685b1f8513b008bab6ad999c89d8c src/solver/kernels/scalar_advection.jl
+60be7c533641c2d3267ee03f447c926760fa46165125ea3fdfb392f15c634dee src/solver/kernels/time_integration.jl
+9364a0c030d73ca5d7613edceef17cf4429463556c459275ecef304ec2492139 src/solver/kernels/topology.jl
+5ee16434ddbdd27289834bbd610949d26c57436fddaa48baaf9cee66e323d477 src/solver/kernels/trace_maps.jl
+5d9637bdab5bd337b703386f95f3cabdcde8fb7bf4b4990118eecdb856624c16 Project.toml
+444734afdd425b26f79e7bf5117a717526858db1e63e0585bca95d3e6c66cd23 Manifest.toml
+144b403e055b28eda8f49e21f02e5084ea24c4872f04be3da133cb8089aeed63 examples/distributed_periodic_poisson_bracket_maxwell.jl
+f4749533485867a12c374dbc1e736b3624dff836b9ca55dd6c59ede0b5a1a309 examples/distributed_metallic_sphere_scattering.jl
+b4c72990ba2c82d3d5c579d603e468d6ddb6b6be1d8d10440a58022cea755a0e test/test_reference_tet_nodes.jl
+bc5a09d758ff26bcb93473820d3ad32ad535489bcff0edc66fb2850b087097fe test/test_mpi_magnetic_charge_null_invariant.jl
+468a130737c2104099bfd51a388a08dc8ffc1a6e9995d86d1e9f17c8a7fa719f docs/math/maxwell_poisson_bracket_formulation.tex
+a1ab3b8d7b88ae2f771a49b53878946c1635fe63541dffe512381df9dacfeb08 docs/numerics/magnetic_charge_longtime_analysis.md

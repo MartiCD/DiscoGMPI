@@ -2,6 +2,7 @@ output/
 
 .julia_depot/
 
+
 benchmark/solver/*.csv
 benchmark/solver/*.txt
 benchmark/solver/*.png
@@ -12,6 +13,7 @@ docs/*.log
 docs/*.lot
 docs/*.out
 docs/*.tex
+!docs/DiscoGMPI_Distributed_Memory_Technical_Report.tex
 docs/*.toc
 
 docs/math/*.aux
@@ -26,6 +28,7 @@ docs/numerics/*.log
 docs/numerics/*.lot
 docs/numerics/*.out
 docs/numerics/*.tex
+!docs/numerics/conserved_quantities_results_subsection.tex
 docs/numerics/*.toc
 
 docs/rcs/*.aux
@@ -39,10 +42,21 @@ docs/rcs/*.toc
 examples/meshes/*.vtk
 !examples/meshes/metallic_sphere_scattering_validation.vtk
 !examples/meshes/metallic_sphere_scattering_epw4.vtk
+!examples/meshes/pec_almond_scattering_fx1_epw4.vtk
 examples/meshes/*.geo
 !examples/meshes/metallic_sphere_scattering.geo
+!examples/meshes/pec_almond_scattering.geo
 examples/meshes/*.sh
+!examples/meshes/generate_pec_almond_scattering_mesh.sh
 examples/meshes/*.msh
 examples/__pycache__/
 examples/refined_meshes/*.vtk
 examples/meshes/tet_mesh*
+
+*.sh 
+*.slurm
+*.png
+*.pdf
+*.svg
+*.jpg
+*.jpeg

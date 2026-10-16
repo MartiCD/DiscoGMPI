@@ -1,0 +1,21 @@
+% Requires graphicx and amsmath. Place alongside the exported figure.
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{dg_p1_leapfrog_dispersion.pdf}
+  \caption{Dispersion of the one-dimensional Maxwell system discretized by
+  centered-flux DG with $p=1$, exact mass integration, and staggered
+  electric--magnetic leapfrog time integration. Here $\theta=kh$,
+  $\Omega=\omega h/c$, and $r=c\Delta t/h$.
+  (a) Positive physical (solid) and additional (dotted) frequency branches
+  for $r=0.1, 0.3, 0.49$, together with the semidiscrete limit (gray) and the exact
+  relation $\Omega=\theta$ (black dashed). Negative-frequency branches follow
+  by symmetry. All displayed Courant numbers satisfy the sharp
+  all-wavenumber stability bound $r<1/2$.
+  (b) Relative physical-mode phase-speed error from the dispersion relation
+  (solid) and its leading-order expansion
+  $(1/48+r^2/24)\theta^2$ (dashed).
+  The dashed curves are asymptotic predictions as $\theta\to0$;
+  their extension to larger $\theta$ illustrates the departure from that limit.
+  The triangle indicates a logarithmic slope of two.}
+  \label{fig:p1-dg-leapfrog-dispersion}
+\end{figure}

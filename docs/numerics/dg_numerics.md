@@ -32,7 +32,7 @@ The reference tetrahedron has vertices
 (-1,-1,-1),\quad (1,-1,-1),\quad (-1,1,-1),\quad (-1,-1,1).
 ```
 
-`build_reference_tet(N)` constructs equispaced nodal points on this reference tetrahedron. The current nodal set is simple and deterministic; it is not an optimized warp-blend or Fekete set. This matters at high order because interpolation conditioning is affected by the nodal distribution.
+`build_reference_tet(N)` constructs equispaced nodal points on this reference tetrahedron by default. The optional call `build_reference_tet(N; nodal_set=:warp_blend)` constructs the Hesthaven-Warburton tetrahedral warp-blend nodes. The DG face operators detect non-equispaced tetrahedral nodes and build each triangular face mass matrix from the actual face-node coordinates, so the trace space remains consistent with the volume nodal set. High-order ParaView output still assumes VTK Lagrange/equispaced node ordering, so warp-blend runs should use sampled visualization output or an output-specific interpolation path before relying on high-order Lagrange `.vtu` files.
 
 The code builds an orthonormal modal tetrahedral basis, evaluates it at the nodal points, and forms a Vandermonde matrix
 
@@ -208,7 +208,73 @@ F_E^{PB}= -\frac{1}{2\epsilon}n\times(H^- - H^+),
 F_H^{PB}= -\frac{1}{2\mu}n\times(E^- + E^+).
 ```
 
-Only the central Poisson-bracket flux is supported.
+The implemented Poisson-bracket surface operator supports centered and
+alternating fluxes. Upwind fluxes are rejected for this formulation because they
+are dissipative and are not the partitioned Poisson-bracket operator used by the
+ESPRK path.
+
+## Magnetic-charge null-invariant diagnostic
+
+For the Poisson-bracket formulation, the implemented magnetic-field equation is
+the bracket-induced curl equation
+
+```math
+(\mu \dot H_h,w)_{\mathcal T_h}
+=
+-(E_h,\nabla\times w)_{\mathcal T_h}
++ \langle \widehat E_h,n\times w\rangle_{\partial\mathcal T_h}.
+```
+
+Schematically, the implemented algebraic update is
+
+```math
+M_H\dot h = C_{HE}e,
+```
+
+where `C_HE` includes the volume curl operator, material interior faces,
+periodic faces, MPI halo faces, and physical boundary traces used by the
+production RHS.
+
+The signed magnetic charge currently monitored by `src/MaxwellDiagnostics.jl`
+is the strong-divergence integral
+
+```math
+Q_{H,h}
+=
+\sum_{K\in\mathcal T_h^{owned}}
+\mu_K |J_K|\,1^T M
+\left(D_x H_{x,K}+D_y H_{y,K}+D_z H_{z,K}\right),
+```
+
+followed by an MPI sum over owned elements. The quadrature diagnostics also
+report absolute and local broken-divergence norms. Those local norms are useful
+for diagnosing unresolved divergence error, but they are not alone the
+bracket-induced invariant.
+
+If this charge is written as `Q_H,h = q_H^T M_H h`, semidiscrete conservation
+requires
+
+```math
+\frac{d Q_{H,h}}{dt}=q_H^T C_{HE}e=0
+\qquad\hbox{for every }e,
+```
+
+equivalently `q_H^T C_HE = 0`. If the diagnostic is represented with a discrete
+strong-divergence matrix `D_H`, the corresponding identity is
+`D_H M_H^{-1} C_HE = 0`.
+
+The function `distributed_magnetic_charge_rhs_breakdown` checks this condition
+with the same matrix-free operators used by `maxwell_rhs_periodic!`, and splits
+the derivative into volume, interior-face, periodic-face, and boundary-face
+contributions. The focused MPI test
+`test/test_mpi_magnetic_charge_null_invariant.jl` exercises centered and
+alternating Poisson-bracket fluxes on a structured periodic box and is launched
+by `examples/validate_distributed_maxwell_matrix.jl` on 1, 2, and 4 MPI ranks.
+
+The tested structured periodic cases give roundoff-level residuals. Therefore a
+very small long-time drift of the signed global magnetic charge is consistent
+with accumulated floating-point error, as long as this null-invariant test
+continues to pass.
 
 ## Boundary trace construction
 

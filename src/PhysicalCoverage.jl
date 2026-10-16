@@ -949,6 +949,7 @@ struct DistributedPeriodicMaxwellExchange
     remote_faces::Dict{Int, Vector{DistributedPeriodicFace}}
     send_buffers::Dict{Int, Vector{Float64}}
     recv_buffers::Dict{Int, Vector{Float64}}
+    requests::Vector{MPI.Request}
 end
 
 function owned_periodic_boundary_descriptors(
@@ -1231,6 +1232,7 @@ function build_distributed_periodic_maxwell_exchange(
         remote_faces,
         send_buffers,
         recv_buffers,
+        MPI.Request[],
     )
 end
 
@@ -1248,13 +1250,13 @@ function pack_distributed_periodic_traces!(
     return buffer
 end
 
-function exchange_distributed_periodic_traces!(
+function begin_distributed_periodic_trace_exchange!(
     U::MaxwellField,
     distributed_dg::DistributedDGDiscretization,
     periodic::DistributedPeriodicMaxwellExchange;
     tag::Int = 24018,
+    requests::Vector{MPI.Request} = periodic.requests,
 )
-    requests = MPI.Request[]
     for neighbor in periodic.neighbors
         pack_distributed_periodic_traces!(
             periodic.send_buffers[neighbor],
@@ -1282,8 +1284,23 @@ function exchange_distributed_periodic_traces!(
             ),
         )
     end
+    return requests
+end
+
+finish_distributed_periodic_trace_exchange!(periodic::DistributedPeriodicMaxwellExchange) = periodic
+
+function exchange_distributed_periodic_traces!(
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange;
+    tag::Int = 24018,
+)
+    requests = periodic.requests
+    empty!(requests)
+    begin_distributed_periodic_trace_exchange!(U, distributed_dg, periodic;
+                                               tag = tag, requests = requests)
     isempty(requests) || MPI.Waitall(requests)
-    return periodic
+    return finish_distributed_periodic_trace_exchange!(periodic)
 end
 
 function distributed_periodic_plus_trace(
@@ -1455,21 +1472,32 @@ function maxwell_rhs_periodic!(
     formulation::AbstractMaxwellDGFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    partition::Union{Nothing,Symbol} = nothing,
 )
-    exchange_maxwell_ghost_traces!(U, distributed_dg)
-    exchange_distributed_periodic_traces!(U, distributed_dg, periodic)
     dg = distributed_dg.dg
+    requests = distributed_dg.exchange.requests
+    empty!(requests)
+    begin_maxwell_ghost_trace_exchange!(U, distributed_dg; requests = requests)
+    begin_distributed_periodic_trace_exchange!(U, distributed_dg, periodic;
+                                               requests = requests)
     fill_maxwell_rhs!(rhs, 0.0)
-    maxwell_volume_rhs!(
-        rhs,
-        U,
-        dg.ref,
-        dg.physops,
-        formulation;
-        ε = ε,
-        μ = μ,
-        reset = false,
-    )
+    if partition !== nothing && formulation isa PoissonBracketFormulation && dg.backend isa SerialBackend
+        volume_workspace = maxwell_volume_serial_workspace!(dg.backend, U, dg.ref)
+        maxwell_poisson_volume_partition_rhs!(rhs, U, dg.ref, dg.physops, partition;
+            ε = ε, μ = μ, reset = false, workspace = volume_workspace,
+            elements = distributed_dg.distributed_mesh.partition.owned)
+    elseif formulation isa PoissonBracketFormulation && dg.backend isa SerialBackend
+        volume_workspace = maxwell_volume_serial_workspace!(dg.backend, U, dg.ref)
+        maxwell_volume_rhs!(rhs, U, dg.ref, dg.physops, formulation;
+            ε = ε, μ = μ, reset = false, workspace = volume_workspace,
+            elements = distributed_dg.distributed_mesh.partition.owned)
+    else
+        maxwell_volume_rhs!(rhs, U, dg.ref, dg.physops, formulation;
+                            ε = ε, μ = μ, reset = false)
+    end
+    isempty(requests) || MPI.Waitall(requests)
+    finish_maxwell_ghost_trace_exchange!(U, distributed_dg)
+    finish_distributed_periodic_trace_exchange!(periodic)
     maxwell_interior_surface_rhs!(
         rhs,
         U,
@@ -1502,6 +1530,7 @@ function maxwell_rhs_periodic!(
         ε = ε,
         μ = μ,
     )
+    partition === nothing || zero_complementary_maxwell_rhs!(rhs, partition)
     return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
 end
 
@@ -1578,6 +1607,21 @@ function make_distributed_periodic_maxwell_rhs_function(
             ε = ε,
             μ = μ,
         )
+    end
+end
+
+function make_distributed_periodic_maxwell_partition_rhs_function(
+    distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    return function rhs_partition_function!(rhs::MaxwellRHS, U::MaxwellField, partition::Symbol)
+        return maxwell_rhs_periodic!(rhs, U, distributed_dg, periodic, registry,
+                                     formulation; ε = ε, μ = μ,
+                                     partition = partition)
     end
 end
 

@@ -57,11 +57,15 @@ struct DistributedPeriodicMaxwellExperimentConfig
     wave_number::Float64
     flux_kind::MaxwellFluxKind
     energy_every::Int
+    print_every::Int
+    full_diagnostics_every::Int
     cubature_order::Int
     paraview_every::Int
     checkpoint_every::Int
     checkpoint_dir::String
     restart_path::String
+    magnetic_initialization::Symbol
+    electric_initialization::Symbol
 end
 
 struct DistributedConvergenceConfig
@@ -80,6 +84,11 @@ struct DistributedConvergenceConfig
     boundary_condition::Symbol
     flux_kind::MaxwellFluxKind
     output::String
+    nodal_set::Symbol
+    rate_tolerance::Float64
+    rate_policy::Symbol
+    error_every::Int
+    error_mode::Symbol
 end
 
 struct DistributedPeriodicConvergenceConfig
@@ -97,6 +106,21 @@ struct DistributedPeriodicConvergenceConfig
     geo_path::String
     mesh_dir::String
     output::String
+    nodal_set::Symbol
+    rate_tolerance::Float64
+    rate_policy::Symbol
+    magnetic_initialization::Symbol
+    electric_initialization::Symbol
+    error_every::Int
+    error_mode::Symbol
+end
+
+function validate_convergence_error_sampling(error_mode::Symbol, error_every::Int)
+    error_mode in (:final, :max_time) ||
+        throw(ArgumentError("--error-mode must be final or max-time."))
+    error_every >= 1 ||
+        throw(ArgumentError("--error-every must be a positive integer."))
+    return nothing
 end
 
 struct AxisAlignedBox

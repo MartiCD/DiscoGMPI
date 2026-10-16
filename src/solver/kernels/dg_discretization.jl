@@ -7,13 +7,14 @@ function DGDiscretization(
     order::Int;
     boundary_tag_name::String = "boundary_id",
     trace_tol::Float64 = 1e-10,
+    nodal_set::Symbol = :equispaced,
     backend::AbstractBackend = SerialBackend(),
 )
     topology = build_dg_topology(mesh; boundary_tag_name = boundary_tag_name)
     geometry = build_dg_geometry(mesh, topology)
     mappings = build_reference_mappings(mesh)
-    ref = build_reference_tet(order)
-    fops = build_reference_face_operators(ref)
+    ref = build_reference_tet(order; nodal_set = nodal_set)
+    fops = build_reference_face_operators(ref; nodal_set = nodal_set)
     physops = build_physical_operators(ref, mappings)
 
     trace_maps = build_dg_trace_maps(

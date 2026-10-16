@@ -18,7 +18,9 @@ try
     comm = MPI.COMM_WORLD
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
-    root_mesh = rank == 0 ? build_periodic_isoresolution_mesh(4) : nothing
+    root_mesh = rank == 0 ? structured_box_mesh(
+        4, 2, 2; lower = (0.0, 0.0, 0.0), upper = (2.0, 1.0, 1.0),
+        boundary_id = periodic_box_boundary_id) : nothing
     root_partition = rank == 0 ?
                      periodic_balanced_spatial_partition(root_mesh, nranks) :
                      nothing

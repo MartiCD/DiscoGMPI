@@ -37,6 +37,11 @@ end
     @test !config.run_mpi_tests
 end
 
+@testset "Validation matrix MPI release-gate coverage" begin
+    mpi_spec_names = Set(spec.name for spec in MPI_TEST_SPECS)
+    @test "magnetic-charge-null-invariant" in mpi_spec_names
+end
+
 @testset "Validation matrix convergence-rate checks" begin
     directory = mktempdir()
     path = joinpath(directory, "convergence.csv")

@@ -173,7 +173,25 @@ end
         return 0.0
     end
 
-    return 0.5
+    # Faces orthogonal to (1,1,1) still need a genuinely one-sided trace.
+    # Orient the face lexicographically by the first nonzero normal component.
+    # This rule is global and odd under normal reversal, so
+    # theta(-n) = 1 - theta(n) and both sides select one unique trace.
+    if n[1] > 0.0
+        return 1.0
+    elseif n[1] < 0.0
+        return 0.0
+    elseif n[2] > 0.0
+        return 1.0
+    elseif n[2] < 0.0
+        return 0.0
+    elseif n[3] > 0.0
+        return 1.0
+    elseif n[3] < 0.0
+        return 0.0
+    end
+
+    throw(ArgumentError("Cannot orient a face with a zero normal."))
 end
 
 @inline function cross_n_components(
@@ -1273,15 +1291,17 @@ function maxwell_boundary_surface_face_rhs!(
     end
 end
 
-struct MaxwellVolumeThreadWorkspace
+mutable struct MaxwellVolumeThreadWorkspace
     work::Vector{MaxwellElementScratch}
+    mass_factor::Any
     nrows::Int
     nthreads::Int
 end
 
-function MaxwellVolumeThreadWorkspace(nrows::Int)
+function MaxwellVolumeThreadWorkspace(nrows::Int, ref::Union{Nothing,ReferenceTet} = nothing)
     return MaxwellVolumeThreadWorkspace(
         [MaxwellElementScratch(nrows) for _ in 1:Base.Threads.nthreads()],
+        ref === nothing ? nothing : cholesky(ref.M),
         nrows,
         Base.Threads.nthreads(),
     )
@@ -1298,16 +1318,36 @@ end
 function maxwell_volume_thread_workspace!(
     backend::ThreadedBackend,
     U::MaxwellField,
+    ref::Union{Nothing,ReferenceTet} = nothing,
 )
     nrows = size(U.Ex, 1)
     workspace = backend.maxwell_volume_workspace[]
 
     if !(workspace isa MaxwellVolumeThreadWorkspace) ||
        !matches_workspace(workspace, nrows)
-        workspace = MaxwellVolumeThreadWorkspace(nrows)
+        workspace = MaxwellVolumeThreadWorkspace(nrows, ref)
         backend.maxwell_volume_workspace[] = workspace
+    elseif ref !== nothing && workspace.mass_factor === nothing
+        workspace.mass_factor = cholesky(ref.M)
     end
 
+    return workspace::MaxwellVolumeThreadWorkspace
+end
+
+function maxwell_volume_serial_workspace!(
+    backend::SerialBackend,
+    U::MaxwellField,
+    ref::Union{Nothing,ReferenceTet} = nothing,
+)
+    nrows = size(U.Ex, 1)
+    workspace = backend.maxwell_volume_workspace[]
+    if !(workspace isa MaxwellVolumeThreadWorkspace) ||
+       !matches_workspace(workspace, nrows)
+        workspace = MaxwellVolumeThreadWorkspace(nrows, ref)
+        backend.maxwell_volume_workspace[] = workspace
+    elseif ref !== nothing && workspace.mass_factor === nothing
+        workspace.mass_factor = cholesky(ref.M)
+    end
     return workspace::MaxwellVolumeThreadWorkspace
 end
 
@@ -1411,7 +1451,8 @@ function maxwell_volume_rhs_threaded!(
     work = workspace === nothing ?
            MaxwellVolumeThreadWorkspace(size(U.Ex, 1)).work :
            workspace.work
-    mass_factor = cholesky(ref.M)
+    mass_factor = workspace === nothing || workspace.mass_factor === nothing ?
+                  cholesky(ref.M) : workspace.mass_factor
 
     Base.Threads.@threads :static for e in 1:ne
         scratch = work[Base.Threads.threadid()]
@@ -1950,6 +1991,8 @@ function maxwell_rhs!(
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
     workspace::Union{Nothing, MaxwellSurfaceWorkspace} = nothing,
+    volume_workspace::Union{Nothing, MaxwellVolumeThreadWorkspace} = nothing,
+    volume_elements = axes(U.Ex, 2),
 )
     require_poisson_bracket_surface_flux(formulation)
 
@@ -1965,6 +2008,8 @@ function maxwell_rhs!(
         ε = ε,
         μ = μ,
         reset = false,
+        workspace = volume_workspace,
+        elements = volume_elements,
     )
 
     maxwell_interior_surface_rhs!(
@@ -2154,7 +2199,9 @@ function maxwell_rhs!(
     backend::SerialBackend;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    volume_elements = axes(U.Ex, 2),
 )
+    volume_workspace = maxwell_volume_serial_workspace!(backend, U, dg.ref)
     surface_workspace = maxwell_surface_workspace!(backend, dg.ref, dg.fops)
     return maxwell_rhs!(
         rhs,
@@ -2169,6 +2216,8 @@ function maxwell_rhs!(
         ε = ε,
         μ = μ,
         workspace = surface_workspace,
+        volume_workspace = volume_workspace,
+        volume_elements = volume_elements,
     )
 end
 
@@ -2185,7 +2234,7 @@ function maxwell_rhs!(
     require_poisson_bracket_surface_flux(formulation)
 
     fill_maxwell_rhs!(rhs, 0.0)
-    volume_workspace = maxwell_volume_thread_workspace!(backend, U)
+    volume_workspace = maxwell_volume_thread_workspace!(backend, U, dg.ref)
     surface_workspace = maxwell_surface_thread_workspace!(
         backend,
         dg.ref,

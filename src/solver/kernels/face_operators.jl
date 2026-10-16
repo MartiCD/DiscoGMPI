@@ -641,10 +641,17 @@ function grad_vandermonde_tri(a::Vector{Float64}, b::Vector{Float64}, basis::Ort
     return Va, Vb
 end
 
-function build_reference_tri(N::Int)
+function build_reference_tri_from_nodes(
+    N::Int,
+    a::Vector{Float64},
+    b::Vector{Float64},
+)
     Np = num_tri_nodes(N)
 
-    a, b = equispaced_tri_nodes(N)
+    length(a) == Np ||
+        throw(ArgumentError("Triangle nodal set has $(length(a)) nodes; expected $Np."))
+    length(b) == Np ||
+        throw(ArgumentError("Triangle nodal set has $(length(b)) nodes; expected $Np."))
 
     basis = build_orthonormal_tri_basis(N)
 
@@ -674,6 +681,11 @@ function build_reference_tri(N::Int)
         Db,
         M,
     )
+end
+
+function build_reference_tri(N::Int)
+    a, b = equispaced_tri_nodes(N)
+    return build_reference_tri_from_nodes(N, a, b)
 end
 
 function print_reference_tri_summary(tri::ReferenceTri)
@@ -835,7 +847,86 @@ function ordered_reference_face_nodes(ref::ReferenceTet, tri::ReferenceTri; tol 
     )
 end
 
-function build_reference_face_operators(ref::ReferenceTet)
+function reference_face_nodes_and_tri_coords(
+    ref::ReferenceTet,
+    face_id::Int;
+    tol = 1e-10,
+)
+    ids = reference_face_nodes(ref; tol = tol)[face_id]
+    a = Vector{Float64}(undef, length(ids))
+    b = Vector{Float64}(undef, length(ids))
+
+    for (i, node_id) in enumerate(ids)
+        a[i], b[i] = tet_face_to_tri_coords(
+            face_id,
+            ref.r[node_id],
+            ref.s[node_id],
+            ref.t[node_id],
+        )
+    end
+
+    return ids, a, b
+end
+
+function build_reference_face_operators_from_individual_faces(ref::ReferenceTet)
+    face_nodes_vec = Vector{Int}[]
+    face_mass_vec = Matrix{Float64}[]
+    Emat = zeros(Float64, ref.Np, ref.Np)
+
+    for f in 1:4
+        ids, a, b = reference_face_nodes_and_tri_coords(ref, f)
+        tri = build_reference_tri_from_nodes(ref.N, a, b)
+        Mf = build_reference_face_mass_from_tri(ref, tri, f)
+
+        push!(face_nodes_vec, ids)
+        push!(face_mass_vec, Mf)
+
+        for a_idx in axes(Mf, 1)
+            ia = ids[a_idx]
+
+            for b_idx in axes(Mf, 2)
+                ib = ids[b_idx]
+                Emat[ia, ib] += Mf[a_idx, b_idx]
+            end
+        end
+    end
+
+    face_nodes = (
+        face_nodes_vec[1],
+        face_nodes_vec[2],
+        face_nodes_vec[3],
+        face_nodes_vec[4],
+    )
+    face_mass = (
+        face_mass_vec[1],
+        face_mass_vec[2],
+        face_mass_vec[3],
+        face_mass_vec[4],
+    )
+    face_lift = build_reference_face_lift_matrices(ref, face_nodes, face_mass)
+    LIFT = ref.M \ Emat
+
+    return ReferenceTetFaceOperators(
+        face_nodes,
+        face_mass,
+        face_lift,
+        Emat,
+        LIFT,
+    )
+end
+
+function build_reference_face_operators(
+    ref::ReferenceTet;
+    nodal_set::Symbol = :auto,
+)
+    if nodal_set == :auto
+        if !reference_tet_nodes_are_equispaced(ref)
+            return build_reference_face_operators_from_individual_faces(ref)
+        end
+    elseif canonical_tet_nodal_set(nodal_set) != :equispaced
+        return build_reference_face_operators_from_individual_faces(ref)
+    end
+
     tri = build_reference_tri(ref.N)
 
     face_nodes = ordered_reference_face_nodes(ref, tri)

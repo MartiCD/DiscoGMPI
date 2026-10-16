@@ -32,6 +32,8 @@ Options:
                         of MPI ranks launched by mpiexec. Default: MPI ranks.
   --partition PATH      Zero-based METIS element partition.
                         When omitted, rank zero creates one automatically.
+                        METIS is used when mpmetis is available; otherwise a
+                        deterministic balanced spatial partition is written.
   --repartition         Regenerate the METIS partition even if it exists.
   --distributed-mesh-dir PATH
                         Rank-local mesh cache. Each rank independently loads
@@ -44,8 +46,8 @@ Options:
                         Recreate a missing or stale rank-local mesh cache by
                         having every rank read the global mesh and partition,
                         avoiding root-built rank-local mesh packets. If
-                        partition generation is needed, rank zero still runs
-                        mpmetis once before the collective read.
+                        partition generation is needed, rank zero creates it
+                        once before the collective read.
   --output-dir PATH     Output directory.
                         Default: output/distributed_periodic_poisson_bracket
   --run-root PATH       Create an isolated timestamped run directory below PATH.
@@ -66,7 +68,12 @@ Options:
                         Default: 2*pi
   --flux NAME           Poisson-bracket surface flux: centered or alternating.
                         Default: centered
-  --energy-every N      Write energy every N steps. Default: 1
+  --energy-every N      Write energy and lightweight invariants every N steps.
+                        Default: 1
+  --print-every N       Print the diagnostic summary every N steps. Default: 1
+  --full-diagnostics-every N
+                        Write the full quadrature validation diagnostics every
+                        N steps. Default: same as --energy-every.
   --cubature-order N    Jaskowiec-Sukumar volume cubature order.
                         Default: max(2, 2 * DG order + 4)
   --paraview-every N    Write a ParaView snapshot every N steps, plus the
@@ -79,13 +86,22 @@ Options:
   --restart PATH        Restart from a checkpoint directory containing
                         checkpoint_manifest.toml. --final-time remains the
                         absolute target time.
+  --magnetic-initialization=MODE  interpolate (default) or curl-potential.
+  --electric-initialization=MODE  interpolate (default) or curl-potential.
   --help                Show this message.
 
 Outputs:
-  diagnostics/energy.csv           DG mass-matrix energy history.
+  diagnostics/energy.csv           DG energy history from the lightweight
+                                   cubature pass.
+  diagnostics/invariant_diagnostics.csv
+                                   Lightweight energy, chirality, momentum,
+                                   angular momentum, and integrated D/B history.
+                                   Its exact_* columns hold the initial
+                                   analytical invariant values.
   diagnostics/quadrature_diagnostics.csv
                                    Energy, chirality, L2 errors, charges,
-                                   and momenta.
+                                   momenta, integrated D/B components,
+                                   and directional charge contributions.
   config/run_layout.toml           Run-directory layout.
   config/resolved_config.toml      Fully resolved run configuration.
   config/run_metadata.toml         Runtime metadata.
@@ -154,7 +170,11 @@ function parse_arguments(
     mu = 1.0
     wave_number = DEFAULT_WAVE_NUMBER
     flux_kind = MaxwellFlux_Central
+    magnetic_initialization = :interpolate
+    electric_initialization = :interpolate
     energy_every = 1
+    print_every = 1
+    full_diagnostics_every = 0
     cubature_order = 0
     paraview_every = 10
     checkpoint_every = 0
@@ -225,12 +245,24 @@ function parse_arguments(
         elseif startswith(arg, "--wave-number")
             value, i = option_value(args, i, "--wave-number")
             wave_number = parse(Float64, value)
+        elseif startswith(arg, "--magnetic-initialization")
+            value, i = option_value(args, i, "--magnetic-initialization")
+            magnetic_initialization = parse_magnetic_initialization(value)
+        elseif startswith(arg, "--electric-initialization")
+            value, i = option_value(args, i, "--electric-initialization")
+            electric_initialization = parse_electric_initialization(value)
         elseif startswith(arg, "--flux")
             value, i = option_value(args, i, "--flux")
             flux_kind = parse_maxwell_flux_kind(value)
         elseif startswith(arg, "--energy-every")
             value, i = option_value(args, i, "--energy-every")
             energy_every = parse(Int, value)
+        elseif startswith(arg, "--print-every")
+            value, i = option_value(args, i, "--print-every")
+            print_every = parse(Int, value)
+        elseif startswith(arg, "--full-diagnostics-every")
+            value, i = option_value(args, i, "--full-diagnostics-every")
+            full_diagnostics_every = parse(Int, value)
         elseif startswith(arg, "--cubature-order")
             value, i = option_value(args, i, "--cubature-order")
             cubature_order = parse(Int, value)
@@ -322,6 +354,12 @@ function parse_arguments(
         throw(ArgumentError("The prescribed analytical solution requires mu=1."))
     energy_every >= 1 ||
         throw(ArgumentError("--energy-every must be at least 1."))
+    print_every >= 1 ||
+        throw(ArgumentError("--print-every must be at least 1."))
+    full_diagnostics_every >= 0 ||
+        throw(ArgumentError("--full-diagnostics-every must be non-negative."))
+    full_diagnostics_every == 0 &&
+        (full_diagnostics_every = energy_every)
     cubature_order == 0 || 2 <= cubature_order <= 20 ||
         throw(ArgumentError("--cubature-order must be in 2:20."))
     paraview_every >= 1 ||
@@ -347,11 +385,15 @@ function parse_arguments(
         wave_number,
         flux_kind,
         energy_every,
+        print_every,
+        full_diagnostics_every,
         cubature_order,
         paraview_every,
         checkpoint_every,
         checkpoint_dir,
         restart_path,
+        magnetic_initialization,
+        electric_initialization,
     )
 end
 
@@ -399,11 +441,15 @@ function generate_metis_partition(config::ExperimentConfig)
     write_metis_mesh_from_vtk(config.mesh_path, metis_mesh_path)
 
     mpmetis = Sys.which("mpmetis")
-    mpmetis === nothing &&
-        error(
-            "Automatic partitioning requires the 'mpmetis' executable. " *
-            "Install METIS or pass --partition PATH.",
-        )
+    if mpmetis === nothing
+        mesh = load_periodic_mesh(config.mesh_path)
+        partition = balanced_spatial_partition(mesh, config.partition_count)
+        open(config.partition_path, "w") do io
+            foreach(owner -> println(io, owner), partition)
+        end
+        @warn "mpmetis is unavailable; wrote a balanced spatial partition" partition_path = config.partition_path partitions = config.partition_count
+        return config.partition_path
+    end
 
     command = `$mpmetis $metis_mesh_path $(config.partition_count)`
     run(command)
@@ -615,6 +661,8 @@ function experiment_configuration(
         "domain_upper" => collect(box.upper),
         "domain_lengths" => collect(periodic_box_lengths(box)),
         "energy_every" => config.energy_every,
+        "print_every" => config.print_every,
+        "full_diagnostics_every" => config.full_diagnostics_every,
         "cubature_order" => cubature_order,
         "paraview_every" => config.paraview_every,
         "checkpoint_every" => config.checkpoint_every,
@@ -622,6 +670,8 @@ function experiment_configuration(
         "restart_path" => config.restart_path,
         "formulation" => "PoissonBracketFormulation",
         "flux" => maxwell_flux_kind_label(config.flux_kind),
+        "magnetic_initialization" => string(config.magnetic_initialization),
+        "electric_initialization" => string(config.electric_initialization),
         "boundary_condition" => "periodic in x, y, and z",
         "periodic_pairs" => "1<->2, 3<->4, 5<->6",
         "analytical_solution" => "traveling wave along +x",
@@ -655,6 +705,8 @@ function checkpoint_metadata(
         "esprk_order" => config.esprk_order,
         "first_partition" => "H",
         "flux" => maxwell_flux_kind_label(config.flux_kind),
+        "magnetic_initialization" => string(config.magnetic_initialization),
+        "electric_initialization" => string(config.electric_initialization),
         "distributed_mesh_dir" => config.distributed_mesh_dir,
         "mesh_load_mode" => mesh_load_mode,
     )
@@ -664,6 +716,8 @@ function validate_restart_configuration(
     state::DistributedCheckpointState,
     config::ExperimentConfig,
 )
+    validate_magnetic_initialization_restart(state.metadata, config.magnetic_initialization)
+    validate_electric_initialization_restart(state.metadata, config.electric_initialization)
     validate_restart_numbers(
         state,
         (
@@ -728,6 +782,24 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         distributed_dg,
         periodic_boundary_specs(box),
     )
+    if !restarting && config.magnetic_initialization == :curl_potential
+        materials = homogeneous_maxwell_materials(size(U.Hx, 2);
+            epsilon = config.epsilon, permeability = config.mu)
+        potential = (x, y, z, t) -> periodic_magnetic_vector_potential(x, y, z, t;
+            mu = config.mu, wave)
+        initialize_magnetic_from_potential!(U, distributed_dg, materials, potential; periodic)
+        initial_divergence = magnetic_initialization_diagnostics(U, distributed_dg, materials)
+        rank == 0 && println("Initial magnetic divergence: ", initial_divergence)
+    end
+    if !restarting && config.electric_initialization == :curl_potential
+        materials = homogeneous_maxwell_materials(size(U.Ex, 2);
+            epsilon = config.epsilon, permeability = config.mu)
+        potential = (x, y, z, t) -> periodic_electric_vector_potential(x, y, z, t;
+            epsilon = config.epsilon, wave)
+        initialize_electric_from_potential!(U, distributed_dg, materials, potential; periodic)
+        initial_divergence = electric_initialization_diagnostics(U, distributed_dg, materials)
+        rank == 0 && println("Initial electric divergence: ", initial_divergence)
+    end
     formulation = PoissonBracketFormulation(config.flux_kind)
     scheme = explicit_partitioned_symplectic_rk_scheme(
         config.esprk_order;
@@ -771,7 +843,11 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     energy_path = run_diagnostics_path(run_paths, "energy.csv")
     quadrature_path =
         run_diagnostics_path(run_paths, "quadrature_diagnostics.csv")
+    lightweight_path =
+        run_diagnostics_path(run_paths, "invariant_diagnostics.csv")
     history_files = DiagnosticHistoryFiles(nothing, nothing, false)
+    lightweight_io = nothing
+    lightweight_write_header = false
     history_open_error = nothing
     if rank == 0
         try
@@ -780,7 +856,16 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                 quadrature_path;
                 restarting = restarting,
             )
+            lightweight_append =
+                restarting && isfile(lightweight_path) &&
+                filesize(lightweight_path) > 0
+            restarting && !lightweight_append &&
+                error("Missing invariant diagnostics history for restart: $lightweight_path")
+            lightweight_io = open(lightweight_path, lightweight_append ? "a" : "w")
+            lightweight_write_header = !lightweight_append
         catch error
+            lightweight_io !== nothing && close(lightweight_io)
+            close_diagnostic_history_files(history_files)
             history_open_error = sprint(showerror, error)
         end
     end
@@ -789,18 +874,6 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
     history_open_error === nothing ||
         error("Diagnostic history opening failed: $history_open_error")
 
-    current_energy = distributed_maxwell_energy(
-        U,
-        distributed_dg;
-        ε = config.epsilon,
-        μ = config.mu,
-    )
-    initial_energy_total = restarting ?
-                           restart_initial_energy(
-        restart_state,
-        current_energy.total,
-    ) :
-                           current_energy.total
     current_quadrature = distributed_periodic_quadrature_diagnostics(
         U,
         distributed_dg,
@@ -810,6 +883,29 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         mu = config.mu,
         wave = wave,
     )
+    lightweight_workspace =
+        DistributedMaxwellLightweightWorkspace(distributed_dg, cubature_order)
+    current_lightweight_result =
+        distributed_maxwell_lightweight_diagnostics_and_energy!(
+            lightweight_workspace,
+            U,
+            distributed_dg;
+            epsilon = config.epsilon,
+            mu = config.mu,
+        )
+    current_energy = current_lightweight_result.energy
+    current_lightweight = current_lightweight_result.diagnostics
+    initial_energy_total = restarting ?
+                           restart_initial_energy(
+        restart_state,
+        current_energy.total,
+    ) :
+                           current_energy.total
+    # Reuse the analytical invariant values from the initial full diagnostic.
+    # This makes the lightweight history measure conservation drift without
+    # evaluating the exact fields at every time step.
+    reference_lightweight = exact_lightweight_diagnostics(current_quadrature)
+    exact_total_energy = current_quadrature.exact_total_energy
 
     collective_root_action(
         comm,
@@ -830,6 +926,18 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                 start_step,
                 start_time,
                 current_quadrature,
+            )
+        end
+        if lightweight_write_header
+            write_lightweight_diagnostics_header(lightweight_io)
+            write_lightweight_diagnostics_row(
+                lightweight_io,
+                start_step,
+                start_time,
+                current_energy,
+                current_lightweight,
+                exact_total_energy,
+                reference_lightweight,
             )
         end
     end
@@ -869,6 +977,8 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         println("final step/time:      ", final_step, " / ", config.final_time)
         println("remaining steps:      ", remaining_steps)
         println("initial energy:       ", initial_energy_total)
+        println("print every:          ", config.print_every)
+        println("full diagnostics:     every ", config.full_diagnostics_every, " steps")
         println("ParaView every:       ", config.paraview_every)
         println("checkpoint every:     ", config.checkpoint_every)
         println("checkpoint directory: ", checkpoint_dir)
@@ -999,13 +1109,12 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                 )
             end
 
-            if step % config.energy_every == 0 || step == final_step
-                final_energy = distributed_maxwell_energy(
-                    U,
-                    distributed_dg;
-                    ε = config.epsilon,
-                    μ = config.mu,
-                )
+            lightweight_due =
+                step % config.energy_every == 0 || step == final_step
+            full_diagnostics_due =
+                step % config.full_diagnostics_every == 0 || step == final_step
+
+            if full_diagnostics_due
                 final_quadrature = distributed_periodic_quadrature_diagnostics(
                     U,
                     distributed_dg,
@@ -1017,7 +1126,31 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                 )
                 collective_root_action(
                     comm,
-                    "Diagnostic history writing at step $step",
+                    "Full diagnostic history writing at step $step",
+                ) do
+                    write_quadrature_diagnostics_row(
+                        history_files.quadrature_io,
+                        step,
+                        time,
+                        final_quadrature,
+                    )
+                end
+            end
+
+            if lightweight_due
+                current_lightweight_result =
+                    distributed_maxwell_lightweight_diagnostics_and_energy!(
+                        lightweight_workspace,
+                        U,
+                        distributed_dg;
+                        epsilon = config.epsilon,
+                        mu = config.mu,
+                    )
+                final_energy = current_lightweight_result.energy
+                current_lightweight = current_lightweight_result.diagnostics
+                collective_root_action(
+                    comm,
+                    "Lightweight diagnostic history writing at step $step",
                 ) do
                     relative_drift = write_energy_row(
                         history_files.energy_io,
@@ -1026,28 +1159,29 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
                         final_energy,
                         initial_energy_total,
                     )
-                    write_quadrature_diagnostics_row(
-                        history_files.quadrature_io,
+                    write_lightweight_diagnostics_row(
+                        lightweight_io,
                         step,
                         time,
-                        final_quadrature,
+                        final_energy,
+                        current_lightweight,
+                        exact_total_energy,
+                        reference_lightweight,
                     )
-                    println(
-                        "step ", step, "/", final_step,
-                        ", t = ", time,
-                        ", energy = ", final_energy.total,
-                        ", relative drift = ", relative_drift,
-                        ", L2(E error) = ",
-                        final_quadrature.electric_error_l2,
-                        ", L2(H error) = ",
-                        final_quadrature.magnetic_error_l2,
-                        ", L2(w error) = ",
-                        final_quadrature.energy_density_error_l2,
-                        ", chirality = ",
-                        final_quadrature.optical_chirality,
-                        ", Qe = ", final_quadrature.electric_charge,
-                        ", Qm = ", final_quadrature.magnetic_charge,
-                    )
+                    if step % config.print_every == 0 || step == final_step
+                        println(
+                            "step ", step, "/", final_step,
+                            ", t = ", time,
+                            ", energy = ", final_energy.total,
+                            ", relative drift = ", relative_drift,
+                            ", chirality = ",
+                            current_lightweight.optical_chirality,
+                            ", integrated D sum = ",
+                            sum(current_lightweight.integrated_d),
+                            ", integrated B sum = ",
+                            sum(current_lightweight.integrated_b),
+                        )
+                    end
                 end
             end
 
@@ -1100,6 +1234,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
             "Diagnostic history closing",
         ) do
             close_diagnostic_history_files(history_files)
+            lightweight_io !== nothing && close(lightweight_io)
         end
     end
 
@@ -1161,6 +1296,7 @@ function run_experiment(config::ExperimentConfig, comm::MPI.Comm)
         println()
         println("Energy history:        ", energy_path)
         println("Quadrature diagnostics:", quadrature_path)
+        println("Invariant diagnostics: ", lightweight_path)
         println(
             "Run metadata:          ",
             run_config_path(run_paths, "run_metadata.toml"),

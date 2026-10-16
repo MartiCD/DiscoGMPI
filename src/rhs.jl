@@ -114,6 +114,7 @@ function build_face_traces_E_owned!(
     return nothing
 end
 
+
 # build_face_traces_H_owned!(traceH, Hx, Hy, Hz, problem, mesh)
 function build_face_traces_H_owned!(
     traceH::Array{Float64,4},
@@ -452,66 +453,5 @@ function rhs_hamiltonian_E_mpi!(
     exchange_face_traces_blocking!(ws.traceH, ws.ghostH, commdata.trace_maps, comm_mpi)
     accumulate_face_flux_E_owned!(ws, problem, mesh, commdata)
     accumulate_volume_rhs_E_owned!(ws, Hx, Hy, Hz, problem, mesh)
-    return nothing
-end
-
-# Time marching 
-# ti_ESPRK_mpi!(Hx, Hy, Hz, Ex, Ey, Ez, workspace, problem, mesh, commdata, comm_mpi, time)
-function ti_ESPRK_mpi!(
-    Hx::Matrix{Float64},
-    Hy::Matrix{Float64},
-    Hz::Matrix{Float64},
-    Ex::Matrix{Float64},
-    Ey::Matrix{Float64},
-    Ez::Matrix{Float64},
-    ws::RHSWorkspaceMPI{Float64},
-    problem::Maxwell3D,
-    mesh,
-    commdata::TraceCommData,
-    comm_mpi,
-    time::ODEParams,
-)
-    tiorder = time.order
-    dt = time.Δt
-    ntimesteps = compute_time_steps(time)
-
-    COEFFS = Dict(
-        2 => (a=(0.0, 1.0), b=(0.5, 0.5)),
-        3 => (a=(0.2916666666666667, 0.75, -0.041666666666666664),
-              b=(0.6666666666666666, -0.6666666666666666, 1.0)),
-        4 => (a=(7.0/48.0, 3.9/8.0, -1.0/48.0, -1.0/48.0, 3.0/8.0, 7.0/48.0),
-              b=(1.0/3.0, -1.0/3.0, 1.0, -1.0/3.0, 1.0/3.0, 0.0))
-    )
-
-    haskey(COEFFS, tiorder) || error("Selected ESPRK scheme not available.")
-    a_coeffs, b_coeffs = COEFFS[tiorder]
-    nstages = length(a_coeffs)
-
-    for timestep in 1:ntimesteps
-        for s in 1:nstages
-            rhs_hamiltonian_H_mpi!(Ex, Ey, Ez, ws, problem, mesh, commdata, comm_mpi)
-
-            for e in mesh.partition.owned
-                @views begin
-                    Hx[:, e] .+= dt * a_coeffs[s] .* ws.rhsHx[:, e]
-                    Hy[:, e] .+= dt * a_coeffs[s] .* ws.rhsHy[:, e]
-                    Hz[:, e] .+= dt * a_coeffs[s] .* ws.rhsHz[:, e]
-                end
-            end
-
-            rhs_hamiltonian_E_mpi!(Hx, Hy, Hz, ws, problem, mesh, commdata, comm_mpi)
-
-            for e in mesh.partition.owned
-                @views begin
-                    Ex[:, e] .+= dt * b_coeffs[s] .* ws.rhsEx[:, e]
-                    Ey[:, e] .+= dt * b_coeffs[s] .* ws.rhsEy[:, e]
-                    Ez[:, e] .+= dt * b_coeffs[s] .* ws.rhsEz[:, e]
-                end
-            end
-        end
-
-        # Later: global reductions for norms/energy
-    end
-
     return nothing
 end

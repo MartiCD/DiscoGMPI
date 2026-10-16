@@ -14,6 +14,7 @@ struct DistributedMaxwellExchange
     faces::Dict{Int, Vector{DistributedDGInterfaceFace}}
     send_buffers::Dict{Int, Vector{Float64}}
     recv_buffers::Dict{Int, Vector{Float64}}
+    requests::Vector{MPI.Request}
 end
 
 struct DistributedDGDiscretization{
@@ -228,6 +229,7 @@ function build_distributed_maxwell_exchange(
         faces,
         send_buffers,
         recv_buffers,
+        MPI.Request[],
     )
 end
 
@@ -238,6 +240,7 @@ function build_distributed_dg_from_local_mesh(
     boundary_face_tags::Dict{NTuple{3, Int}, Int} =
         local_boundary_face_tags(distributed_mesh),
     trace_tol::Float64 = 1e-10,
+    nodal_set::Symbol = :equispaced,
     backend::AbstractBackend = SerialBackend(),
     comm::MPI.Comm = MPI.COMM_WORLD,
 )
@@ -252,6 +255,7 @@ function build_distributed_dg_from_local_mesh(
         order;
         boundary_tag_name = boundary_tag_name,
         trace_tol = trace_tol,
+        nodal_set = nodal_set,
         backend = backend,
     )
 
@@ -273,6 +277,7 @@ function build_distributed_dg(
     boundary_tag_name::String = "boundary_id",
     material_tag_name::Union{Nothing, String} = nothing,
     trace_tol::Float64 = 1e-10,
+    nodal_set::Symbol = :equispaced,
     backend::AbstractBackend = SerialBackend(),
 )
     MPI.Initialized() ||
@@ -315,6 +320,7 @@ function build_distributed_dg(
         boundary_tag_name = boundary_tag_name,
         boundary_face_tags = boundary_face_tags,
         trace_tol = trace_tol,
+        nodal_set = nodal_set,
         backend = backend,
         comm = comm,
     )
@@ -478,6 +484,7 @@ function build_distributed_dg_from_root(
     boundary_tag_name::String = "boundary_id",
     material_tag_name::Union{Nothing, String} = nothing,
     trace_tol::Float64 = 1e-10,
+    nodal_set::Symbol = :equispaced,
     backend::AbstractBackend = SerialBackend(),
 )
     MPI.Initialized() ||
@@ -501,6 +508,7 @@ function build_distributed_dg_from_root(
         order;
         boundary_tag_name = boundary_tag_name,
         trace_tol = trace_tol,
+        nodal_set = nodal_set,
         backend = backend,
         comm = comm,
     )
@@ -651,13 +659,13 @@ function unpack_maxwell_interface!(
     return U
 end
 
-function exchange_maxwell_ghost_traces!(
+function begin_maxwell_ghost_trace_exchange!(
     U::MaxwellField,
     distributed_dg::DistributedDGDiscretization;
     tag::Int = 24017,
+    requests::Vector{MPI.Request} = distributed_dg.exchange.requests,
 )
     exchange = distributed_dg.exchange
-    requests = MPI.Request[]
 
     for neighbor in exchange.neighbors
         faces = exchange.faces[neighbor]
@@ -689,7 +697,14 @@ function exchange_maxwell_ghost_traces!(
         )
     end
 
-    MPI.Waitall(requests)
+    return requests
+end
+
+function finish_maxwell_ghost_trace_exchange!(
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization,
+)
+    exchange = distributed_dg.exchange
 
     for neighbor in exchange.neighbors
         unpack_maxwell_interface!(
@@ -700,6 +715,19 @@ function exchange_maxwell_ghost_traces!(
     end
 
     return U
+end
+
+
+function exchange_maxwell_ghost_traces!(
+    U::MaxwellField,
+    distributed_dg::DistributedDGDiscretization;
+    tag::Int = 24017,
+)
+    requests = distributed_dg.exchange.requests
+    empty!(requests)
+    begin_maxwell_ghost_trace_exchange!(U, distributed_dg; tag = tag, requests = requests)
+    isempty(requests) || MPI.Waitall(requests)
+    return finish_maxwell_ghost_trace_exchange!(U, distributed_dg)
 end
 
 function zero_ghost_maxwell_rhs!(
@@ -721,6 +749,14 @@ function zero_ghost_maxwell_rhs!(
         end
     end
 
+    return rhs
+end
+
+function zero_complementary_maxwell_rhs!(rhs::MaxwellRHS, partition::Symbol)
+    components = partition == :E ? (rhs.rhsHx, rhs.rhsHy, rhs.rhsHz) :
+                 partition == :H ? (rhs.rhsEx, rhs.rhsEy, rhs.rhsEz) :
+                 throw(ArgumentError("Maxwell partition must be :E or :H."))
+    foreach(component -> fill!(component, 0.0), components)
     return rhs
 end
 
@@ -802,20 +838,51 @@ function maxwell_rhs!(
     formulation::AbstractMaxwellDGFormulation;
     ε::Float64 = 1.0,
     μ::Float64 = 1.0,
+    partition::Union{Nothing,Symbol} = nothing,
 )
-    exchange_maxwell_ghost_traces!(U, distributed_dg)
-
-    maxwell_rhs!(
-        rhs,
-        U,
-        distributed_dg.dg,
-        registry,
-        formulation;
-        ε = ε,
-        μ = μ,
-    )
+    dg = distributed_dg.dg
+    if partition !== nothing && formulation isa PoissonBracketFormulation && dg.backend isa SerialBackend
+        requests = distributed_dg.exchange.requests
+        empty!(requests)
+        begin_maxwell_ghost_trace_exchange!(U, distributed_dg; requests = requests)
+        fill_maxwell_rhs!(rhs, 0.0)
+        volume_workspace = maxwell_volume_serial_workspace!(dg.backend, U, dg.ref)
+        surface_workspace = maxwell_surface_workspace!(dg.backend, dg.ref, dg.fops)
+        maxwell_poisson_volume_partition_rhs!(rhs, U, dg.ref, dg.physops, partition;
+            ε = ε, μ = μ, reset = false, workspace = volume_workspace,
+            elements = distributed_dg.distributed_mesh.partition.owned)
+        isempty(requests) || MPI.Waitall(requests)
+        finish_maxwell_ghost_trace_exchange!(U, distributed_dg)
+        maxwell_interior_surface_rhs!(rhs, U, dg.ref, dg.fops, dg.mappings,
+            dg.flux_faces, formulation; ε = ε, μ = μ, workspace = surface_workspace)
+        maxwell_boundary_surface_rhs!(rhs, U, dg.ref, dg.fops, dg.mappings,
+            dg.flux_faces, registry, formulation; ε = ε, μ = μ,
+            workspace = surface_workspace)
+        zero_complementary_maxwell_rhs!(rhs, partition)
+    elseif formulation isa PoissonBracketFormulation && dg.backend isa SerialBackend
+        exchange_maxwell_ghost_traces!(U, distributed_dg)
+        maxwell_rhs!(rhs, U, dg, registry, formulation, dg.backend;
+                     ε = ε, μ = μ,
+                     volume_elements = distributed_dg.distributed_mesh.partition.owned)
+    else
+        exchange_maxwell_ghost_traces!(U, distributed_dg)
+        maxwell_rhs!(rhs, U, dg, registry, formulation; ε = ε, μ = μ)
+    end
 
     return zero_ghost_maxwell_rhs!(rhs, distributed_dg)
+end
+
+function make_distributed_maxwell_partition_rhs_function(
+    distributed_dg::DistributedDGDiscretization,
+    registry::MaxwellBoundaryRegistry,
+    formulation::PoissonBracketFormulation;
+    ε::Float64 = 1.0,
+    μ::Float64 = 1.0,
+)
+    return function rhs_partition_function!(rhs::MaxwellRHS, U::MaxwellField, partition::Symbol)
+        return maxwell_rhs!(rhs, U, distributed_dg, registry, formulation;
+                            ε = ε, μ = μ, partition = partition)
+    end
 end
 
 function maxwell_rhs!(

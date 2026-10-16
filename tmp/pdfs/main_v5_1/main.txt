@@ -1,0 +1,1765 @@
+    A structure-preserving discontinuous Galerkin method for Maxwell’s equations
+                   based on a discrete Poisson bracket formulation
+
+                    Martí Circuns-Duxansa , Eloi Ruiz-Gironésa , Josep de la Puentea , Xevi Rocaa,∗
+        a Computer Applications in Science and Engineering, Barcelona Supercomputing Center, E-08034, Barcelona, Spain
+
+
+
+
+Abstract
+We develop a structure-preserving discontinuous Galerkin method for the time-domain Maxwell’s equations based
+on a discrete Poisson bracket formulation. Starting from the Hamiltonian structure of the electric-magnetic field
+system, we construct a discontinuous finite element discretization of the underlying Poisson bracket that preserves
+skew-symmetry and yields a finite-dimensional Hamiltonian system of ordinary differential equations for the discrete
+field coefficients. To obtain a fully discrete scheme suitable for long-time wave propagation, we couple this semi-
+discretization with explicit symplectic partitioned Runge-Kutta time integration. The resulting method preserves
+the relevant discrete geometric structure and exhibits the bounded, non-secular energy behaviour characteristic of
+symplectic integration. Numerical experiments—including plane-wave propagation and cavity-mode benchmarks—
+demonstrate high-order convergence, long-time physical fidelity, and robust conservation properties.
+Keywords: Maxwell’s equations, discontinuous Galerkin method, structure-preserving discretization, Hamiltonian
+systems, Poisson bracket
+
+
+1. Introduction
+
+    Time-domain simulation of electromagnetic waves is central to applications ranging from antenna design and
+scattering to photonics and plasma modeling. At the PDE level, Maxwell’s equations encode not only wave propaga-
+tion and source coupling, but also tightly constrained geometric and variational structure: curl operators connected
+by Stokes’ theorem, divergence constraints, and conservation laws such as Poynting’s theorem. In lossless media
+and in closed domains, these features yield conserved quantities -most prominently electromagnetic energy- that are
+physically meaningful and numerically diagnostic over long time horizons.
+    A persistent difficulty in computational electromagnetics is that high-order spatial accuracy alone does not guar-
+antee physically faithful long-time behavior. Even stable schemes may exhibit slow drift in invariants, accumulated
+phase error, or spurious modes, especially when simulations require many wave periods or when multiscale resolutions
+enforce stringent CFL conditions. This motivates structure-preserving discretizations: algorithms designed so that
+discrete solutions inherit key geometric identities and invariants of the continuous system. In geometric numerical
+integration, symplectic methods are the flagship example for Hamiltonian ODEs; they are designed to preserve the
+symplectic structure and thereby yield near-conservation of invariants over long integrations [32].
+    Classical electromagnetic solvers set the baseline. The finite-difference time-domain (FDTD) scheme introduced
+by Yee remains foundational in time-domain electromagnetics and is supported by extensive practical developments
+[17, 23, 12]. While FDTD is efficient on structured grids, unstructured geometries and high-order accuracy often
+
+
+  ∗ Corresponding author
+
+    Email addresses: marti.circuns@bsc.es (Martí Circuns-Duxans), eloi.ruiz@bsc.es (Eloi Ruiz-Gironés),
+josep.delapuente@bsc.es (Josep de la Puente), xevi.roca@bsc.es (Xevi Roca)
+lead to finite element and discontinuous Galerkin formulations Curl-conforming edge elements [24, 6, 25, 5] and their
+modern FEEC interpretation provide stable discretizations aligned with the de Rham complex and are a standard
+tool in computational electromagnetism [15, 4].
+    Discontinuous Galerkin time-domain (DGTD) methods further offer element-local mass matrices, high-order
+approximations, and flexibility for heterogeneous media and local refinement; they have a mature analysis literature
+addressing stability, convergence, and energy behavior under specific flux and time choices [7, 8, 16, 18, 22, 10].
+    A particularly direct route to conservation is the bracket-first philosophy: discretize the Poisson bracket and
+Hamiltonian functional so that discrete skew-symmetry is built in, and conservation follows from algebra rather than
+from delicate cancellations in the PDE form. In fluid dynamics and geophysical flows, this idea is classic [3](. In
+finite element settings, [34] demonstrated that discretizing a bilinear Poisson bracket with discontinuous elements can
+produce a semi-discrete Hamiltonian ODE system with mass/energy conservation properties, providing a template
+for hyperbolic systems that include Maxwell-type equations. In electromagnetic plasma simulations, discrete Poisson
+bracket constructions also underpin modern structure-preserving Vlasov-Maxwell solvers, where bracket properties
+and a compatible field space are central design constraints [19].
+    The closest modern comparison class is the emerging family of symplectic-Hamiltonian finite element methods,
+which explicitly constructs space discretizations yielding a discrete Hamiltonian ODE and couples them with sym-
+plectic time integrators to obtain non-drifting approximations of key physical quantities [28, 29, 30, 31, 26]. Our
+focus differs in that we organize the discretization around an explicit discrete Poisson bracket defined in DG spaces,
+and we emphasize explicit symplectic time-marching and DGTD-style benchmarking to assess accuracy, stability,
+and long-time fidelity.
+    In contrast to the recent family of Symplectic Finite Element Methods, the scheme presented in this paper applies
+directly to a discrete analog of the Poisson bracket in space, naturally yielding a Hamiltonian system of ODEs. In
+time, we combine the resulting semi-discrete scheme with suitable symplectic time-marching schemes for long-time
+simulations.
+    This work makes three contributions. First, starting from the Hamiltonian formulation of Maxwell’s equations in
+the E − H variables, we construct a discrete Poisson bracket posed on discontinuous finite element spaces. The re-
+sulting semi-discrete evolution is therefore obtained directly from a finite-dimensional Hamiltonian structure, rather
+than from a DG weak form postulated a priori and analyzed afterward. Second, we show that the semi-discrete equa-
+tions induced by this bracket coincide with a discontinuous Galerkin formulation with well-defined face contributions
+arising from broken integration by parts. In this sense, the numerical flux structure is not an external design choice,
+but emerges from the discrete Hamiltonian framework. Third, we combine the bracket-based DG semi-discretization
+with explicit symplectic partitioned Runge–Kutta time integrators, thereby obtaining a fully discrete method tailored
+to long-time wave propagation. This construction yields a high-order scheme that is locally discontinuous in space
+and designed to exhibit non-drifting behavior of physically relevant invariants over long simulation times.
+    The main contribution of this work is the systematic derivation of a discontinuous Galerkin discretization of
+Maxwell’s equations from a discrete Poisson bracket. In this construction, the variational formulation and the nu-
+merical traces arise directly from the underlying Hamiltonian structure. The resulting semi-discrete scheme preserves
+the weak electric and magnetic Gauss constraints and, in the source-free case under compatible boundary conditions,
+exactly conserves the discrete electromagnetic energy. The fully discrete formulation is obtained by means of a sym-
+plectic partitioned Runge–Kutta method, which preserves the discrete symplectic structure and provides a favorable
+long-time behavior of the electromagnetic energy.
+    In the present work, the term structure-preserving refers primarily to retaining, at the semi-discrete level, the
+Hamiltonian generation mechanism and the skew-symmetry of the underlying bracket. These properties are sufficient
+to produce a finite-dimensional Hamiltonian evolution and to recover the DG weak form from the discrete bracket
+construction. We do not claim here that the discrete bracket satisfies a Jacobi identity in full generality. From
+the viewpoint of Poisson geometry, the discrete structure retained in this paper is the skew-symmetric Hamiltonian
+coupling induced by the bracket, the algebraic feature most directly tied to the conservation properties studied below.
+    The results presented in this work are threefold. At the structural level, we establish the algebraic properties of the
+
+
+                                                            2
+continuous and discrete brackets that are needed for the formulation, and we show that the semi-discrete evolution
+generated by the discrete bracket recovers the proposed weak form. At the methodological level, we present the
+passage from the continuous bracket to its broken-space counterpart as a formal derivation that guides the design of
+the spatial discretization. At the fully discrete level, we interpret the long-time conservation and stability properties
+associated with symplectic partitioned Runge–Kutta time integration in light of standard geometric integration
+theory, and we assess the resulting scheme numerically through convergence, conservation, and long-time propagation
+tests. Throughout the paper, we distinguish explicitly between statements proved here, statements inherited from
+classical symplectic integration theory, and properties supported by the numerical experiments.
+    The remainder of this paper is organized as follows. In Section 2, we present the paper’s preliminaries. In
+Section 2.2, we present the Hamiltonian structure of Maxwell’s equations in E − H formulation and derive the
+associated Poisson bracket. In Section 2.3, we introduce the structure-preserving discontinuous Galerkin spatial
+discretization through a discrete Poisson bracket formulation and derive the corresponding semi-discrete weak form.
+In Section 3, tal i qual. In , we construct the fully discrete scheme by coupling the semi-discrete Hamiltonian
+system with explicit symplectic partitioned Runge-Kutta time integrators. Section 5 presents numerical experiments,
+including convergence studies, conservation of physical quantities, and long-time physical-fidelity analyses.
+
+
+2. Preliminaries
+
+2.1. Maxwell equations
+    The fundamental principles of electricity and magnetism, known as Maxwell’s equations, can be summarized in
+differential form as follows [33]:
+
+                                                      εĖ = ∇ × H − J,                                              (1a)
+                                                     µḢ = −∇ × E,                                                  (1b)
+                                                ∇ · (εE) = ρ,                                                       (1c)
+                                                ∇ · (µH) = 0,                                                       (1d)
+
+in Ω × (0, T ], equipped with the following boundary condition
+
+                                              n × E = gE on Γ × (0, T ],
+   and initial conditions
+
+                                                 E(x, 0) = E0 , on Ω,
+                                                 H(x, 0) = H0 , on Ω.
+
+    Here, E and H are the electric and magnetic fields; ε and µ are the permittivity and permeability; and ρ and
+J represent the scalar charge density function and the vector current density function, respectively. Equations (1a)
+to (1d) assume a homogeneous, non-dispersive medium where ε, µ, ρ, J, and gE are independent of time. It also
+disregards polarization and magnetization effects, implying a linear relationship between the fields and charges.
+We also assume that the current J is solenoidal, J = ∇ × J× . Equations (1a) to (1d) account for full time-
+dependent behavior without approximating steady-state conditions. It also disregards polarization and magnetization
+effects, implying a linear relationship between the fields and charges. The set of Equations (1a) to (1d) forms the
+basis of classical electromagnetic phenomena and has been extensively studied in CEM, particularly in time-domain
+formulations.
+    The quantities appearing in Table 1 are defined as follows. The vector
+
+                                                      S := E × H
+
+
+                                                           3
+Table 1: Conservation law for EM quantities, η, η̇ + ∇ · fη = Sη , deduced from Equations (1a) and (1b). We denote the flux of η by fη
+and the corresponding sources and sinks by Sη . See [30, 33] for a detailed description of electromagnetic quantities.
+
+
+                       Conservation of            η            fη          Sη
+                       Energy                     HE           S           −E · J
+                       Linear momentum            P            −σ          −F + 12 (E · E∇ε + H · H∇µ)
+                       Angular momentum           L            −x × σ      x × SP
+                       Magnetic charge            ∇ · (µH)     0           0
+                       Electric charge            ∇ · (εE)     J           0
+
+
+is the Poynting vector, representing the electromagnetic energy flux. The Maxwell stress tensor is
+                                                                                1 (︁
+                                                                                     ε|E|2 + µ|H|2 ,
+                                                                                                  )︁
+                                σ := ε E ⊗ E + µ H ⊗ H − E I,            E :=
+                                                                                2
+where E is the electromagnetic energy density, I is the identity tensor, and ⊗ denotes the tensor product, with
+(a ⊗ b)ij = ai bj . The vector
+                                             F := ρ E + J × (µH)
+is the Lorentz force density acting on charges and currents.
+    The position vector relative to a fixed origin is denoted by x = (x1 , x2 , x3 )T . The electromagnetic linear and
+angular momentum densities are, respectively,
+
+                                              P := (εE) × (µH),          L := x × P.
+
+The source term in the linear momentum balance is
+                                                             1 (︁ 2
+                                                                 |E| ∇ε + |H|2 ∇µ ,
+                                                                                 )︁
+                                              SP := −F +
+                                                             2
+so that
+                                                      ∂t P + ∇ · (−σ) = SP .
+Accordingly, the angular momentum source is x × SP . For the homogeneous medium considered here, ∇ε = ∇µ = 0
+and therefore SP = −F.
+    Maxwell’s equations describe the behavior of electromagnetic fields and give rise to fundamental conservation laws
+that are pivotal in understanding the physical properties of electromagnetic phenomena. These conservation laws
+are expressed in invariants that reflect the continuity and balance of key quantities, such as magnetic charge, electric
+charge, energy, linear momentum, and angular momentum; see Table 1. These conserved quantities provide deep
+insights into the symmetries and fundamental behaviors of electromagnetic systems, playing a crucial role in analyzing
+transient phenomena such as scattering, emission, and dynamic observability. Preserving these invariants through
+high-fidelity physical simulations is imperative to ensure that the numerical model remains faithful to the underlying
+physical laws; however, some numerical schemes often fail to preserve these conserved quantities, potentially leading
+to discrepancies in complex electromagnetic scenarios.
+
+2.2. Poisson structure
+   Next, we state the Hamiltonian formulation of Maxwell’s equations in the E − H variables and identify the
+corresponding Poisson bracket; see [30]. This section serves two purposes: first, to state clearly the continuous
+bracket structure that motivates the discretization; second, to isolate the algebraic ingredients preserved at the
+semi-discrete level.
+
+
+                                                                    4
+2.2.1. Manifolds
+    To formulate Maxwell’s equations as a Hamiltonian system, we must specify both the phase space and the class
+of admissible variations. The phase space incorporates the boundary condition through the exterior trace, while the
+space of variations determines the functionals on which the Poisson bracket acts.
+    We define M and D, the phase and test-function spaces, respectively, as follows
+
+                                            M = L2,ext (Ω; gE ) × H(curl, Ω),                                   (2a)
+                                                     ∞,ext                ∞
+                                             D=C             (Ω; 0) × C (Ω).                                    (2b)
+
+So E lives in an affine space with prescribed tangential exterior trace, while H lives in H(curl).
+    To account for the boundary condition, Equation (2) accounts for the exterior trace of the tangential electric
+field. This choice ensures that the boundary contributions arising from integration by parts are well-defined and
+consistent with the imposed tangential condition.
+
+2.2.2. Hamiltonian
+    The Hamiltonian represents the system’s total electromagnetic energy, augmented by a source term chosen to
+reproduce the current in Ampère’s law. This functional will generate the time evolution through the Poisson bracket.
+We define the Hamiltonian as
+                                               ∫︂                      ∫︂
+                                             1
+                                H(E, H) =         (εE · E + µH · H) −      J× · µH.                              (3)
+                                             2 Ω                         Ω
+
+Equation (3) is the electromagnetic energy plus a source term involving a solenoidal source. The second term in
+Equation (3) is chosen so that the functional derivative with respect to H produces the shifted field H − J× . Taking
+the curl reproduces the physical current J = ∇ × J× in Ampère’s law.
+
+2.2.3. Poisson Bracket
+    We consider the E − H Poisson bracket as
+                              ∫︂ (︃                (︃       )︃             (︃      )︃)︃
+                                      1 δF            1 δG       1 δG         1 δF
+                     {F, G} =               ·∇×                −      ·∇×
+                                 Ω    ε δE            µ δH       ε δE         µ δH
+                              ∫︂   (︄(︃      )︃ext       (︃      )︃ (︃      )︃ext      (︃      )︃)︄
+                                        1 δF                1 δG       1 δG               1 δF
+                            −                      ·n×              −             n×·               ,             (4)
+                                Γ       ε δE                µ δH       ε δE               µ δH
+
+where F = F (E, H) and G = G(E, H) are functionals on the manifold M. In addition, the functional derivatives,
+ δ    δ
+δE , δH are defined
+                                      ∫︂
+                                          δF        d
+                                             ·ϕ=      F (E + εϕ, H) ,                                    (5a)
+                                          δE       dε
+                                     ∫︂ Ω
+                                          δF        d
+                                             ·ψ =     F (E, H + εψ) ,                                    (5b)
+                                       Ω  δH       dε
+
+and the coordinate functionals,
+                                                                ∫︂
+                                                   FE (ϕ) =            εE · ϕ,                                  (6a)
+                                                                ∫︂Ω
+                                                   FH (ψ) =            µH · ψ.                                  (6b)
+                                                                   Ω
+
+
+
+                                                               5
+2.3. Semi-discrete structure
+    In this section, we state a semi-discrete method by discretizing the Hamiltonian structure identified in Section 2.2;
+see Equation (4).
+    We now introduce the finite-dimensional Hamiltonian scheme underlying our spatial discretization. This requires
+three ingredients: a discrete phase space, a discrete Hamiltonian functional, and a discrete bracket acting on function-
+als of the discrete fields. Once these objects are specified, the discrete Hamiltonian structure defines the semi-discrete
+evolution by direct analogy with the continuous formulation. The main point of this construction is that the DG
+semi-discretization will emerge from this bracket-generated dynamics rather than being imposed independently.
+
+2.3.1. Mesh notation and broken finite element spaces
+    We briefly recall the mesh notation and broken finite element framework used throughout the DG discretization;
+we follow standard nodal DG terminology and conventions [9, 13, 14].
+    Given a domain Ω and a characteristic mesh size h, we denote by Th a collection of disjoint regular elements K
+that partition Ω, that is                                 ⋃︂
+                                                    Ω=        K.
+                                                                 K∈T
+
+For two elements K − and K + in Th , F = ∂K − ∩ ∂K + is an interior face between K − and K + if the d − 1 measure
+of F is nonzero. For an element K in Th , F = ∂K ∩ ∂Ω is a boundary face if the d − 1 measure of F is nonzero. We
+denote by Fh0 the set of interior faces of Th , and by Fh∂ the set of boundary faces. The set of all faces of an element
+K is ∂K, and the collection of all element boundaries is
+                                                   ∂Th = {∂K|K ∈ Th },
+and it is referred as the mesh skeleton.
+   ?? summarizes the definitions and notation for the entities associated with the triangulation of the domain Th .
+                              Table 2: Definitions of entities related to the domain triangulation.
+
+
+          Entity     Description                                 Definition
+          T          Simplicial mesh of the domain Ω                  ⋃︁ collection of simplices, T = {K}
+                                                                 A finite
+          Ω̄         Closure of the domain Ω                     Ω̄ = K∈T K̄
+          hK         Size of element K                           The inner diameter of element K
+          h          Mesh size                                   h := minK∈T hK
+          Th         Simplicial mesh with mesh size h            A simplicial mesh defined by Th with mesh size h
+          ∂Th        Element boundaries                          ∂Th = {∂K | K ∈ Th }
+          F          Mesh face                                   A subset of Ω
+          Fh0        Interior faces                              Given K − and K + , F = ∂K − ∩ ∂K +
+          Fh∂        Boundary faces                              If F = ∂K − ∩ ∂Ω for some element K −
+          ∂K         Faces of element K                          The set of all faces of element K
+
+   Given a simplex K ∈ Th , we define the inner products as the following volume integrals
+                                               ∫︂                    ∫︂
+                                    (u, v)K :=     uv, (q, w)K :=       q · w,
+                                                      K                        K
+                2                                            2        d
+where u, v ∈ L (K) are scalar functions and q, w ∈ L (K) are vector-valued functions. We also define the inner
+products over the triangulation Th ,
+                                           ∑︂                      ∑︂
+                                (u, v)Th =    (u, v)K , (q, w)Th =    (q, w)K .
+                                              K∈Th                            K∈Th
+
+
+                                                                  6
+Similarly, for the element boundaries and the boundaries of Th , we define the following inner products
+                                   ∫︂                                              ∫︂
+                       ⟨u, v⟩∂K :=      uv,                          ⟨q, w⟩∂K :=        q · w,
+                                     ∂K                                              ∂K
+                                    ∑︂                                              ∑︂
+                      ⟨u, v⟩∂Th :=      ⟨u, v⟩∂K ,                  ⟨q, w⟩∂Th :=        ⟨q, w⟩∂K .
+                                 K∈Th                                                           K∈Th
+
+
+
+Moreover, we define the inner products
+                                                ∑︂                               ∑︂
+                                    ⟨u, v⟩F =          ⟨u, v⟩F ,     ⟨q, w⟩F =          ⟨q, w⟩F ,
+                                                F ∈F                             F ∈F
+
+where F is a set of faces, such as F, Fh0 , Fh∂ . Eventually, we also define the inner products for the inner skeleton and
+the boundary skeleton as follows
+                                              ∑︂
+                           ⟨q, w⟩∂Th \∂Ω =          ⟨q, w⟩∂K\∂Ω
+                                            K∈Th
+                                                   ∑︂                               ∑︂
+                          ⟨q, w⟩∂Th ∩∂Ω =                          ⟨q, w⟩∂K∩∂Ω =           ⟨q, w⟩∂K∩∂Ω .
+                                            K∈Th |∂K∩∂Ω̸=∅                         K∈Th
+
+    For interior faces Fh0 , see the definition in Table 2; we define the average, the jump, and the jump along a normal
+of a vector-valued function r as follows
+                                                          1 (︁ +
+                                                              r + r− ,
+                                                                    )︁
+                                                  {r} :=
+                                                          2
+                                                   [r] := r− − r+
+                                                [[r]] := n− × r− + n+ × r+ .
+The jump of a vector-valued function r on a boundary face, Fh∂ is defined as follows
+                                                   [[r]] := n × (r − rext ),
+where rext is the exterior trace.
+    We define the average, the jump, and the jump along a normal of a scalar-valued function u for an interior face
+Fh0 as follows
+                                                      1 (︁
+                                               {u} := u− + u+
+                                                              )︁
+                                                      2
+                                                [u] :=u− − u+
+                                                   [[u]] :=n− u− + n+ u+
+The jump of a scalar-valued function u on a boundary face, Fh∂ is defined as follows
+                                                       [[u]] := n(u − uext ),
+where uext is the exterior trace.
+    In addition, we should be able to seek for approximations to the electric and magnetic fields, Eh and Hh , on the
+triangulation of the domain, Th . To do so, we work with broken polynomial spaces defined as follows:
+                                 Vh (Th ) := {v ∈ L2 (Ω) | ∀K ∈ Th ,            v|K ∈ V(K)},                         (7a)
+                                                         2
+                                 Wh (Th ) := {w ∈ L (Ω) | ∀K ∈ Th ,              w|K ∈ W(K)}.                        (7b)
+Here, both V(K) and W(K) represent the space of piecewise-defined polynomials, Pkd (K), of degree k and dimension
+d for a given simplex K used to approximate Eh and Hh , respectively.
+
+
+                                                                    7
+2.3.2. Manifolds
+    We introduce the discrete phase space and the test function space, respectively, as
+
+                                                 Mh := Vhext (gE ) × Wh ,                                     (8a)
+                                                  Dh := Vhext (0) × Wh ,                                      (8b)
+
+where Vh and Wh are broken polynomial spaces over the mesh Th . As in the continuous setting, the tangential
+boundary condition is incorporated through the exterior trace in Vhext (gE ).
+
+2.3.3. Discrete Hamiltonian
+    The discrete Hamiltonian is defined by
+                                        1
+                                 Hh =     ((εEh , Eh )Th + (µHh , Hh )Th ) − (J× , µHh )Th .                    (9)
+                                        2
+This is the natural broken-space analog of the continuous Hamiltonian: it consists of the discrete electromagnetic
+energy together with the source contribution needed to recover the forcing term in Ampère’s law.
+
+2.3.4. Discrete Poisson Bracket
+    Now, we can define the discrete Poisson bracket as
+                                 (︃             (︃       )︃)︃      (︃              (︃       )︃)︃
+                                    1 δF           1 δG               1 δG            1 δF
+                      {F, G}h =           ,∇ ×                   −           ,∇ ×
+                                    ε δEh          µ δHh      Th      ε δEh           µ δHh      Th
+                                ⟨︄             (︃       )︃⟩︄        ⟨︄             (︃       )︃⟩︄
+                                    1 δF
+                                       ˆ︂         1 δG                 1 δG
+                                                                          ˆ︂          1 δF
+                              −           ,n ×                   +            ,n ×                  ,         (10)
+                                    ε δEh         µ δHh                ε δEh          µ δHh
+                                                              ∂Th                               ∂Th
+
+where the numerical trace for u is defined as
+                                                {︄
+                                                  {u} + C12 [[u]]     if F ∈ Fh0 ,
+                                          u
+                                          ˆ︁ :=                                                               (11)
+                                                  uext                if F ∈ Fh∂ ,
+
+   The coordinate functionals are
+
+                              FEh = (εEh , v)Th and FHh = (µHh , w)Th          ∀(v, w) ∈ Dh .                 (12)
+
+2.3.5. Semi-discrete Hamiltonian system
+    The semi-discrete Hamiltonian system is defined as follows
+
+                                                   ḞEh = {FEh , Hh }h ,                                     (13a)
+                                                   ḞHh = {FHh , Hh }h .                                     (13b)
+
+
+3. Bracket-induced DG weak formulation
+
+   In this section, we aim to find a bracket-induced, Hamiltonian weak form in Eh − Hh variables. The resulting
+semi-discrete weak form is then equivalent to a discontinuous Galerkin formulation, with face contributions arising
+naturally from the broken bracket structure.
+
+
+
+
+                                                             8
+3.1. Our semi-discrete Hamiltonian formulation with DG structure
+    We do not introduce the weak formulation here as an independent discretization ansatz. Rather, it is the explicit
+form taken by the bracket-generated semi-discrete evolution when tested against the coordinate functionals of the
+discrete fields. In this sense, the discontinuous Galerkin structure follows from the semi-discretediscrete Hamiltonian
+framework.
+
+3.2. Derivation
+   Here we verify explicitly that the discrete Hamiltonian evolution law reproduces the weak semi-discrete system.
+This calculation is the key link between the abstract bracket formulation and the implementable numerical method.
+The weak form is therefore not an external construction, but the concrete realization of the discrete bracket dynamics.
+
+3.2.1. Hamiltonian dynamics of Eh and Hh from the semi-discrete Poisson bracket
+Lemma 3.1. (from Poisson bracket). The semi-discrete Hamiltonian dynamics for Eh and Hh , are equivalent to
+seek for (Eh , Hh ) ∈ Vh × Wh such that
+          (︂          )︂
+             εĖh , v       = (∇ × Hh , v)Th − (J, v)Th − ⟨n × Hh , v⟩
+                                                                    ˆ︁ ∂Th + ⟨n × J× , v⟩
+                                                                                       ˆ︁ ∂Th  ∀v ∈ Vh , (14a)
+                         Th
+        (︂            )︂                         ⟨︂              ⟩︂
+           µḢh , w         = − (Eh , ∇ × w)Th + E  ˆ︁ h , n × w                              ∀w ∈ Wh .  (14b)
+                  Th                                     ∂Th
+
+Proof. We define the time derivative of the coordinate functionals Equation (12) as follows
+                                                       (︂       )︂
+                                               ḞEh := εĖh , v       ,                                          (15a)
+                                                                   T
+                                                       (︂         )︂h
+                                               ḞHh := µḢh , w         .                                        (15b)
+                                                                   Th
+
+In addition, applying the functional derivatives to the coordinate functionals FEh and FHh , see Equation (12), it
+follows that
+                                         1 δFEh          1 δFHh
+                                                 = v,           = 0,                                             (16a)
+                                         ε δEh           ε δEh
+                                         1 δFEh          1 δFHh
+                                                 = 0,            =w                                              (16b)
+                                         µ δHh           µ δHh
+                                         1 δHh           1 δHh
+                                                = Eh ,          = Hh − J× .                                      (16c)
+                                         ε δEh           µ δHh
+
+Inserting Equation (16) in the semi-discrete Poisson bracket Equation (10) we obtain:
+
+                    {FEh , Hh }h = (∇ × Hh , v)Th − (J, v)Th − ⟨n × Hh , v⟩
+                                                                         ˆ︁ ∂Th + ⟨n × J× , v⟩
+                                                                                            ˆ︁ ∂Th               (17a)
+                                                      ⟨︂              ⟩︂
+                    {FHh , Hh }h = − (Eh , ∇ × w)Th + E  ˆ︁ h , n × w                                            (17b)
+                                                                        ∂Th
+
+    We obtain the semi-discrete Hamiltonian weak form of Equation (14) by taking the definition of the semi-discrete
+Hamiltonian system, see Equation (13), and inserting Equation (15) and Equation (17) on the left-hand side and
+right-hand side, respectively.
+
+
+
+
+                                                          9
+3.2.2. Equivalent semi-discrete weak form without current vector potential
+Lemma 3.2. (without current vector potential). The weak form of Lemma 3.1, is equivalent to seek (Eh , Hh ) ∈
+Vh × Wh such that
+                 (︂          )︂
+                    εĖh , v       = (∇ × Hh , v)Th − (J, v)Th − ⟨n × Hh , v⟩
+                                                                           ˆ︁ ∂Th  ∀v ∈ Vh ,            (18a)
+                                Th
+               (︂            )︂                         ⟨︂              ⟩︂
+                  µḢh , w         = − (Eh , ∇ × w)Th + E  ˆ︁ h , n × w           ∀w ∈ Wh .             (18b)
+                          Th                                                ∂Th
+
+Proof. Because the weak forms in Equation (14) and Equation (18) differ only by the last term of Equation (14a), we
+only need to show that this term vanishes on the mesh skeleton, ∂Th . By Lemma 1, we can express ⟨n × Jx , v⟩ˆ︁ ∂Th
+as follows
+
+                          ⟨n × Jx , v⟩
+                                    ˆ︁ ∂Th = ⟨[[J× ]], {ˆ︁
+                                                        v}⟩F 0 − ⟨{J× }, [[ˆ︁
+                                                                           v]]⟩F 0 + ⟨n × J× , v⟩
+                                                                                               ˆ︁ F ∂
+                                                                h                           h         h
+                                                (1)   (2)   (3)
+                                             = βEh + βEh + βEh
+
+where,
+                                                     (1)
+                                                    βEh := ⟨[[J× ]], {ˆ︁
+                                                                      v}⟩F 0
+                                                                                   h
+                                                     (2)
+                                                    βEh := − ⟨{J× }, [[ˆ︁
+                                                                       v]]⟩F 0
+                                                                            h
+                                                     (3)
+                                                    βEh := ⟨n × J× , v⟩
+                                                                     ˆ︁ F ∂ .
+                                                                                   h
+
+
+We proceed to verify that each of the three terms on the right-hand side of the expression above vanishes. For the
+             (1)
+first term, βEh , we use the definition of the jump on interior faces:
+                                             (1)
+                                         βEh = ⟨[[J× ]], {ˆ︁
+                                                          v}⟩F 0
+                                                               h
+
+                                             = n × J−
+                                               ⟨︁ −              +
+                                                                   × J+
+                                                                              ⟩︁
+                                                          ×  + n      × , {ˆ︁
+                                                                           v} F 0 .
+                                                                                                  h
+
+                                +        −
+Since, on every interior face, n = −n = −n, it follows that
+                                       (1)
+                                      βE h = n × J −         +
+                                            ⟨︁                       ⟩︁
+                                                    × − n × J× , {ˆ︁
+                                                                  v} F 0 .
+                                                                                             h
+
+
+Now, because J× is single-valued across Fh0 , its tangential trace is also single-valued, and therefore
+
+                                              n × J−        +
+                                                   × − n × J× = 0                      on Fh0 .
+
+Hence,
+                                                      (1)
+                                                    βEh = ⟨0, {ˆ︁
+                                                               v}⟩F 0 = 0.
+                                                                           h
+
+
+For the second term, we note that v
+                                  ˆ︁ is single-valued across every interior face. Hence its jump vanishes:
+
+                                                      [[ˆ︁
+                                                        v]] = 0          on Fh0 .
+
+It follows immediately that
+                                                    (2)
+                                                   βEh = − ⟨{J× }, [[ˆ︁
+                                                                     v]]⟩F 0
+                                                                                   h
+
+                                                          = − ⟨{J× }, 0⟩F 0 = 0.
+                                                                               h
+
+
+
+
+                                                                    10
+For the third term, we use Lemma 2 to transfer the cross product to the second slot:
+                                                (3)
+                                              βEh = ⟨n × J× , v⟩
+                                                              ˆ︁ F ∂
+                                                                        h
+
+                                                      = − ⟨J× , n × v⟩
+                                                                    ˆ︁ F ∂ .
+                                                                            h
+
+
+On boundary faces, by definition of the exterior trace used in v,
+                                                               ˆ︁ one has
+
+                                            ˆ︁ = n × vext = 0
+                                          n×v                               on Fh∂ .
+
+Therefore,
+                                                (3)
+                                               βEh = − ⟨J× , 0⟩F ∂ = 0.
+                                                                    h
+
+
+
+
+3.2.3. Equivalent face terms with DG structure
+    Next, we will transform the skeleton terms into a convenient form for a standard DG implementation. In standard
+implementations, face terms are implemented as loops over the faces of the elements. However, it is convenient that
+the skeleton expressions only use the trace of the test functions and the normal on the current element. Regarding
+trial functions, we can use any expression depending on the exterior trace and the trace values at both sides. Next,
+according to these standard DG requirements, we transform the skeleton terms.
+
+Lemma 3.3. (magnetic face term with DG structure). The skeleton contribution of Equation (14a) can be rewritten
+as                                             ⟨︃                                ⟩︃
+                                                  1
+                            ⟨n × Hh , v⟩
+                                      ˆ︁ ∂Th =      [[Hh ]] − CT
+                                                               12 n × [[Hh ]], v            .              (19)
+                                                  2                                 ∂Th \∂Ω
+
+Proof. Throughout the proof, we consider
+
+                                               γHh := ⟨n × Hh , v⟩
+                                                                ˆ︁ ∂Th .
+
+   First, taking into account that the boundary term can be decomposed by skeleton contributions in the interior
+and on the boundary, we have that
+
+                                  γHh = ⟨n × Hh , v⟩
+                                                  ˆ︁ ∂Th \∂Ω + ⟨n × Hh , v⟩
+                                                                         ˆ︁ ∂Th ∩∂Ω .
+
+Now, using the definition of the trace operator, see Equation (11), and noticing that the boundary term of the
+right-hand side vanishes since vext is zero on ∂Ω, we have that
+
+                                       γHh = ⟨n × Hh , {v} + C12 [[v]]⟩∂Th \∂Ω .
+
+In virtue of the average and jump definitions,
+                                ⟨︃                                              ⟩︃
+                                           1 (︁
+                                                v + v+ + C12 n × v + n+ × v+
+                                                      )︁    (︁               )︁
+                          γ Hh = n × H h ,                                                 ,
+                                           2                                       ∂Th \∂Ω
+
+so distributing by v and v+ terms,
+                       ⟨︃                     ⟩︃          ⟨︃                        ⟩︃
+                                1                                  1 +       +    +
+                 γHh = n × Hh , v + C12 n × v            + n × Hh , v + C12 n × v              .
+                                2                ∂Th \∂Ω           2                   ∂Th \∂Ω
+
+
+
+                                                             11
+   Then, since we are integrating the inner skeleton, we can consider that we loop the second right-hand side term
+from the adjacent elements. Accordingly, we must replace n × Hh with n+ × H+        h, v
+                                                                                         +
+                                                                                           with v, and n+ × v+ with
+n × v, yielding to
+                        ⟨︃                        ⟩︃          ⟨︃                            ⟩︃
+                                   1                                       1
+                  γHh = n × Hh , v + C12 n × v               + n+ × H+ h ,   v + C 12 n × v            .
+                                   2                 ∂Th \∂Ω               2                   ∂Th \∂Ω
+
+Thus, grouping by the common right factor,
+                                   ⟨︃                            ⟩︃
+                                           +   + 1
+                           γHh = n × Hh + n × Hh , v + C12 n × v            ,
+                                                  2                 ∂Th \∂Ω
+
+and using the jump definition, we have that
+                                                       ⟨︃                                ⟩︃
+                                                                    1
+                                           γHh =            [[Hh ]], v + C12 n × v                        .
+                                                                    2                         ∂Th \∂Ω
+
+   Finally, distributing by the common left factor and taking into account that ⟨a, n × b⟩∂Th \∂Ω = ⟨−n × a, b⟩∂Th \∂Ω ,
+                                           ⟨︃                  ⟩︃
+                                                1
+                                                                              − n × CT
+                                                                               ⟨︁                 ⟩︁
+                                 γ Hh =           [[Hh ]], v                         12 [[Hh ]], v ∂T \∂Ω .
+                                                2                   ∂Th \∂Ω
+                                                                                                              h
+
+
+
+Hence, grouping by the common right factor, we have that
+                                         ⟨︃                                 ⟩︃
+                                            1
+                                 γHh =        [[Hh ]] − n × CT
+                                                             12 [[H h ]], v            .
+                                            2                                  ∂Th \∂Ω
+
+
+
+
+Lemma 3.4. (electric face term with DG structure). The skeleton contribution of Equation (14b) can be rewritten
+                  ⟨︂              ⟩︂
+                    Eˆ︁ h , n × w    = ⟨−n × ({Eh } + C12 [Eh ]) , w⟩∂Th \∂Ω + ⟨−gE , w⟩∂Th ∩∂Ω            (20)
+                                     ∂Th
+
+Proof. Using Lemma 2, see Section Appendix E,
+                                    ⟨︂              ⟩︂                      ⟨︂             ⟩︂
+                                      Eˆ︁ h , n × w                        = −n × E
+                                                                                  ˆ︁ h , w            .
+                                                                     ∂Th                        ∂Th
+
+Now, we decompose the boundary term into interior and exterior skeleton contributions,
+                      ⟨︂              ⟩︂  ⟨︂             ⟩︂      ⟨︂               ⟩︂
+                        Eˆ︁ h , n × w    = −n × E
+                                                ˆ︁ h , w       + −n × E  ˆ︁ h , w      .
+                                           ∂Th                                 ∂Th \∂Ω                            ∂Th ∩∂Ω
+
+Eventually, the definition of the numerical trace, see Equation (11), and the boundary condition, n × Eext = gE , we
+obtain               ⟨︂              ⟩︂
+                       Eˆ︁ h , n × w    = ⟨−n × ({Eh } + C12 [Eh ]) , w⟩∂Th \∂Ω + ⟨−gE , w⟩∂Th ∩∂Ω .
+                                    ∂Th
+
+
+
+
+                                                                            12
+3.3. Our semi-discrete Hamiltonian weak form: without current vector potential and DG structure
+Proposition 3.1. Taking (Eh , Hh ) ∈ Vh × Wh , the semi-discrete problem is therefore to find (Eh , Hh ) such that,
+for all v ∈ Vh and w ∈ Wh ,
+                                                     ⟨︃                                ⟩︃
+     (︂          )︂                                     1
+        εĖh , v       = (∇ × Hh , v)Th − (J, v)Th −      [[Hh ]] − CT
+                                                                     12 n × [[Hh ]], v                  ∀v ∈ Vh , (21a)
+                    Th                                  2                                 ∂Th \∂Ω
+   (︂            )︂
+     µḢh , w          = − (Eh , ∇ × w)Th + ⟨−n × ({Eh } + C12 [Eh ]) , w⟩∂Th \∂Ω + ⟨−gE , w⟩∂Th ∩∂Ω . ∀w ∈ Wh . (21b)
+              Th
+
+Proof. Using Lemma 3.1, we obtain a semi-discrete Hamiltonian weak form for Eh and Hh from the discrete Poisson
+bracket. We then note that Lemma 3.2 is equivalent to Lemma 3.1 because Jx and v    ˆ︁ are single-valued on interior
+faces and because the exterior trace of v
+                                        ˆ︁ is defined on boundary faces. Given Lemma 3.3 and Lemma 3.4, we are
+able to elaborate an equivalence from the semi-discrete Hamiltonian weak form that comes from the discrete Poisson
+bracket and without the current vector potential to a semi-discrete Hamiltonian weak form whose face terms have a
+DG structure, which is precisely Proposition 3.1.
+Remark 3.2. Because Equation (21) comes from a discrete Poisson bracket and is Hamiltonian at the semi-discrete
+level, it preserves the electromagnetic energy and both the electric and magnetic charge at the semi-discrete level;
+see [30]. The key point here is that our semi-discrete method does not come from a standard DG procedure and
+then it is proved to be equivalent to the semi-discrete Hamiltonian weak form; rather, it is obtained directly from a
+discrete Poisson bracket. Furthermore, its weak form is equivalent to a DG method if we rewrite its face terms in
+the typical DG form by setting the numerical traces to the trial functions.
+
+
+4. Fully discrete structure/system
+
+   After spatial discretization, the Maxwell system is a finite-dimensional partitioned system. Let RE and RH
+denote the electric and magnetic residual operators defined by the weak formulation in Section , including the inverse
+element mass operators. In the source-free case,
+
+                                            Ė h = RE (H h ),        Ḣ h = RH (E h ).                                       (22)
+
+Each right-hand side depends only on the opposite field, so the two partial flows are explicit shears. This structure
+motivates the use of an explicit symplectic partitioned Runge–Kutta (ESPRK) composition.
+   For one time step of length ∆t, the H-first formulation used in this work reads
+                                               (i)      (i−1)       (︁ (i−1) )︁
+                                             Hh = Hh     + bi ∆t RH E h         ,                                            (23)
+                                              (i)  (i−1)           (︁ (i) )︁
+                                             Eh = Eh     + ai ∆t RE H h ,                                                    (24)
+                           (0)    (0)                                             (s)    (s)
+for i = 1, . . . , s, with (E h , H h ) = (E nh , H nh ) and (E n+1
+                                                                h   , H n+1
+                                                                        h   ) = (E h , H h ). The coefficients {ai , bi }si=1 used
+for each temporal order are listed in Appendix . A prescribed current density enters the electric residual at the
+corresponding stage time; all conservation and long-time energy statements below refer to the source-free problem.
+    We define a step (pn , qn ) →    − (pn+1 , qn+1 ) of an s-staged partitioned Runge-Kutta method with coefficients
+
+
+
+
+                                                                13
+(aij , bj , cj ) and (ãij , b̃j , c̃j ) for i, j = 1, ..., s by
+                                          s
+                                         ∑︂                                                                                                  s
+                                                                                                                                            ∑︂
+                         pn+1 = pn +            bi k i ,                                                                 qn+1 = qn +              b̃i k̃i
+                                         i=1                                                                                                i=1
+                                  ∂H n,i n,i n                                                                ∂H n,i n,i n
+                           ki = −    (p , q , t + ci ∆tn ),                                           k̃i =      (p , q , t + c̃i ∆tn )
+                                  ∂q                                                                          ∂p
+                                          s
+                                         ∑︂                                                                                    s
+                                                                                                                              ∑︂
+                         pn,i = pn + ∆tn    aij kj                                                            qn,i = qn + ∆tn    ãij k̃j
+                                                    j=1                                                                                    j=1
+
+
+
+
+In order to define explicit schemes, we consider an explicit and diagonally implicit Runge Kutta methods of the form
+                                         {︄                           {︄
+                                           0     if i < j,               0   if i ≤ j,
+                                  aij =                        ãij =
+                                           bj    if i ≥ j,               b̃j if i > j.
+
+For the separable Hamiltonian structure arising from the semi-discrete Maxwell system, the resulting explicit sym-
+plectic partitioned Runge–Kutta (ESPRK) scheme advances the discrete electromagnetic fields stage-by-stage as
+detailed below
+                                                                       i
+                                                                      ∑︂                                      i−1
+                                                                                                              ∑︂
+                                                pn+1 = pn +                 bj kj ,        qn+1 = qn +              b̃j k̃j ,
+                                                                      j=1                                     j=1
+                                                ∂H n,j n                                             ∂H n,j n
+                                    kj = −         (q , t + cj ∆tn ),                      k̃j = −      (p , t + c̃j ∆tn ).
+                                                ∂q                                                   ∂q
+
+    Now, let us consider the semi-discrete scheme (inseparable equations). We assume that for a given time tn the
+values of the variables are known, we denote these by (Hh n , Eh n ), and they correspond to the 0-stage of an ESPRK
+scheme. Then the, i-th stage of the method, for a time step ∆tn is defined by the equations at the element level as
+follows
+
+                                             (︂                                                                          )︁ )︂
+     µHh n,i , w T = µHh n,i−1 , w T + bi ∆tn ⟨−n × ({Eh } + C12 [Eh ]) , w⟩∂Th \∂Ω + ⟨−gE , w⟩∂Th ∩∂Ω − Eh n,i−1 , ∇ × w T
+(︁              )︁  (︁            )︁                                                                    (︁
+                     h                          h                                                                                                                            h
+
+
+                                                                                                                                                                  (25a)
+                                                             (︄                                                     ⟨︃          (︃                          )︃   ⟩︃     )︄
+                                                                                                                                     1
+          εEh n,i , v T = εEh n,i−1 , v T + b̃i ∆t         n
+                                                                    ∇ × Hh n,i , v T − Jn,i , v T − n ×
+     (︁              )︁  (︁            )︁                      (︁                 )︁  (︁       )︁
+                                                                                                                                       [Hh ] + 2C12 {Hh } , v
+                     h                      h                                              h              h                          2                            ∂Th \∂Ω
+                                                                                                                                                                 (25b)
+
+           These equations are solved using the following algorithm
+
+5. Numerical experiments
+
+    The purpose of this section is to assess the practical behavior of the proposed method. The results reported
+below should therefore be interpreted as numerical evidence for the expected approximation properties and long-
+time conservation behavior of the scheme. In particular, the convergence orders and non-drifting invariant behavior
+shown here are empirical observations for the test problems under consideration, although they are consistent with the
+structural properties established in the previous sections and with the general theory of symplectic time integration.
+
+
+                                                                                      14
+ Algorithm 1: Single iteration of EPRK discontinuous Poisson bracket method for E–H formulation.
+   Input : (Hh n , Eh n );
+   Output : (Hh n+1 , Eh n+1 );
+   Initialize (Hh n,0 , Eh n,0 ) ←
+                                 − (Hh n , Eh n );
+   for i = 1 to s do
+       Hh n,i ←− Solve Equation (25a) given (Hh n,i−1 , Eh n,i−1 );
+           n,i
+       Eh ←    − Solve Equation (25b) given (Hh n,i , Eh n,i−1 );
+   end
+   Return (Hh n+1 , Eh n+1 ) ←   − (Hh n,s , Eh n,s )
+
+
+5.1. Convergence tests
+    We propose an hp-refinement study of two source-free Maxwell problems with analytical solutions: a traveling
+wave in a periodic box and a standing mode in a perfectly conducting cavity. The study compares centered and
+alternating numerical fluxes on unstructured and/or tetrahedral meshes at matched nominal directional resolution.
+Both problems use a homogeneous, lossless medium with ε = µ = 1, J = 0, and wave speed c = (εµ)−1/2 = 1. We
+consider p ∈ {1, 2, 3, 4} and four resolution levels, denoted by M1 , . . . , M4 . All field components are approximated
+by polynomials of total degree at most p, represented using equispaced tetrahedral interpolation nodes. We obtain
+the initial coefficients by nodal interpolation of the exact fields.
+
+Spatial isoresolution and mesh construction. Let qp,ℓ denote the target number of elements along a reference length
+Lref . For the periodic wave, this length is one wavelength in the propagation direction; for the cavity, it is one cube
+edge. We prescribe
+                               12 ℓ−1                   Lref
+                      qp,ℓ =     2 ,       htar,p,ℓ =        ,         Rℓ = pqp,ℓ = 12 2ℓ−1 ,   ℓ = 1, . . . , 4.
+                               p                        qp,ℓ
+Thus, Rℓ is the effective directional resolution per reference length. The prescribed resolution matrix is
+
+                                                 p      M1       M2 M3 M4
+                                                 4       3        6 12 24
+                                                 3       4        8 16 32 .                                             (26)
+                                                 2       6       12 24 48
+                                                 1      12       24 48 96
+
+Here, isoresolution refers to equality of pqp,ℓ across polynomial degrees at a fixed Mℓ . The actual scalar dimension
+per tetrahedron and the global number of field unknowns are
+                                        (p + 1)(p + 2)(p + 3)
+                                 Np =                         ,            Ndof,p,ℓ = 6NK,p,ℓ Np ,
+                                                  6
+where NK,p,ℓ is the number of tetrahedra. These actual counts need not agree across p at fixed Rℓ and will be
+reported separately.
+    For each physical domain, we generate two independent unstructured and/or structured base meshes with Gmsh,
+using q = 3 and q = 4. Uniform refinement by splitting each tetrahedron into eight children produces the two
+sequences 3, 6, 12, 24, 48, 96 and 4, 8, 16, 32. The first supplies the families for p = 1, 2, 4, and the second supplies the
+family for p = 3. A mesh with a given q is reused for every matching (p, ℓ) pair; for example, P 4M2 and P 2M1 use
+the same mesh, as do P 4M3 , P 2M2 , and P 1M1 . Centered and alternating runs use identical meshes, nodal sets,
+initial coefficients, and time steps for every (p, ℓ).
+
+
+                                                                  15
+    The base meshes prescribe edge subdivisions while keeping surface triangulations and volume tetrahedralizations
+unstructured. Accordingly, q specifies a nominal spacing and edge-subdivision count; it does not prescribe the number
+of tetrahedra intersected by an arbitrary interior line. Base-mesh generation uses a fixed seed (1234) and one meshing
+thread. We optimize the base meshes before splitting, and preserve the geometry at every level. Each mesh must
+satisfy the mean-ratio condition
+                                                       12(3|K|)2/3
+                                                 min ∑︁             ≥ 0.1,                                        (27)
+                                                          e⊂K |e|
+                                               K∈Tp,ℓ             2
+
+where the sum runs over the six edges of K. For the periodic domain, we match translated opposite-face triangulations
+during generation and check them after each split. We retain mesh counts, quality measures, generator version, and
+mesh hashes for reproducibility.
+
+Temporal resolution. Time integration uses the magnetic-field-first ESPRK scheme of order p + 1. Define the mini-
+mum element inradius and the nominal CFL bound by
+
+                                      3|K|                        Ceff ρp,ℓ                  0.8
+                         ρp,ℓ = min          ,      ∆tCFL,p,ℓ =             ,      Ceff =        = 0.2.
+                               K∈Tp,ℓ |∂K|                          pc                        4
+
+We take the minimum over the entire distributed mesh. At each resolution level, we impose the degree-dependent
+relation
+                                                            p
+                                                   ∆tp,ℓ = ∆t4,ℓ .                                               (28)
+                                                            4
+Consequently, degrees p = 1, 2, 3 use time steps equal to 1/4, 1/2, and 3/4 of the p = 4 step, respectively. Temporal
+resolution therefore increases as p decreases; we do not hold the number of time steps per period constant across
+degrees.
+    To satisfy all nominal CFL bounds and reach one full period T exactly, we set, separately for each physical
+problem,
+                                                     4
+                                  δℓ =     min         ∆tCFL,p,ℓ ,
+                                       p∈{1,2,3,4} p
+                                         ⌈︃     ⌉︃
+                                             T                   4n4,ℓ                     T
+                                n4,ℓ = 3           ,     np,ℓ =        ,        ∆tp,ℓ =        .
+                                            3δℓ                    p                      np,ℓ
+
+The factor three makes every np,ℓ an integer, including the p = 3 case, while preserving Equation (28) exactly. The
+resulting step is checked against ∆tCFL,p,ℓ for every run. Since split refinement can change element shape, we do not
+assume exact halving of the CFL length between successive mesh levels.
+    The intended regime is one in which temporal errors are small compared with spatial errors. We assess this by
+repeating representative cases with the same initial coefficients and half the time step. We document changes in
+the reported errors before interpreting measured rates as spatial rates. Halving the step also refines the sampling
+of the temporal maximum; comparison at common sample times helps distinguish this effect from a change in the
+numerical trajectory. The choice of CFL and integrator order alone does not establish negligible temporal error.
+
+Error measures and comparison protocol.. We measure errors using the largest actual element diameter,
+
+                                                 hmax,p,ℓ = max diam(K),
+                                                           K∈Tp,ℓ
+
+
+
+
+                                                             16
+which is distinct from both htar,p,ℓ and the inradius entering the CFL estimate. At tn = n∆tp,ℓ , write enU =
+Uh (·, tn ) − U(·, tn ) for U ∈ {E, H}. The primary errors are
+                                                    ⎛                           ⎞1/2
+                                                           ∑︂ ∫︂
+                             EU,p,ℓ =      max      ⎝                  |enU |2 dx⎠       ,           U ∈ {E, H},
+                                         0≤n≤np,ℓ                  K
+                                                         K∈Tp,ℓ
+                                                    (︂                                   )︂1/2
+                            Etot,p,ℓ =     max           ∥enE ∥2L2 (Ω) + ∥enH ∥2L2 (Ω)           .
+                                         0≤n≤np,ℓ
+
+The combined norm uses the normalized material parameters ε = µ = 1. We also record all six component errors,
+including components whose exact value vanishes. Error integrals are evaluated using Jaskowiec–Sukumar cubature
+with requested exactness degree max(2, 2p + 4). Sampling includes t = 0 and every completed time step. We take
+each maximum independently; in particular, we do not reconstruct the combined error from the separately maximized
+electric and magnetic errors. These measurements approximate L∞ (0, T ; L2 (Ω)) errors by discrete-time sampling.
+    For a fixed degree and numerical flux, the measured refinement rate is
+
+                                     (ℓ)        log(EU,p,ℓ−1 /EU,p,ℓ )
+                                    rU,p =                               ,                ℓ = 2, 3, 4,
+                                              log(hmax,p,ℓ−1 /hmax,p,ℓ )
+with the same definition for the combined and component-wise errors. Rates will be computed from unrounded
+values. Comparisons across degrees at fixed Mℓ assess accuracy at equal nominal directional resolution; rates along
+M1 , . . . , M4 assess refinement at fixed p. Together these form an hp study with the prescribed temporal coupling.
+No measured order is inferred before the campaign is completed.
+
+5.1.1. Periodic traveling plane wave
+    Let Ω = (0, 2) × (0, 1) × (0, 1), with periodic identification of each pair of opposite faces. The analytical solution
+is                                      ⎛                ⎞                  ⎛              ⎞
+                                                 0                                   0
+                             E(x, t) = ⎝         0       ⎠,       H(x, t) = ⎝sin(πx − πt)⎠ .
+                                          − sin(πx − πt)                             0
+The wave propagates in the positive x direction with unit amplitude, wavelength λ = 2, and period T = 2. We take
+Lref = λ, so that qp,ℓ in Equation (26) specifies the target elements per wavelength along x. The field errors over one
+period will test propagation and periodic coupling on the split unstructured mesh families.
+    Table 3 reserves the electric and magnetic error comparison for this experiment. The completed data will support
+the fixed-p refinement and fixed-Rℓ comparisons defined above.
+
+5.1.2. Perfectly conducting cavity
+    The second problem is posed on the unit cube Ω = (0, 1)3 , with n × E = 0 on ∂Ω. The analytical standing mode
+is
+                                         ⎛                           ⎞
+                                           − cos(πx) sin(πy) sin(πz)       √
+                               E(x, t) = ⎝             0             ⎠ cos( 3πt),
+                                            sin(πx) sin(πy) cos(πz)
+                                             ⎛                           ⎞
+                                               − sin(πx) cos(πy) cos(πz)       √
+                                          1 ⎝
+                               H(x, t) = √     2 cos(πx) sin(πy) cos(πz) ⎠ sin( 3πt).
+                                           3 − cos(πx) cos(πy) sin(πz)
+
+These fields satisfy the source-free Maxwell equations,
+                                               √        both divergence constraints, and the PEC condition on all
+six walls. We integrate for one period, T = 2/ 3. For this experiment Lref = 1, and qp,ℓ denotes target elements
+
+
+                                                                       17
+Table 3: Results pending: table placeholder. Isoresolution study of the periodic traveling wave with equispaced nodes. Each degree
+block contains M1 , M2 , M3 , M4 in order. Centered and alternating fluxes share the measured hmax and ∆t in each row. Errors are
+sampled maximum-in-time spatial L2 errors. Dashes reserve unreported values; rates at M1 are not applicable.
+
+
+                                                   Centered flux                                    Alternating flux
+p         hmax           ∆t           EE          rE          EH           rH           EE          rE           EH            rH
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+1           –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+2           –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+3           –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+4           –             –            –            –           –            –           –            –           –             –
+            –             –            –            –           –            –           –            –           –             –
+
+
+per cavity edge. The coordinate sinusoidal factors have wavelength two, so the nominal directional resolution per
+coordinate wavelength is 2Rℓ ; it remains matched across degrees at each level.
+   The cavity experiment tests the multidirectional mode together with the physical-boundary treatment on the
+unstructured and/or refinement families. At a full period, the exact electric field returns to its initial state, and the
+exact magnetic field vanishes. Taking the maximum error over the trajectory avoids relying solely on this particular
+endpoint phase. Table 4 reserves the corresponding flux comparison. The recorded results will include combined-field
+and component-wise errors alongside the tabulated electric and magnetic errors.
+
+5.2. Physical fidelity
+    Figure 1 evaluates the physical fidelity of the proposed conservative discretization by comparing the numerical
+approximation with the analytical traveling-wave solution over increasingly long simulation times. The plots display
+the components H2 (top panels) and E3 (bottom panels) as functions of the spatial coordinate x. In each panel, the
+analytical solution (solid black line) is compared with the numerical approximation (red dashed line). The simulation
+employs an ESPRK method of order 5 with time step ∆t = 0.02, combined with a spatial discretization of polynomial
+degree p = 4 and mesh size h = 0.1.
+    Panels (a)–(d) correspond to progressively larger final times T = 10, 100, 1000, and 10000, respectively. Across
+all time horizons, the numerical and analytical solutions remain visually indistinguishable, demonstrating that the
+scheme accurately reproduces both the phase and amplitude of the traveling wave.
+    Several observations can be drawn from these results. First, traveling-wave solutions are particularly sensitive
+to numerical phase errors [1, 2, 11, 20], which typically accumulate during long-time simulations. The near-perfect
+overlap between the numerical and analytical curves, even at T = 104 , indicates that the method exhibits very small
+phase drift, a characteristic feature of structure-preserving time integrators.
+    Second, the amplitude of both (Eh )3 and (Hh )2 remains constant across all panels, indicating the absence of
+artificial numerical dissipation. This behaviour reflects the energy-preserving property of the ESPRK scheme, which
+
+
+                                                               18
+  1                                                                            1
+                                                                 (H)2                                                                                           (H)2
+                                                                 (Hh )2                                                                                         (Hh )2
+  0                                                                            0
+
+−1                                                                         −1
+  1                                                                            1
+             (E)3                                                                             (E)3
+             (Eh )3                                                                           (Eh )3
+  0                                                                            0
+
+−1                                                                         −1
+      0.00   0.25     0.50   0.75    1.00   1.25   1.50   1.75     2.00            0.00       0.25        0.50     0.75     1.00       1.25     1.50     1.75     2.00
+                                      x                                                                                      x
+                                    (a)                                                                                   (b)
+
+  1                                                                                1
+                                                                 (H)2                                                                                             (H)2
+                                                                 (Hh )2                                                                                           (Hh )2
+  0                                                                                0
+
+−1                                                                             −1
+  1                                                                                1
+             (E)3                                                                                (E)3
+             (Eh )3                                                                              (Eh )3
+  0                                                                                0
+
+−1                                                                             −1
+      0.00   0.25     0.50   0.75    1.00   1.25   1.50   1.75     2.00                0.00      0.25       0.50     0.75       1.00     1.25     1.50     1.75        2.00
+                                      x                                                                                          x
+                                    (c)                                                                                      (d)
+
+
+Figure 1: Plot of analytical solution and numerical approximations by conservative scheme. We use an ESPRK of order 5 with time step
+∆t = 0.02. Spatial discretization parameters p = 4 and h = 0.25. Top-left panel: final time T = 10. Top-right panel: final time T = 100.
+Bottom-left panel: final time T = 1000. Bottom-right panel: final time T = 10000.
+
+
+
+
+                                                                          19
+Table 4: Results pending: table placeholder. Isoresolution study of the PEC cavity with equispaced nodes. Each degree block
+contains M1 , M2 , M3 , M4 in order. The two fluxes use identical meshes and time steps. Errors are sampled maximum-in-time spatial L2
+errors over one period, and rates use measured hmax . Dashes reserve unreported values; rates at M1 are not applicable.
+
+
+                                                    Centered flux                                      Alternating flux
+p          hmax           ∆t           EE           rE          EH           rH           EE           rE           EH             rH
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+1            –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+2            –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+3            –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+4            –             –            –            –            –            –            –            –            –             –
+             –             –            –            –            –            –            –            –            –             –
+
+
+prevents spurious numerical energy loss or growth during time integration.
+    Third, the results demonstrate the long-term stability of the coupled spatial and temporal discretization. The
+combination of a high-order spatial approximation (p = 4) with symplectic time integration preserves the waveform
+even after very long simulation times, suggesting that the numerical method respects the underlying Hamiltonian
+structure of Maxwell’s equations.
+    Finally, the same level of agreement is observed for both field components shown in the figure, indicating that the
+numerical scheme maintains the correct coupling between the electric and magnetic fields throughout the simulation.
+    Overall, the figure provides strong numerical evidence that the proposed conservative discretization achieves
+excellent physical fidelity, accurately reproducing the analytical traveling-wave solution while maintaining stability,
+phase accuracy, and amplitude preservation over very long integration times.
+
+5.3. Conservation properties
+    We examine how the source-free Maxwell system preserves physical quantities in a homogeneous periodic medium.
+The experiment complements the field-error measurements of Section 5.1: accuracy relative to an analytical solution
+and preservation of a discrete invariant are distinct properties. In particular, an initial interpolation error may
+produce an offset in an integral quantity even when that quantity is subsequently conserved. We therefore distinguish
+deviations from analytical values from changes relative to the initial discrete state.
+    fluxes remain to be completed.
+
+Problem and experimental protocol. The domain is Ω = (0, 2) × (0, 1) × (0, 1), with periodic identification of opposite
+faces, ε = µ = 1, and J = 0. We consider the linearly polarized traveling wave
+                             ⎛                ⎞                ⎛               ⎞
+                                      0                                0
+                   E(x, t) = ⎝        0       ⎠,     H(x, t) = ⎝sin(kx − ωt)⎠ ,       k = ω = 2π.
+                               − sin(kx − ωt)                          0
+
+                                                                 20
+Its temporal period is one. Unlike the convergence experiment, this test keeps the mesh fixed and varies the polyno-
+mial degree. The MN5 campaign configuration uses 16 × 8 × 8 Cartesian cells, each subdivided into six tetrahedra,
+giving 6144 elements. The planned comparison comprises p = 1, . . . , 5 with equispaced nodal sets and both numerical
+fluxes. Each field component belongs to the elementwise total-degree space Pp . The runs use magnetic-field-first
+ESPRK integration of order p + 1 and volume cubature of requested degree max(2, 2p + 4).
+    For each mesh, degree, and initialization, the initial coefficients are held fixed when comparing time steps. The
+audit configuration initializes the electric field by interpolation and constructs the magnetic field from a discrete curl
+of a vector potential. This construction controls the initial divergence defect; it does not imply that all subsequent
+elementwise divergence or interface-jump diagnostics vanish. The nominal time step follows the element-based CFL
+estimate used in Section 5.1, with the global minimum taken over MPI partitions. In the invariant-audit driver, only
+the last step is shortened when necessary to reach the requested final time. The submission defaults are CFL 0.1,
+32 MPI processes, and sampling every ten steps; the initial and final states are also sampled. Run-specific overrides
+and initialization choices are retained in the campaign metadata.
+    The available preliminary panels extend to T = 104 , corresponding to 104 wave periods. Their observations below
+refer to this displayed interval. A direct association between these panels and the submission defaults requires the
+corresponding run metadata; consequently, the preliminary figure is not used to infer quantitative dependence on
+CFL, MPI partitioning, or flux choice.
+
+Energy and weak-charge diagnostics.. The principal energy diagnostic is the discrete electromagnetic Hamiltonian
+                                                    ∫︂
+                                             1 ∑︂
+                                                           ε|Eh |2 + µ|Hh |2 dx.
+                                                        (︁                  )︁
+                                    Hh (t) =
+                                             2        K
+                                                  K∈Th
+
+We distinguish the analytical error eH (t) = |Hh (t) − H(t)| from the relative conservation defect
+
+                                                           Hh (t) − Hh (0)
+                                                δH (t) =                   .
+                                                               Hh (0)
+
+The considered plane wave has exact energy H = 1. The first diagnostic includes the error introduced by initializing
+the fields, whereas the second isolates subsequent changes in the discrete energy. The semi-discrete conservation
+result does not automatically extend to exact preservation of the original Hamiltonian by the ESPRK update. We
+therefore examine the fully discrete histories for the amplitude of energy fluctuations and accumulated drift.
+   The charge tests use the same weak functionals as the semi-discrete conservation statement. Write Uh = εEh or
+Uh = µHh . For a continuous periodic scalar test function ϕh , define
+                                                             ∑︂
+                                           QU,h (ϕh ; t) = −   (Uh , ∇ϕh )K
+                                                                K
+
+Supplementary physical quantities.. We also assess the integrated linear momentum, angular momentum, and optical
+chirality,
+                 ∫︂                                                              ∫︂
+           Ph =      Eh × Hh dx,                                            Lh =     x × (Eh × Hh ) dx,
+                   Ω                                                               Ω
+                       ∫︂
+                 1 ∑︂ (︁                                   )︁
+           χh =            Eh · ∇h × Eh + Hh · ∇h × Hh dx.
+                 2       K
+                      K
+
+These expressions use the normalized material parameters of this test. For the analytical wave, P = (1, 0, 0),
+L = (0, 1/2, −1/2) with the origin at the lower corner of the displayed cuboid, and χ = 0. Angular momentum is
+evaluated on this chosen periodic cell: the position vector is not periodic, and its integral should not be interpreted
+
+
+                                                             21
+as a general invariant on a periodic domain. The momentum errors are Euclidean norms of differences of integrated
+vectors. Their magnitudes alone do not test preservation of every component. Chirality uses element-wise curls and
+serves as an additional accuracy diagnostic. None of these observations substitutes for the energy and weak-charge
+tests above.
+    The completed campaign will compare centered and alternating traces using the maximum sampled energy defect,
+the maximum weak-charge drift, and the supplementary analytical errors for each degree. Because the temporal
+order and CFL-limited step also depend on p, these comparisons describe the combined discretization; attributing
+changes exclusively to spatial degree requires a separate temporal sensitivity check. The preliminary p = 1 histories
+support bounded energy and momentum behavior over the displayed interval, while leaving quantitative weak-charge
+verification and the dependence on degree and flux open.
+
+6. Concluding remarks
+
+    In this work, we have developed a structure-preserving discontinuous Galerkin method for the time-domain
+Maxwell’s equations based on a discrete Poisson bracket formulation. Exploiting the Hamiltonian structure of
+Maxwell’s equations, we constructed a semi-discrete approximation via a consistent discrete Poisson bracket, resulting
+in a finite-dimensional Hamiltonian system of ordinary differential equations.
+    The performance of the proposed method was assessed through a convergence study. Moreover, the scheme
+exhibits non-drifting behavior of key physical invariants, including energy, magnetic charge, linear momentum, and
+angular momentum, thereby confirming its structure-preserving nature and long-time stability.
+
+Declaration of competing interest
+
+   The authors declare that they have no known competing financial interests or personal relationships that could
+have appeared to influence the work reported in this paper.
+
+CRediT autorship contribution statement
+
+   Martí Circuns-Duxans: Conceptualization, Methodology, Software, Writing - review & editing. Josep de
+la Puente: Conceptualization, Methodology, Writing - review & editing. Eloi Ruiz-Gironés: Conceptualization,
+Methodology, Writing - review & editing. Xevi Roca: Conceptualization, Methodology, Writing - review & editing.
+
+Acknowledgments
+
+   This work has received funding from the grant PRE2022-105078 funded by MICIU/AEI/10.13039/501100011033
+and by ESF+.
+
+Appendix A. Single-valued numerical traces and face orientation
+
+   This appendix specifies the facewise conventions used by the numerical traces in Section 2.3.4. Let F = ∂K − ∩
+∂K + be an interior face. We assign to F a fixed global orientation by choosing nF = n− = −n+ and define the
+tangential projector and the oriented cross-product operator by
+
+                                      PF = I − nF ⊗ nF ,       NF v = nF × v.
+
+For a broken vector field u, its oriented tangential jump is
+
+                                             [[u]]F := nF × u− − u+ .
+                                                           (︁      )︁
+
+
+                                                          22
+   On every interior face, C12,F is a prescribed tangential linear operator, represented by a real 3×3 matrix satisfying
+
+                                                 C12,F = PF C12,F PF .
+
+It is constant on the face and independent of time and of the discrete solution. Only its tangential action enters
+the weak formulation. The common numerical trace is defined by. Here “single-valued” means that the same face
+field u
+      ˆ︁ F is assembled once and used by both adjacent elements. Consequently, their outward tangential traces have
+opposite signs,
+                                               n− × u
+                                                    ˆ︁ F = −n+ × uˆ︁ F .
+The underlying element fields remain discontinuous.
+    The centered trace is recovered with C12,F = 0. A genuinely alternating trace is obtained by storing a face-wise
+selector θF ∈ {0, 1} and setting
+                                               C12,F = 21 − θF NF .
+                                                       (︁      )︁
+                                                                                                               (A.1)
+Indeed, Equations (??) and (A.1) give
+
+                                            ˆ︁ F = θF PF u− + (1 − θF )PF u+ .
+                                         PF u
+
+The orientation nF and the selector θF are global face data and must therefore be identical for the two neighbouring
+elements. If the labels K − and K + are reversed, one simultaneously replaces nF by −nF and θF by 1 − θF ; the
+physical trace is unchanged.
+   For Maxwell’s equations we use the complementary pair
+                       ˆ︁ h = PF {E h }F + C12,F [[Eh ]] ,
+                    PF E                                             ˆ︂ h = PF {H h }F + CT [[Hh ]] .
+                                                                  PF H                                            (A.2)
+                                                        F                                 12,F     F
+
+For the alternating choice, the electric and magnetic traces are therefore taken from opposite sides of each face.
+Periodically identified faces are treated as interior faces after applying the periodic map. On a physical boundary,
+the exterior state is instead prescribed by the corresponding boundary condition.
+
+
+Appendix B. Traces and numerical fluxes
+
+   On every interior face F = ∂K − ∩∂K + , fix the labeling of the neighboring elements and set nF = n− = −n+ . Let
+PF := I − nF ⊗ nF be the tangential projector. The coefficient C12,F ∈ R3×3 is a prescribed real matrix, constant
+on the face and independent of time and of the discrete solution. The same matrix is used by both neighboring
+elements; it acts on the tangential jump
+                                               [[u]] = nF × (u− − u+ ).                                      (B.1)
+We suppress the face index on C12,F when convenient. Only the tangential block PF C12,F PF affects the weak
+formulation, because all numerical traces occur in tangential pairings. Thus C12,F may equivalently be viewed as a
+linear map on the tangential plane; it is not, in general, a scalar.
+    The numerical trace on F is a single common face function,
+                                                     1 −
+                                            u
+                                            ˆ︁ F =     (u + u+ ) + C12,F [[u]].                                   (B.2)
+                                                     2
+   Both elements use this same value. In particular,
+
+                                               n− × u
+                                                    ˆ︁ F + n+ × u
+                                                                ˆ︁ F = 0.                                         (B.3)
+
+Single-valuedness refers to the shared numerical trace; the underlying element fields may remain discontinuous.
+
+
+                                                             23
+   Centered traces correspond to C12,F = 0. To specify alternating traces, define NF a := nF × a and choose
+                                            (︃        )︃
+                                               1
+                                    C12,F =      − θ F NF ,      θF ∈ {0, 1}.                               (B.4)
+                                               2
+
+Since NF2 = −PF , this gives
+                                            ˆ︁ F = θF PF u− + (1 − θF )PF u+ .
+                                         PF u                                                                     (B.5)
+Thus the numerical tangential trace is taken from one selected element. Intermediate values 0 ≤ θF ≤ 1 give weighted
+traces, including the centered trace when θF = 1/2. The orientation and θF are face data, not independent choices
+made by each element. Reversing the face labeling requires replacing θF by 1 − θF to preserve the selected trace.
+   In the equivalent DG formulation, the interior magnetic trace is
+                                              ˆ︁ F = {Hh } + CT [[Hh ]].
+                                              H                                                                   (B.6)
+                                                              12,F
+
+For the alternating choice above,
+                      ˆ︁ F = θF PF E− + (1 − θF )PF E+ ,
+                   PF E                                            ˆ︁ F = (1 − θF )PF H− + θF PF H+ .
+                                                                PF H                                              (B.7)
+                                    h                h                                 h          h
+
+Hence the electric and magnetic tangential traces are selected from opposite sides of the face. On physical boundary
+faces, the exterior trace is prescribed as in Equation (11); periodic face pairs are treated as interior faces after the
+periodic mapping.
+    In element-wise face formulas, the matrix and cross-product order must be retained. For electric test functions
+with homogeneous exterior tangential data,
+                                                   ⟨︃                                  ⟩︃
+                                                      1
+                                                        [[Hh ]] − n × CT12 [[Hh ]] , v
+                                                                     (︁           )︁
+                                ⟨n × Hh , v⟩
+                                          ˆ︁ ∂Th =                                               .
+                                                      2                                   ∂Th \Γ
+
+Here n is the outward normal of the current element. For a general matrix C12 , multiplication by CT12 cannot be
+interchanged with the cross product. Likewise, the trace definition uses the tangential jump [[u]], not the unrotated
+difference u− − u+ ; these expressions must not be interchanged without redefining the face operator.
+
+Appendix C. Conservation
+
+   Opció 1:
+
+Appendix C.1. Semi-discrete conservation properties
+    We establish conservation of the discrete weak electric and magnetic charges and of the electromagnetic energy
+directly from Equations (21a) and (21b). Throughout this subsection, J = 0, the mesh is fixed, and ε and µ are
+positive and independent of time. The numerical traces are those of Equation (11), with one single-valued coefficient
+C12 on each interior face. The identities below concern the semi-discrete equations with exact integration; their
+realization in floating-point arithmetic also depends on consistent quadrature and assembly.
+
+Appendix C.1.1. Electric and magnetic charge
+   For qh ∈ L2 (Ω)3 and z ∈ H01 (Ω), we write
+
+                                            (∇ · qh , z)w := − (qh , ∇z)Th .                                      (C.1)
+
+The subscript w denotes the distributional duality pairing, which need not be an L2 inner product for a discontinuous
+field.
+
+
+                                                           24
+Proposition Appendix C.1 (Conservation of discrete weak charges). Let (Eh , Hh ) satisfy Equations (21a) and (21b)
+with J = 0. Define
+                                   Sh,E := {v ∈ H01 (Ω) : ∇v ∈ vh },
+                                                                                                            (C.2)
+                                   Sh,H := {w ∈ H01 (Ω) : ∇w ∈ wh }.
+For every fixed v ∈ Sh,E and w ∈ Sh,H ,
+
+                                            d
+                                               (∇ · (εEh ), v)w = (∇ · (εĖh ), v)w = 0,                        (C.3a)
+                                            dt
+                                           d
+                                              (∇ · (µHh ), w)w = (∇ · (µḢh ), w)w = 0.                         (C.3b)
+                                           dt
+Thus both weak charge functionals retain their initial values.
+Proof. The gradients of the scalar test functions have single-valued tangential components on interior faces and zero
+tangential components on Γ. Consequently,
+
+                             [[∇v]] = [[∇w]] = 0        on Fh0 ,      n × ∇v = n × ∇w = 0    on Γ.
+
+Also, the curl of either gradient vanishes on every element.
+   For the electric charge, take v = ∇v in Equation (21a). By Equation (11), ∇v ˆ︂ = {∇v} on interior faces. Its
+tangential component agrees with the tangential component of the gradient from either element. On boundary faces,
+the electric test trace and ∇v both have zero tangential component. Hence
+                                        ⟨︂            ⟩︂
+                                          n × Hh , ∇v
+                                                   ˆ︂     = ⟨n × Hh , ∇v⟩∂Th .
+                                                               ∂Th
+
+Using Equation (C.1) and integrating the curl term by parts on each element, we obtain
+                                                  (︂        )︂
+                            (∇ · (εĖh ), v)w = − εĖh , ∇v
+                                                               Th
+                                                                   ⟨︂           ⟩︂
+                                              = − (∇ × Hh , ∇v) + n × Hh , ∇v
+                                                                          Th
+                                                                             ˆ︂
+                                                                                            ∂Th
+                                                       = − (Hh , ∇ × ∇v)Th = 0.
+
+   For the magnetic charge, take w = ∇w in Equation (21b). Then
+                                                   (︂             )︂
+                             (∇ · (µḢh ), w)w = − µḢh , ∇w
+                                                                     Th
+                                                                         ⟨︂               ⟩︂
+                                               = (Eh , ∇ × ∇w)Th − E        ˆ︁ h , n × ∇w
+                                                                                             ∂Th
+                                                   ⟨︂                 ⟩︂
+                                               =− E   ˆ︁ h , n × ∇w        .
+                                                                               ∂Th
+
+
+Since E
+      ˆ︁ h is single-valued on each interior face, the two element contributions on that face combine to give
+                      ⟨︂               ⟩︂   ∑︂ ⟨︂                             ⟩︂    ⟨︂               ⟩︂
+                        Eˆ︁ h , n × ∇w    =       Eˆ︁ h , n− × ∇w− + n+ × ∇w+     + E  ˆ︁ h , n × ∇w
+                                     ∂Th                                             F               Γ
+                                              F ∈Fh0
+
+                                           = 0.
+
+This proves both derivative identities. Time independence of the material coefficients and scalar test functions gives
+the stated conservation laws.
+
+
+                                                                     25
+Remark Appendix C.2 (Discrete Gauss constraints and periodic boundaries). For the degree-k vector polynomial
+spaces on an affine simplicial mesh, continuous piecewise polynomials of degree at most k + 1 with zero boundary
+trace form an admissible scalar test space. If initially
+
+                                (∇ · (εEh (0)), v)w = (ρ0 , v)Ω ,       (∇ · (µHh (0)), w)w = 0,
+
+these identities persist in time. Initial constraint errors are preserved; the proposition does not remove them. For
+periodic boundary conditions, replace H01 (Ω) by the periodic scalar space and treat each paired periodic boundary
+as an interior face. The same proof then applies.
+Remark Appendix C.3 (Weak charge versus elementwise divergence). Let ∇h · denote the elementwise divergence,
+and define the normal jump by
+                                      jn (qh ) := q−    −   +    +
+                                                   h · n + qh · n .
+For a continuous piecewise polynomial z ∈ H01 (Ω) and a piecewise smooth field qh , elementwise integration by parts
+gives                                                              ∑︂
+                                 (∇ · qh , z)w = (∇h · qh , z)Th −    ⟨jn (qh ), z⟩F .                         (C.4)
+                                                                         F ∈Fh0
+
+Thus conserves the combined expression, including its normal-jump contribution. It does not separately conserve the
+elementwise divergence moment. In the periodic setting the same identity holds with periodic faces included in the
+face sum. For z = 1 the weak pairing vanishes identically, so checking that the broken divergence minus the normal
+jumps is zero only checks the discrete divergence identity. A nontrivial conservation test should track weak charge
+moments for nonconstant admissible scalar functions and compare them with their initial values.
+
+Appendix C.1.2. Electromagnetic energy
+Proposition Appendix C.4 (Conservation of electromagnetic energy). Let (Eh , Hh ) satisfy Equations (21a)
+and (21b) with J = 0. Assume periodic boundary conditions, or homogeneous prescribed tangential electric data
+gE = 0 on Γ. Then the electromagnetic energy
+                                                     1 (︁                               )︁
+                                         Eh (t) :=        (εEh , Eh )Th + (µHh , Hh )Th                                   (C.5)
+                                                     2
+satisfies
+                                              d
+                                                 Eh (t) = 0,         Eh (t) = Eh (0).                                      (C.6)
+                                              dt
+Proof. Choose v = Eh and w = Hh in Equations (21a) and (21b), respectively. Under the stated boundary
+conditions, the numerical trace of the electric test function has the same tangential component as E          ˆ︁ h . Because the
+material coefficients are independent of time,
+                  d       (︂        )︂     (︂           )︂
+                     Eh = εĖh , Eh       + µḢh , Hh
+                  dt                   Th                  Th
+                                              ⟨︂                  ⟩︂                      ⟨︂               ⟩︂
+                        = (∇ × Hh , Eh )Th − n × Hh , E      ˆ︁ h     − (Eh , ∇ × Hh )Th + E ˆ︁ h , n × Hh
+                                                                 ∂Th                                      ∂Th
+                        = 0.
+
+The volume terms cancel by symmetry of the volume inner product, and the face terms cancel by symmetry of the
+face inner product.
+    Equivalently, with the source-free choice J× = 0, Hh = Eh in Equation (9); hence
+
+                                                      Ėh = {Hh , Hh }h = 0
+
+by skew-symmetry of the bracket. Neither argument requires a Jacobi identity.
+
+
+                                                                26
+Remark Appendix C.5 (Boundary power). For nonzero prescribed tangential electric data, the homogeneous electric
+test trace and the prescribed field trace differ on Γ. Keeping that difference in the energy calculation, with J = 0,
+gives
+                                                   Ėh = −⟨gE , Hh ⟩Γ .
+Thus time-independent boundary data alone do not ensure conservation: the boundary power must vanish. The
+conservation proof covers centered and alternating traces of Equation (11), used consistently in both equations.
+
+Appendix D. Lemma 1
+
+   Lemma 1.      For any vector-valued functions a and b in L2 (∂Th ), we have
+
+                            ⟨n × a, b⟩∂Th = ⟨[[a]], {b}⟩F 0 − ⟨{a}, [[b]]⟩F 0 + ⟨n × a, b⟩F ∂ .                   (D.1)
+                                                          h                 h               h
+
+
+
+
+Appendix E. Lemma 2
+
+   Lemma 2. Let n ∈ R3 be fixed and let a and b be vector-valued functions. Then,
+
+                                              ⟨n × a, b⟩ = − ⟨a, n × b⟩ .                                         (E.1)
+
+Proof. Using the cyclic property of the inner product,
+
+                                                ⟨n × a, b⟩ = ⟨n, a × b⟩ .
+
+Since a × b = −b × a,
+                                              ⟨n, a × b⟩ = − ⟨n, b × a⟩ .
+Applying the cyclic property again,
+                                             − ⟨n, b × a⟩ = − ⟨a, n × b⟩ .
+Therefore
+                                              ⟨n × a, b⟩ = − ⟨a, n × b⟩ .
+
+
+
+Appendix F. Espais continus
+
+    Let Ω ⊂ R3 be a bounded Lipschitz domain, with boundary Γ = ∂Ω and outward unit normal n. Throughout
+this section, the function spaces are vector-valued. In particular,
+                                                 {︃                       ∫︂            }︃
+                          L2 (Ω) := L2 (Ω; R3 ) = u : Ω → R3 measurable :    |u|2 dx < ∞ ,          (F.1)
+                                                                                Ω
+
+where functions that agree almost everywhere are identified. The space of square-integrable fields with square-
+integrable weak curl is
+                                 H(curl, Ω) := u ∈ L2 (Ω) : ∇ × u ∈ L2 (Ω) ,
+                                              {︁                          }︁
+                                                                                                          (F.2)
+where the curl is understood in the distributional sense.
+   Following the exterior-trace convention of [30], we distinguish the trace of an interior field, when defined, from an
+independently specified exterior boundary datum uext on Γ. The latter is not obtained by applying a trace operator
+to u and need not coincide with its interior trace, even when that trace exists. This distinction is necessary because
+a general L2 (Ω) field has no well-defined boundary trace.
+
+
+                                                              27
+   For a prescribed tangential boundary datum g, we use the notation
+
+                       L2,ext (Ω; g) := u ∈ L2 (Ω) equipped with uext : n × uext = g on Γ .
+                                       {︁                                                }︁
+                                                                                                                (F.3)
+
+Thus, the superscript ext records the prescribed exterior tangential data; it does not impose additional regularity on
+the interior field.
+    Opció 1: Similarly, C ∞ (Ω) denotes smooth vector-valued functions, whose components have continuous deriva-
+tives of every order. Whenever boundary values of these test functions are used, they are taken to be smooth up to
+the boundary. We write
+
+                      C ∞,ext (Ω; 0) := ϕ ∈ C ∞ (Ω) equipped with ϕext : n × ϕext = 0 on Γ .
+                                       {︁                                                    }︁
+                                                                                                                 (F.4)
+
+The homogeneous condition concerns the exterior tangential datum and does not require the test function to vanish
+on Γ.
+   We denote by C ∞ (Ω; R3 ) the restrictions to Ω of vector fields that are smooth on an open neighborhood of Ω.
+In particular, their classical boundary values are well-defined. As elsewhere in this section, we suppress the target
+space R3 when no confusion is possible.
+   Opció 2: Following the exterior-trace convention, we define
+
+                     C ∞,ext (Ω; 0) := ϕ ∈ C ∞ (Ω; R3 ) equipped with ϕext : n × ϕext = 0 on Γ .
+                                      {︁                                                       }︁
+                                                                                                                (F.5)
+
+The exterior datum is prescribed independently of the classical interior trace. Thus the homogeneous condition on
+ϕext does not require ϕ|Γ or its tangential component to vanish. With this convention, the space of smooth test
+functions is
+                                         D = C ∞,ext (Ω; 0) × C ∞ (Ω; R3 ).                                  (F.6)
+
+
+Appendix G. Coefficients of the ESPRK schemes used in the computations
+
+    In table Tables G.5 to G.7, we gather the coefficients of the s-stage, q-order, ESPRK(s, q), used in our computa-
+tions.
+                                        Table G.5: Coefficients of ESPRK(2,2) [21].
+
+
+              i                                            ai                                       bi
+              1                                            0                                       1/2
+              2                                            1                                       1/2
+
+
+                                        Table G.6: Coefficients of ESPRK(3,3) [27].
+
+
+              i                                           ai                                       bi
+              1                                         7/24                                      2/3
+              2                                          3/4                                     −2/3
+              3                                        −1/24                                       1
+
+
+
+
+                                                               28
+                                     Table G.7: Coefficients of the ESPRK(6,5) [21].
+
+
+              i                               ai                                                bi
+              1                      0.11939002928756727                                 0.33983962583911
+              2                       0.6989273703824752                               −0.08860133690302732
+              3                    −0.17131235827160077                                 0.5858564768259621
+              4                      0.40126950225135344                               −0.6030393565364912
+              5                     0.010705081848235983                                0.3235807965546976
+              6                    −0.058979625498031166                                0.4423637942197495
+
+
+References
+
+[1] Ainsworth, M. (2004a). Discrete Dispersion Relation for hp -Version Finite Element Approximation at High Wave
+   Number. SIAM Journal on Numerical Analysis, 42(2):553–575.
+
+[2] Ainsworth, M. (2004b). Dispersive and dissipative behaviour of high order discontinuous Galerkin finite element
+   methods. Journal of Computational Physics, 198(1):106–130.
+[3] Arakawa, A. (1966). Computational design for long-term numerical integration of the equations of fluid motion:
+   Two-dimensional incompressible flow. part i. Journal of computational physics, 1(1):119–143.
+
+[4] Arnold, D. N., Falk, R. S., and Winther, R. (2006). Finite element exterior calculus, homological techniques, and
+   applications. Acta numerica, 15:1–155.
+[5] Barton, M. L. and Cendes, Z. J. (1987). New vector finite elements for three-dimensional magnetic field compu-
+   tation. Journal of Applied Physics, 61(8):3919–3921.
+[6] Bossavit, A. and Verite, J.-C. (1982). A mixed fem-biem method to solve 3-D eddy-current problems. IEEE
+   Transactions on Magnetics, 18(2):431–435.
+[7] Chen, M.-H., Cockburn, B., and Reitich, F. (2005). High-order RKDG Methods for Computational Electromag-
+   netics. Journal of Scientific Computing, 22–23(1-3):205–226.
+[8] Cockburn, B., Li, F., and Shu, C.-W. (2004). Locally divergence-free discontinuous Galerkin methods for the
+   Maxwell equations. Journal of Computational Physics, 194(2):588–610.
+[9] Di Pietro, D. A. and Ern, A. (2011). Mathematical aspects of discontinuous Galerkin methods, volume 69. Springer
+   Science & Business Media.
+[10] Dosopoulos, S. and Lee, J.-F. (2010). Interior Penalty Discontinuous Galerkin Finite Element Method for the
+   Time-Dependent First Order Maxwell’s Equations. IEEE Transactions on Antennas and Propagation, 58(12):4085–
+   4090.
+[11] Gassner, G. and Kopriva, D. A. (2011). A Comparison of the Dispersion and Dissipation Errors of Gauss
+   and Gauss–Lobatto Discontinuous Galerkin Spectral Element Methods. SIAM Journal on Scientific Computing,
+   33(5):2560–2579.
+
+[12] Hachemi, M. E., Hassan, O., Morgan, K., Rowse, D., and Weatherill, N. (2004). A low–order unstructured–mesh
+   approach for computational electromagnetics in the time domain. Philosophical Transactions of the Royal Society
+   of London. Series A: Mathematical, Physical and Engineering Sciences, 362(1816):445–469.
+
+
+
+                                                           29
+[13] Hesthaven, J. and Warburton, T. (2002). Nodal High-Order Methods on Unstructured Grids. Journal of
+   Computational Physics, 181(1):186–221.
+[14] Hesthaven, J. S. and Warburton, T. (2008). Nodal Discontinuous Galerkin Methods: Algorithms, Analysis, and
+   Applications. Number 54 in Texts in Applied Mathematics. Springer, New York.
+[15] Hiptmair, R. (2002). Finite elements in computational electromagnetism. Acta Numerica, 11:237–339.
+[16] Houston, P., Perugia, I., and Schotzau, D. (2004). Mixed Discontinuous Galerkin Approximation of the Maxwell
+   Operator. SIAM Journal on Numerical Analysis, 42(1):434–459.
+[17] Jin-Fa Lee, Lee, R., and Cangellaris, A. (1997). Time-domain finite-element methods. IEEE Transactions on
+   Antennas and Propagation, 45(3):430–442.
+[18] Kabakian, A. V., Shankar, V., and Hall, W. F. (2004). Unstructured Grid-Based Discontinuous Galerkin Method
+   for Broadband Electromagnetic Simulations. Journal of Scientific Computing, 20(3):405–431.
+[19] Kraus, M., Kormann, K., Morrison, P. J., and Sonnendrücker, E. (2017). Gempic: geometric electromagnetic
+   particle-in-cell methods. Journal of Plasma Physics, 83(4):905830401.
+[20] Lisitsa, V. (2016). Dispersion analysis of discontinuous Galerkin method on triangular mesh for elastic wave
+   equation. Applied Mathematical Modelling, 40(7):5077–5095.
+[21] McLachlan, R. I. and Atela, P. (1992). The accuracy of symplectic integrators. Nonlinearity, 5(2):541–562.
+[22] Monk, P. and Richter, G. R. (2005). A Discontinuous Galerkin Method for Linear Symmetric Hyperbolic Systems
+   in Inhomogeneous Media. Journal of Scientific Computing, 22–23(1-3):443–477.
+[23] Morgan, K., Hassan, O., Pegg, N. E., and Weatherill, N. P. (2000). The simulation of electromagnetic scattering
+   in piecewise homogeneous media using unstructured grids. Computational Mechanics, 25(5):438–447.
+[24] Nédélec, J.-C. (1980). Mixed finite elements in 3. Numerische Mathematik, 35(3):315–341.
+[25] Nédélec, J.-C. (1986). A new family of mixed finite elements in 3. Numerische Mathematik, 50(1):57–81.
+[26] Núñez, C. and Sánchez, M. A. (2025). Symplectic hamiltonian hybridizable discontinuous galerkin methods for
+   linearized shallow water equations. Computer Methods in Applied Mechanics and Engineering, 447:118383.
+[27] Ruth, R. D. (1983). A canonical integration technique. IEEE Trans. Nucl. Sci., 30(CERN-LEP-TH-83-14):2669–
+   2671.
+[28] Sánchez, M., Ciuca, C., Nguyen, N., Peraire, J., and Cockburn, B. (2017). Symplectic Hamiltonian HDG
+   methods for wave propagation phenomena. Journal of Computational Physics, 350:951–973.
+[29] Sánchez, M. A., Cockburn, B., Nguyen, N.-C., and Peraire, J. (2021). Symplectic Hamiltonian finite element
+   methods for linear elastodynamics. Computer Methods in Applied Mechanics and Engineering, 381:113843.
+[30] Sánchez, M. A., Du, S., Cockburn, B., Nguyen, N.-C., and Peraire, J. (2022). Symplectic Hamiltonian finite
+   element methods for electromagnetics. Computer Methods in Applied Mechanics and Engineering, 396:114969.
+[31] Sánchez, M. A. and Valenzuela, J. (2024). Symplectic Hamiltonian Finite Element Methods for Semilinear Wave
+   Propagation. Journal of Scientific Computing, 99(3):62.
+[32] Sanz-Serna, J. M. (1992). Symplectic integrators for hamiltonian problems: an overview. Acta numerica,
+   1:243–286.
+
+
+                                                        30
+[33] Schwinger, J., Deraad, L. L., Milton, K. A., and Tsai, W.-y. (2019). Classical Electrodynamics. CRC Press,
+   Boca Raton, first edition edition.
+[34] Xu, Y., Van Der Vegt, J. J. W., and Bokhove, O. (2008). Discontinuous Hamiltonian Finite Element Method
+   for Linear Hyperbolic Systems. Journal of Scientific Computing, 35(2-3):241–265.
+
+
+
+
+                                                      31
+Figure 2: Preliminary p = 1, alternating-flux histories over 104 wave periods. Panels show (a) electromagnetic energy, (b) optical chirality,
+(c) linear-momentum magnitude, (d) angular-momentum magnitude, and (e,f) the integrated-field sums SD and SB . The charge labels
+retained in panels (e,f) refer to these plotted sums; they do not denote the weak-charge functionals. Only one polynomial degree is
+available, so this figure does not yet demonstrate convergence in p.
+
+
+
+                                                                     32
+Figure 3: Analytical errors for the same preliminary p = 1, alternating-flux result, shown on logarithmic ordinate scales: (a) energy,
+(b) chirality, (c,d) Euclidean errors in the integrated momentum vectors, and (e,f) absolute integrated-field sums |SD | and |SB |. These
+are errors relative to analytical values, rather than changes relative to the initial discrete state. The current rendering omits numerical
+ordinate labels in panels (a,c,d); their amplitudes are therefore not inferred quantitatively from this figure.
+
+
+
+                                                                    33
+Figure 4: Preliminary p = 1, centered-flux, histories over 104 wave periods. Panels show (a) electromagnetic energy, (b) optical chirality,
+(c) linear-momentum magnitude, (d) angular-momentum magnitude, and (e,f) the integrated-field sums SD and SB of Equation. The
+charge labels retained in panels (e,f) refer to these plotted sums; they do not denote the weak-charge functionals. Only one polynomial
+degree is available, so this figure does not yet demonstrate convergence in p.
+
+
+
+                                                                    34
+Figure 5: Analytical errors for the same preliminary p = 1, centered-flux result, shown on logarithmic ordinate scales: (a) energy, (b)
+chirality, (c,d) Euclidean errors in the integrated momentum vectors, and (e,f) absolute integrated-field sums |SD | and |SB |. These
+are errors relative to analytical values, rather than changes relative to the initial discrete state. The current rendering omits numerical
+ordinate labels in panels (a,c,d); their amplitudes are therefore not inferred quantitatively from this figure.
+
+
+
+                                                                    35
+

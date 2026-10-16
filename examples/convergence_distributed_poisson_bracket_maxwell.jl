@@ -47,6 +47,9 @@ Base.@kwdef mutable struct DistributedConvergenceResult
     mean_ratio_min::Float64
     mean_ratio_avg::Float64
     dt::Float64
+    nsteps::Int
+    elapsed_seconds::Float64
+    final_errors::NTuple{9, Float64}
     linf_l2_electric_error::Float64
     linf_l2_magnetic_error::Float64
     linf_l2_u_error::Float64
@@ -59,15 +62,7 @@ Base.@kwdef mutable struct DistributedConvergenceResult
     initial_energy::Float64
     final_energy::Float64
     relative_energy_drift::Float64
-    rate_electric::Union{Missing, Float64} = missing
-    rate_magnetic::Union{Missing, Float64} = missing
-    rate_u::Union{Missing, Float64} = missing
-    rate_ex::Union{Missing, Float64} = missing
-    rate_ey::Union{Missing, Float64} = missing
-    rate_ez::Union{Missing, Float64} = missing
-    rate_hx::Union{Missing, Float64} = missing
-    rate_hy::Union{Missing, Float64} = missing
-    rate_hz::Union{Missing, Float64} = missing
+
 end
 
 function parse_integer_list(value::AbstractString)
@@ -119,6 +114,8 @@ from --mesh-dir and uses the same family for every polynomial degree:
   --mesh-family=unstructured
   --mesh-dir=PATH     Directory containing the four files above.
                       Default: examples/meshes
+  --mesh-levels=a,b   Select unstructured mesh indices from 0,1,2,3.
+                      Default: 0,1,2,3.
 
 The --cells, --jitter, and --seed options are structured-only controls.
 
@@ -131,6 +128,12 @@ Example:
 Common options
 --------------
   --orders=a,b,c      DG polynomial orders. Default: 1,2,3
+  --nodal-set=NAME    equispaced (default) or warp-blend.
+  --rate-policy=NAME  fail (default) or report. Results are written before failure.
+  --rate-tolerance=X  Allowed shortfall from the expected rate. Default: 0.5
+  --error-mode=MODE   Error sampling: final or max-time. Default: max-time.
+  --error-every=N     In max-time mode, sample every N steps and at the final
+                      step. Default: 1.
   --final-time=T      Final physical time. Default: 0.25
   --time=T            Alias for --final-time.
   --periods=P         Final time as P cavity-wave periods. Mutually exclusive
@@ -179,6 +182,7 @@ function parse_convergence_arguments(args::Vector{String})
     mesh_family = :structured
     mesh_dir = joinpath(@__DIR__, "meshes")
     explicit_mesh_dir = false
+    explicit_mesh_levels = false
     orders = [1, 2, 3]
     final_time = 0.25
     final_time_explicit = false
@@ -193,6 +197,11 @@ function parse_convergence_arguments(args::Vector{String})
     mu = 1.0
     boundary_condition = :pec
     flux_kind = MaxwellFlux_Central
+    nodal_set = :equispaced
+    rate_policy = :fail
+    rate_tolerance = CONVERGENCE_RATE_TOLERANCE
+    error_every = 1
+    error_mode = :max_time
     output =
         joinpath("output", "convergence_distributed_poisson_bracket.csv")
 
@@ -210,8 +219,21 @@ function parse_convergence_arguments(args::Vector{String})
         elseif startswith(arg, "--mesh-dir=")
             mesh_dir = abspath(split(arg, "=", limit = 2)[2])
             explicit_mesh_dir = true
+        elseif startswith(arg, "--mesh-levels=")
+            mesh_parameters = parse_integer_list(split(arg, "=", limit = 2)[2])
+            explicit_mesh_levels = true
         elseif startswith(arg, "--orders=")
             orders = parse_integer_list(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--nodal-set=")
+            nodal_set = parse_convergence_nodal_set(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--rate-policy=")
+            rate_policy = Symbol(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--rate-tolerance=")
+            rate_tolerance = parse(Float64, split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--error-every=")
+            error_every = parse(Int, split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--error-mode=")
+            error_mode = Symbol(replace(lowercase(split(arg, "=", limit = 2)[2]), '-' => '_'))
         elseif startswith(arg, "--final-time=") || startswith(arg, "--time=")
             periods === nothing ||
                 throw(
@@ -263,14 +285,16 @@ function parse_convergence_arguments(args::Vector{String})
     mesh_family in (:structured, :unstructured) ||
         throw(ArgumentError("--mesh-family must be structured or unstructured."))
     if mesh_family == :structured
+        explicit_mesh_levels &&
+            throw(ArgumentError("--mesh-levels is only valid with --mesh-family=unstructured."))
         explicit_mesh_dir &&
             throw(
                 ArgumentError(
                     "--mesh-dir is only valid with --mesh-family=unstructured.",
                 ),
             )
-        length(mesh_parameters) >= 2 ||
-            throw(ArgumentError("At least two structured mesh levels are required."))
+        length(mesh_parameters) >= 1 ||
+            throw(ArgumentError("At least one structured mesh level is required."))
         issorted(mesh_parameters) ||
             throw(ArgumentError("--cells must be ordered from coarse to fine."))
         length(unique(mesh_parameters)) == length(mesh_parameters) ||
@@ -297,7 +321,11 @@ function parse_convergence_arguments(args::Vector{String})
                     "--seed is only valid with --mesh-family=structured.",
                 ),
             )
-        mesh_parameters = copy(UNSTRUCTURED_MESH_LEVELS)
+        mesh_parameters = explicit_mesh_levels ? mesh_parameters : copy(UNSTRUCTURED_MESH_LEVELS)
+        all(level -> level in UNSTRUCTURED_MESH_LEVELS, mesh_parameters) ||
+            throw(ArgumentError("--mesh-levels entries must be among 0,1,2,3."))
+        length(unique(mesh_parameters)) == length(mesh_parameters) ||
+            throw(ArgumentError("--mesh-levels entries must be distinct."))
     end
 
     all(order -> 1 <= order <= 5, orders) ||
@@ -339,6 +367,9 @@ function parse_convergence_arguments(args::Vector{String})
         final_time = periods * cavity_wave_period(epsilon, mu)
     end
 
+    validate_convergence_policy(rate_policy, rate_tolerance)
+    validate_convergence_error_sampling(error_mode, error_every)
+    length(mesh_parameters) * length(orders) == 1 && (rate_policy = :report)
     return DistributedConvergenceConfig(
         mesh_parameters,
         mesh_family,
@@ -355,6 +386,11 @@ function parse_convergence_arguments(args::Vector{String})
         boundary_condition,
         flux_kind,
         abspath(output),
+        nodal_set,
+        rate_tolerance,
+        rate_policy,
+        error_every,
+        error_mode,
     )
 end
 
@@ -393,7 +429,7 @@ function validate_unstructured_mesh_family(
             path -> !isfile(path),
             [
                 unstructured_convergence_mesh_path(config, level)
-                for level in UNSTRUCTURED_MESH_LEVELS
+                for level in config.mesh_parameters
             ],
         )
         if !isempty(missing_paths)
@@ -486,7 +522,7 @@ function update_linf_l2_errors(
     current::NTuple{9, Float64},
     candidate::NTuple{9, Float64},
 )
-    return ntuple(index -> max(current[index], candidate[index]), 9)
+    return maxwell_error_maxima(current, candidate)
 end
 
 function advance_distributed_convergence_case!(
@@ -501,45 +537,42 @@ function advance_distributed_convergence_case!(
     boundary_condition::Symbol,
     flux_kind::MaxwellFluxKind,
     cubature_order::Int,
+    error_every::Int = 1,
+    error_mode::Symbol = :max_time,
 )
     rk_workspace = MaxwellPartitionedRKWorkspace(U, scheme)
-    error_workspace = DistributedMaxwellComponentL2Workspace(
-        distributed_dg,
-        cubature_order,
-    )
-    formulation = PoissonBracketFormulation(flux_kind)
-    maxima = cavity_space_l2_error_vector!(
+    error_workspace = error_mode == :max_time ?
+        DistributedMaxwellComponentL2Workspace(distributed_dg, cubature_order) : nothing
+    omega = sqrt(3.0) * pi / sqrt(epsilon * mu)
+    electric0, _ = exact_cavity_mode_functions(0.0;
+        epsilon = epsilon, mu = mu, boundary_condition = boundary_condition)
+    _, magnetic_quarter = exact_cavity_mode_functions(pi / (2.0 * omega);
+        epsilon = epsilon, mu = mu, boundary_condition = boundary_condition)
+    error_workspace === nothing || precompute_maxwell_exact_spatial_modes!(
         error_workspace,
-        U,
-        distributed_dg,
-        0.0;
-        epsilon = epsilon,
-        mu = mu,
-        boundary_condition = boundary_condition,
-    )
+        (x, y, z) -> (electric0(x, y, z)..., magnetic_quarter(x, y, z)...))
+    formulation = PoissonBracketFormulation(flux_kind)
+    rhs_partition_function! = make_distributed_maxwell_partition_rhs_function(
+        distributed_dg, registry, formulation; ε = epsilon, μ = mu)
+    function evaluate(t)
+        c = cos(omega * t)
+        s = sin(omega * t)
+        factors = (c, c, c, s, s, s)
+        components = distributed_maxwell_component_l2_errors_separable!(
+            error_workspace, U, distributed_dg, factors, ntuple(_ -> 0.0, 6))
+        electric = sqrt(sum(components[index]^2 for index in 1:3))
+        magnetic = sqrt(sum(components[index]^2 for index in 4:6))
+        return (electric, magnetic, hypot(electric, magnetic), components...)
+    end
+    maxima = error_mode == :max_time ? evaluate(0.0) : ntuple(_ -> 0.0, 9)
 
     for step in 1:nsteps
-        distributed_partitioned_symplectic_rk_step!(
-            U,
-            rk_workspace,
-            scheme,
-            dt,
-            distributed_dg,
-            registry,
-            formulation;
-            ε = epsilon,
-            μ = mu,
-        )
-        candidate = cavity_space_l2_error_vector!(
-            error_workspace,
-            U,
-            distributed_dg,
-            step * dt;
-            epsilon = epsilon,
-            mu = mu,
-            boundary_condition = boundary_condition,
-        )
-        maxima = update_linf_l2_errors(maxima, candidate)
+        partitioned_symplectic_rk_step_partitioned_rhs!(
+            U, rk_workspace, scheme, dt, rhs_partition_function!)
+        if error_mode == :max_time && (step == nsteps || step % error_every == 0)
+            candidate = evaluate(step * dt)
+            maxima = update_linf_l2_errors(maxima, candidate)
+        end
     end
     return maxima
 end
@@ -550,13 +583,21 @@ function run_distributed_convergence_case(
     mesh_level::Int,
     config::DistributedConvergenceConfig,
     comm::MPI.Comm,
+    root_mesh_override = nothing,
+    root_partition_override = nothing,
+    root_mesh_preloaded::Bool = false,
+    ; nsteps_override::Union{Nothing, Int} = nothing,
+    validity_callback = nothing,
 )
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
-    root_mesh, _mesh_path =
-        root_convergence_mesh(config, mesh_parameter, comm)
-    root_partition =
-        rank == 0 ? balanced_spatial_partition(root_mesh, nranks) : nothing
+    root_mesh = root_mesh_override
+    if !root_mesh_preloaded
+        root_mesh, _ = root_convergence_mesh(config, mesh_parameter, comm)
+    end
+    root_partition = rank == 0 && root_partition_override === nothing ?
+                     balanced_spatial_partition(root_mesh, nranks) :
+                     root_partition_override
     nelements = MPI.bcast(
         rank == 0 ? size(root_mesh.tets, 2) : 0,
         comm;
@@ -568,6 +609,7 @@ function run_distributed_convergence_case(
         root_partition,
         polynomial_order;
         comm = comm,
+        nodal_set = config.nodal_set,
     )
     owned_count =
         length(distributed_dg.distributed_mesh.partition.owned)
@@ -581,6 +623,7 @@ function run_distributed_convergence_case(
         boundary_condition = config.boundary_condition,
     )
     U = interpolate_maxwell_field(distributed_dg, electric, magnetic)
+    validity_callback === nothing || validity_callback("initial", U, distributed_dg)
     boundary_kind = config.boundary_condition == :pec ?
                     MaxwellBC_PEC :
                     MaxwellBC_PMC
@@ -597,8 +640,12 @@ function run_distributed_convergence_case(
         μ = config.mu,
     )
     estimated_dt = MPI.Allreduce(local_dt, min, comm)
-    nsteps = max(1, ceil(Int, config.final_time / estimated_dt))
+    nsteps = nsteps_override === nothing ?
+             max(1, ceil(Int, config.final_time / estimated_dt)) : nsteps_override
+    nsteps > 0 || throw(ArgumentError("Time-step count must be positive."))
     dt = config.final_time / nsteps
+    dt <= estimated_dt * (1 + 64eps(Float64)) ||
+        throw(ArgumentError("Planned dt=$dt exceeds CFL limit $estimated_dt."))
     esprk_order = polynomial_order + 1
     scheme = explicit_partitioned_symplectic_rk_scheme(
         esprk_order;
@@ -615,6 +662,7 @@ function run_distributed_convergence_case(
     ).total
 
     MPI.Barrier(comm)
+    started = time_ns()
     linf_l2_errors = advance_distributed_convergence_case!(
         U,
         distributed_dg,
@@ -627,7 +675,17 @@ function run_distributed_convergence_case(
         boundary_condition = config.boundary_condition,
         flux_kind = config.flux_kind,
         cubature_order = cubature_order,
+        error_every = config.error_every,
+        error_mode = config.error_mode,
     )
+    elapsed = MPI.Allreduce((time_ns() - started) * 1e-9, max, comm)
+    final_errors = cavity_space_l2_error_vector!(
+        DistributedMaxwellComponentL2Workspace(distributed_dg, cubature_order),
+        U, distributed_dg, config.final_time;
+        epsilon = config.epsilon, mu = config.mu,
+        boundary_condition = config.boundary_condition)
+    config.error_mode == :final && (linf_l2_errors = final_errors)
+    validity_callback === nothing || validity_callback("final", U, distributed_dg)
     final_energy = distributed_maxwell_energy(
         U,
         distributed_dg;
@@ -664,6 +722,9 @@ function run_distributed_convergence_case(
         mean_ratio_min = quality.mean_ratio_min,
         mean_ratio_avg = quality.mean_ratio_avg,
         dt = dt,
+        nsteps = nsteps,
+        elapsed_seconds = elapsed,
+        final_errors = final_errors,
         linf_l2_electric_error = linf_l2_errors[1],
         linf_l2_magnetic_error = linf_l2_errors[2],
         linf_l2_u_error = linf_l2_errors[3],
@@ -682,377 +743,26 @@ function run_distributed_convergence_case(
     return result
 end
 
-function convergence_rate(
-    coarse_error::Float64,
-    fine_error::Float64,
-    coarse_h::Float64,
-    fine_h::Float64,
-)
-    return observed_convergence_rate(
-        coarse_error,
-        fine_error,
-        coarse_h,
-        fine_h,
-    )
-end
-
-function convergence_errors(result::DistributedConvergenceResult)
-    return (
-        result.linf_l2_electric_error,
-        result.linf_l2_magnetic_error,
-        result.linf_l2_u_error,
-        result.linf_l2_ex_error,
-        result.linf_l2_ey_error,
-        result.linf_l2_ez_error,
-        result.linf_l2_hx_error,
-        result.linf_l2_hy_error,
-        result.linf_l2_hz_error,
-    )
-end
-
-function set_convergence_rates!(
-    result::DistributedConvergenceResult,
-    rates::NTuple{9, Union{Missing, Float64}},
-)
-    result.rate_electric = rates[1]
-    result.rate_magnetic = rates[2]
-    result.rate_u = rates[3]
-    result.rate_ex = rates[4]
-    result.rate_ey = rates[5]
-    result.rate_ez = rates[6]
-    result.rate_hx = rates[7]
-    result.rate_hy = rates[8]
-    result.rate_hz = rates[9]
-    return result
-end
-
-function add_convergence_rates!(
-    results::Vector{DistributedConvergenceResult},
-)
-    for order in sort(unique(result.order for result in results))
-        subset = sort(
-            filter(result -> result.order == order, results);
-            by = result -> result.mesh_level,
-        )
-        for index in 2:length(subset)
-            coarse = subset[index - 1]
-            fine = subset[index]
-            coarse_errors = convergence_errors(coarse)
-            fine_errors = convergence_errors(fine)
-            rates = ntuple(
-                component ->
-                    coarse_errors[component] > COMPONENT_RATE_ERROR_FLOOR ?
-                    convergence_rate(
-                        fine_errors[component],
-                        coarse_errors[component],
-                        fine.h_max,
-                        coarse.h_max,
-                    ) :
-                    missing,
-                9,
-            )
-            set_convergence_rates!(fine, rates)
-        end
-    end
-    return results
-end
-
-formatted_rate(rate::Union{Missing, Float64}) =
-    ismissing(rate) ? "-" : @sprintf("%.3f", rate)
-
-function formatted_rate_verdict(
-    rate::Union{Missing, Float64},
-    expected::Float64,
-    tolerance::Float64,
-)
-    pass = convergence_rate_pass(rate, expected, tolerance)
-    ismissing(pass) && return "SKIP"
-    return pass ? "PASS" : "FAIL"
-end
-
-function convergence_mesh_label(result::DistributedConvergenceResult)
-    return result.mesh_family == :structured ?
-           "cells=$(result.mesh_parameter)" :
-           "m$(result.mesh_parameter)"
-end
-
-function print_convergence_results(
-    results::Vector{DistributedConvergenceResult},
-)
-    println()
-    println("L-infinity-in-time, L2-in-space field errors")
-    println("------------------------------------------------")
-    println(
-        rpad("N", 4),
-        rpad("mesh", 12),
-        rpad("Ne", 9),
-        rpad("owned", 11),
-        rpad("h char", 12),
-        rpad("h min", 12),
-        rpad("h max", 12),
-        rpad("dt", 12),
-        rpad("E error", 13),
-        rpad("r E", 8),
-        rpad("H error", 13),
-        rpad("r H", 8),
-        rpad("U error", 13),
-        "r U",
-    )
-    for result in results
-        owned =
-            "$(result.min_owned_elements):$(result.max_owned_elements)"
-        println(
-            rpad(string(result.order), 4),
-            rpad(convergence_mesh_label(result), 12),
-            rpad(string(result.nelements), 9),
-            rpad(owned, 11),
-            rpad(@sprintf("%.3e", result.characteristic_h), 12),
-            rpad(@sprintf("%.3e", result.h_min), 12),
-            rpad(@sprintf("%.3e", result.h_max), 12),
-            rpad(@sprintf("%.3e", result.dt), 12),
-            rpad(@sprintf("%.3e", result.linf_l2_electric_error), 13),
-            rpad(formatted_rate(result.rate_electric), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_magnetic_error), 13),
-            rpad(formatted_rate(result.rate_magnetic), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_u_error), 13),
-            formatted_rate(result.rate_u),
-        )
-    end
-
-    println()
-    println("L-infinity-in-time, L2-in-space component errors")
-    println("--------------------------------------------------")
-    println(
-        rpad("N", 4),
-        rpad("mesh", 12),
-        rpad("Ex", 13),
-        rpad("r Ex", 8),
-        rpad("Ey", 13),
-        rpad("r Ey", 8),
-        rpad("Ez", 13),
-        rpad("r Ez", 8),
-        rpad("Hx", 13),
-        rpad("r Hx", 8),
-        rpad("Hy", 13),
-        rpad("r Hy", 8),
-        rpad("Hz", 13),
-        "r Hz",
-    )
-    for result in results
-        println(
-            rpad(string(result.order), 4),
-            rpad(convergence_mesh_label(result), 12),
-            rpad(@sprintf("%.3e", result.linf_l2_ex_error), 13),
-            rpad(formatted_rate(result.rate_ex), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_ey_error), 13),
-            rpad(formatted_rate(result.rate_ey), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_ez_error), 13),
-            rpad(formatted_rate(result.rate_ez), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_hx_error), 13),
-            rpad(formatted_rate(result.rate_hx), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_hy_error), 13),
-            rpad(formatted_rate(result.rate_hy), 8),
-            rpad(@sprintf("%.3e", result.linf_l2_hz_error), 13),
-            formatted_rate(result.rate_hz),
-        )
-    end
-
-    println()
-    println("Energy, mesh quality, and ownership")
-    println("-----------------------------------")
-    println(
-        rpad("N", 4),
-        rpad("mesh", 12),
-        rpad("owned", 11),
-        rpad("Energy(0)", 13),
-        rpad("Energy(T)", 13),
-        rpad("rel drift", 13),
-        rpad("V min", 12),
-        rpad("V max", 12),
-        rpad("V total", 12),
-        rpad("V ratio", 10),
-        rpad("edge min", 12),
-        rpad("edge max", 12),
-        rpad("edge ratio", 12),
-        rpad("q min", 10),
-        "q avg",
-    )
-    for result in results
-        owned =
-            "$(result.min_owned_elements):$(result.max_owned_elements)"
-        println(
-            rpad(string(result.order), 4),
-            rpad(convergence_mesh_label(result), 12),
-            rpad(owned, 11),
-            rpad(@sprintf("%.3e", result.initial_energy), 13),
-            rpad(@sprintf("%.3e", result.final_energy), 13),
-            rpad(@sprintf("%.3e", result.relative_energy_drift), 13),
-            rpad(@sprintf("%.3e", result.volume_min), 12),
-            rpad(@sprintf("%.3e", result.volume_max), 12),
-            rpad(@sprintf("%.3e", result.volume_total), 12),
-            rpad(@sprintf("%.3f", result.volume_ratio), 10),
-            rpad(@sprintf("%.3e", result.edge_min), 12),
-            rpad(@sprintf("%.3e", result.edge_max), 12),
-            rpad(@sprintf("%.3f", result.edge_ratio), 12),
-            rpad(@sprintf("%.3f", result.mean_ratio_min), 10),
-            @sprintf("%.3f", result.mean_ratio_avg),
-        )
-    end
-end
-
-function convergence_csv_header()
-    return (
-        "mpi_ranks,boundary_condition,flux,mesh_family,order,esprk_order," *
-        "cubature_order,mesh_level,mesh_parameter,nelements," *
-        "min_owned_elements,max_owned_elements,characteristic_h,h_min,h_max," *
-        "volume_min,volume_max,volume_total,volume_ratio,edge_min,edge_max," *
-        "edge_ratio,mean_ratio_min,mean_ratio_avg,dt," *
-        "linf_l2_electric_error,linf_l2_magnetic_error,linf_l2_u_error," *
-        "linf_l2_ex_error,linf_l2_ey_error,linf_l2_ez_error," *
-        "linf_l2_hx_error,linf_l2_hy_error,linf_l2_hz_error," *
-        "initial_energy,final_energy,relative_energy_drift," *
-        "rate_electric,rate_magnetic,rate_u,rate_ex,rate_ey,rate_ez," *
-        "rate_hx,rate_hy,rate_hz"
-    )
-end
-
-csv_rate(rate::Union{Missing, Float64}) = ismissing(rate) ? "" : rate
-
-function write_convergence_results(
-    path::String,
-    results::Vector{DistributedConvergenceResult},
-)
-    mkpath(dirname(path))
-    open(path, "w") do io
-        println(io, convergence_csv_header())
-        for result in results
-            values = (
-                result.mpi_ranks,
-                result.boundary_condition,
-                result.flux,
-                result.mesh_family,
-                result.order,
-                result.esprk_order,
-                result.cubature_order,
-                result.mesh_level,
-                result.mesh_parameter,
-                result.nelements,
-                result.min_owned_elements,
-                result.max_owned_elements,
-                result.characteristic_h,
-                result.h_min,
-                result.h_max,
-                result.volume_min,
-                result.volume_max,
-                result.volume_total,
-                result.volume_ratio,
-                result.edge_min,
-                result.edge_max,
-                result.edge_ratio,
-                result.mean_ratio_min,
-                result.mean_ratio_avg,
-                result.dt,
-                result.linf_l2_electric_error,
-                result.linf_l2_magnetic_error,
-                result.linf_l2_u_error,
-                result.linf_l2_ex_error,
-                result.linf_l2_ey_error,
-                result.linf_l2_ez_error,
-                result.linf_l2_hx_error,
-                result.linf_l2_hy_error,
-                result.linf_l2_hz_error,
-                result.initial_energy,
-                result.final_energy,
-                result.relative_energy_drift,
-                csv_rate(result.rate_electric),
-                csv_rate(result.rate_magnetic),
-                csv_rate(result.rate_u),
-                csv_rate(result.rate_ex),
-                csv_rate(result.rate_ey),
-                csv_rate(result.rate_ez),
-                csv_rate(result.rate_hx),
-                csv_rate(result.rate_hy),
-                csv_rate(result.rate_hz),
-            )
-            println(io, join(values, ','))
-        end
-    end
-    return path
-end
-
-function convergence_verdict(
-    results::Vector{DistributedConvergenceResult},
-)
-    verdict = true
-    messages = String[]
-
-    for order in sort(unique(result.order for result in results))
-        subset = sort(
-            filter(result -> result.order == order, results);
-            by = result -> result.mesh_level,
-        )
-        finest = subset[end]
-        expected_electric = order + 1.0
-        expected_magnetic = Float64(order)
-        component_specs = (
-            ("Ex", finest.rate_ex, expected_electric),
-            ("Ey", finest.rate_ey, expected_electric),
-            ("Ez", finest.rate_ez, expected_electric),
-            ("Hx", finest.rate_hx, expected_magnetic),
-            ("Hy", finest.rate_hy, expected_magnetic),
-            ("Hz", finest.rate_hz, expected_magnetic),
-        )
-        active_component_passes = Bool[]
-        component_messages = String[]
-        for (name, rate, expected) in component_specs
-            pass = convergence_rate_pass(
-                rate,
-                expected,
-                CONVERGENCE_RATE_TOLERANCE,
-            )
-            if !ismissing(pass)
-                push!(active_component_passes, pass)
-            end
-            push!(
-                component_messages,
-                @sprintf(
-                    "%s=%s/%s",
-                    name,
-                    formatted_rate(rate),
-                    formatted_rate_verdict(
-                        rate,
-                        expected,
-                        CONVERGENCE_RATE_TOLERANCE,
-                    ),
-                ),
-            )
-        end
-        component_pass =
-            !isempty(active_component_passes) && all(active_component_passes)
-        verdict &= component_pass
-        push!(
-            messages,
-            @sprintf(
-                "N=%d components: %s; expected E %.1f, H %.1f: %s",
-                order,
-                join(component_messages, ", "),
-                expected_electric,
-                expected_magnetic,
-                component_pass ? "PASS" : "FAIL",
-            ),
-        )
-        push!(
-            messages,
-            @sprintf(
-                "N=%d fields: E=%s, H=%s, U=%s (rates use h_max)",
-                order,
-                formatted_rate(finest.rate_electric),
-                formatted_rate(finest.rate_magnetic),
-                formatted_rate(finest.rate_u),
-            ),
-        )
-    end
-    return verdict, messages
+function cavity_convergence_row(r::DistributedConvergenceResult, config)
+    maxima = (r.linf_l2_electric_error, r.linf_l2_magnetic_error, r.linf_l2_u_error,
+              r.linf_l2_ex_error, r.linf_l2_ey_error, r.linf_l2_ez_error,
+              r.linf_l2_hx_error, r.linf_l2_hy_error, r.linf_l2_hz_error)
+    metadata = merge(maxwell_convergence_metadata(r), (
+        case = "cavity",
+        nodal_set = config.nodal_set,
+        mesh_source = config.mesh_family == :structured ? "structured_unit_cube" :
+                      unstructured_convergence_mesh_path(config, r.mesh_parameter),
+        final_time = config.final_time, epsilon = config.epsilon, mu = config.mu,
+        wave_number = sqrt(3.0) * pi, jitter = config.jitter, seed = config.seed,
+        effective_cfl = effective_convergence_cfl(config),
+        error_mode = replace(string(config.error_mode), '_' => '-'),
+        error_every = config.error_every,
+        error_samples = config.error_mode == :final ? 1 :
+                        2 + fld(r.nsteps - 1, config.error_every),
+        nodes_per_element = num_tet_nodes(r.order),
+        h_ratio = r.h_max / r.h_min,
+        rate_tolerance = config.rate_tolerance, rate_policy = config.rate_policy))
+    return maxwell_convergence_row(metadata, maxima, r.final_errors)
 end
 
 function run_convergence_study(
@@ -1105,10 +815,19 @@ function run_convergence_study(
         println("rate length scale:  h_max")
         println("error norm:         L-infinity time, L2 space")
         println("output:             ", config.output)
+        println("error mode/every:   ", replace(string(config.error_mode), '_' => '-'), " / ", config.error_every)
         println()
     end
 
     results = DistributedConvergenceResult[]
+    root_meshes = Dict{Int, Any}()
+    root_partitions = Dict{Int, Any}()
+    for mesh_parameter in config.mesh_parameters
+        root_mesh, _ = root_convergence_mesh(config, mesh_parameter, comm)
+        root_meshes[mesh_parameter] = root_mesh
+        root_partitions[mesh_parameter] = rank == 0 ?
+            balanced_spatial_partition(root_mesh, nranks) : nothing
+    end
     for order in config.orders
         for (index, mesh_parameter) in enumerate(config.mesh_parameters)
             mesh_level = index - 1
@@ -1133,26 +852,16 @@ function run_convergence_study(
                     mesh_level,
                     config,
                     comm,
+                    root_meshes[mesh_parameter],
+                    root_partitions[mesh_parameter],
+                    true,
                 ),
             )
         end
     end
 
-    add_convergence_rates!(results)
-    if rank == 0
-        print_convergence_results(results)
-        write_convergence_results(config.output, results)
-        verdict, messages = convergence_verdict(results)
-        println()
-        println("Convergence checks")
-        println("------------------")
-        foreach(println, messages)
-        println(
-            "Overall expected-rate convergence: ",
-            verdict ? "PASS" : "FAIL",
-        )
-        println("Wrote CSV: ", config.output)
-    end
+    rows = rank == 0 ? [cavity_convergence_row(r, config) for r in results] : NamedTuple[]
+    finish_maxwell_convergence(rows, config.output, comm; policy = config.rate_policy)
     return results
 end
 

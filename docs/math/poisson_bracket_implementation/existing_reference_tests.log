@@ -1,0 +1,9 @@
+┌ Warning: Orthonormal modal basis check is not very accurate
+│   err = 1.3817525906140483e-9
+└ @ DiscoGMPI ~/CODE/DiscoGMPI/src/solver/kernels/reference_tet.jl:636
+Test Summary:                                    | Pass  Total  Time
+Hesthaven-Warburton tetrahedral warp-blend nodes |  673    673  0.0s
+Test Summary:                                    | Pass  Total  Time
+Warp-blend reference matrices and face operators |   85     85  1.7s
+Test Summary:                                              | Pass  Total  Time
+Warp-blend nodal set is available through DGDiscretization |    3      3  1.5s

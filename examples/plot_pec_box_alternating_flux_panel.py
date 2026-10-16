@@ -7,9 +7,13 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+# Avoid slow/warning-prone Matplotlib cache creation on shared filesystems.
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import (
@@ -45,11 +49,40 @@ REQUIRED_COLUMNS = {
     "exact_angular_momentum_y",
     "exact_angular_momentum_z",
 }
+DIVERGENCE_COLUMNS = {
+    "electric_divergence_l2",
+    "magnetic_divergence_l2",
+    "electric_divergence_linf",
+    "magnetic_divergence_linf",
+}
 
 DEFAULT_ORDERS = (1, 2, 3, 4)
-COLOR_CYCLE = ("#1b9e77", "#d95f02", "#7570b3", "#e7298a")
-MARKER_CYCLE = ("o", "s", "^", "D")
-LINESTYLE_CYCLE = ("-", "--", "-.", ":")
+DEFAULT_FIGURE_WIDTH = 7.2
+DEFAULT_FIGURE_HEIGHT = 8.15
+
+# Okabe-Ito palette: colorblind-safe and robust in print.
+COLOR_CYCLE = (
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#000000",
+)
+# Data curves are line-only; colors distinguish the series.
+MARKER_CYCLE = (None,)
+PANEL_LABELS = tuple(f"({letter})" for letter in "abcdefghijklmnopqrstuvwxyz")
+# Dash-only line patterns. The h-convergence wrapper reuses this module, so
+# these styles distinguish either DG orders p or mesh levels h.
+LINESTYLE_CYCLE = (
+    (0, (10.0, 2.5)),
+    (0, (7.0, 2.0)),
+    (0, (4.5, 1.6)),
+    (0, (12.0, 2.2, 5.0, 2.2)),
+    (0, (8.0, 1.8, 4.0, 1.8)),
+    (0, (14.0, 2.5, 3.0, 2.5)),
+)
 
 
 @dataclass(frozen=True)
@@ -119,7 +152,6 @@ class DiagnosticsSeries:
 
 @dataclass(frozen=True)
 class PlotQuantity:
-    label: str
     ylabel: str
     getter: Callable[[DiagnosticsSeries], list[float]]
     symlog: bool = False
@@ -190,6 +222,14 @@ def parse_args() -> argparse.Namespace:
         help="Legend title. Default: DG order.",
     )
     parser.add_argument(
+        "--series-id-label",
+        default="p",
+        help=(
+            "Short label used when reporting loaded series. "
+            "Default: p."
+        ),
+    )
+    parser.add_argument(
         "--diagnostics-file",
         default="quadrature_diagnostics.csv",
         help="Diagnostics CSV filename inside each order directory.",
@@ -224,6 +264,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--divergence-output",
+        type=Path,
+        default=Path("output/pec_box_af_divergence_constraints_panel.pdf"),
+        help=(
+            "Output path for the 2x2 divergence-constraint diagnostics panel. "
+            "Default: output/pec_box_af_divergence_constraints_panel.pdf."
+        ),
+    )
+    parser.add_argument(
         "--summary-png-output",
         type=Path,
         default=None,
@@ -242,6 +291,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional PNG path for the conserved-invariant error panel.",
     )
     parser.add_argument(
+        "--divergence-png-output",
+        type=Path,
+        default=None,
+        help="Optional PNG path for the divergence-constraint diagnostics panel.",
+    )
+    parser.add_argument(
+        "--skip-divergence",
+        action="store_true",
+        help=(
+            "Do not write the divergence-constraint panel. Use this for old "
+            "CSV files generated before the divergence diagnostics were added."
+        ),
+    )
+    parser.add_argument(
         "--no-png",
         action="store_true",
         help="Only write vector outputs.",
@@ -249,8 +312,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dpi",
         type=int,
-        default=400,
-        help="PNG resolution in dots per inch. Default: 400.",
+        default=600,
+        help="PNG resolution in dots per inch. Default: 600.",
+    )
+    parser.add_argument(
+        "--figure-width",
+        type=float,
+        default=DEFAULT_FIGURE_WIDTH,
+        help=(
+            "Figure width in inches. Default: "
+            f"{DEFAULT_FIGURE_WIDTH}, tuned for two-column journal figures."
+        ),
+    )
+    parser.add_argument(
+        "--figure-height",
+        type=float,
+        default=DEFAULT_FIGURE_HEIGHT,
+        help=(
+            "Figure height in inches. Default: "
+            f"{DEFAULT_FIGURE_HEIGHT}."
+        ),
+    )
+    parser.add_argument(
+        "--legend-columns",
+        type=int,
+        default=0,
+        help=(
+            "Number of columns in the figure-level legend. "
+            "Default: automatic."
+        ),
+    )
+    parser.add_argument(
+        "--line-width",
+        type=float,
+        default=1.45,
+        help="Line width in points. Default: 1.45.",
+    )
+    parser.add_argument(
+        "--marker-size",
+        type=float,
+        default=3.9,
+        help="Marker size in points. Default: 3.9.",
+    )
+    parser.add_argument(
+        "--title",
+        default=None,
+        help=(
+            "Optional figure title. Omit for manuscript-ready panels where "
+            "the caption carries the description."
+        ),
     )
     parser.add_argument(
         "--charge-scale",
@@ -290,16 +400,22 @@ def configure_matplotlib(usetex: bool) -> None:
             "font.family": "serif",
             "font.serif": ["STIXGeneral", "DejaVu Serif", "Times New Roman"],
             "mathtext.fontset": "stix",
-            "font.size": 10.0,
-            "axes.labelsize": 10.8,
-            "axes.titlesize": 10.8,
-            "legend.fontsize": 9.0,
-            "xtick.labelsize": 8.8,
-            "ytick.labelsize": 8.8,
+            "font.size": 9.4,
+            "axes.labelsize": 10.0,
+            "axes.titlesize": 10.0,
+            "legend.fontsize": 8.9,
+            "xtick.labelsize": 8.4,
+            "ytick.labelsize": 8.4,
             "axes.linewidth": 0.9,
-            "lines.linewidth": 1.65,
-            "lines.markersize": 4.2,
-            "lines.markeredgewidth": 0.7,
+            "axes.axisbelow": True,
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+            "figure.dpi": 150,
+            "lines.linewidth": 1.45,
+            "lines.markersize": 3.9,
+            "lines.markeredgewidth": 0.75,
+            "lines.solid_capstyle": "round",
+            "lines.dash_capstyle": "butt",
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.major.size": 4.8,
@@ -315,7 +431,11 @@ def configure_matplotlib(usetex: bool) -> None:
             "legend.edgecolor": "0.75",
             "legend.handlelength": 2.3,
             "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.025,
+            "savefig.pad_inches": 0.035,
+            "savefig.dpi": 600,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "svg.fonttype": "none",
         }
     )
 
@@ -334,6 +454,8 @@ def read_series(path: Path, order: int, label: str) -> DiagnosticsSeries:
             raise ValueError(
                 f"{path} is missing required columns: {', '.join(missing)}"
             )
+        for name in sorted(DIVERGENCE_COLUMNS & available):
+            columns[name] = []
 
         for row_number, row in enumerate(reader, start=2):
             try:
@@ -348,6 +470,18 @@ def read_series(path: Path, order: int, label: str) -> DiagnosticsSeries:
         raise ValueError(f"No data rows found in {path}.")
 
     return DiagnosticsSeries(order=order, path=path, columns=columns, label=label)
+
+
+def resolve_diagnostics_path(case_dir: Path, diagnostics_file: str) -> Path:
+    diagnostics_path = Path(diagnostics_file)
+    candidates = [case_dir / diagnostics_path]
+    if len(diagnostics_path.parts) == 1:
+        candidates.append(case_dir / "diagnostics" / diagnostics_path)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
 
 
 def load_all_series(
@@ -365,12 +499,28 @@ def load_all_series(
         )
     return [
         read_series(
-            root / f"{prefix}{order}" / diagnostics_file,
+            resolve_diagnostics_path(root / f"{prefix}{order}", diagnostics_file),
             order,
             label,
         )
         for order, label in zip(orders, labels)
     ]
+
+
+def require_columns(
+    series: list[DiagnosticsSeries],
+    columns: set[str],
+    panel_name: str,
+) -> None:
+    for item in series:
+        missing = sorted(column for column in columns if column not in item.columns)
+        if missing:
+            raise ValueError(
+                f"Cannot write {panel_name}: {item.path} is missing "
+                f"columns {', '.join(missing)}. Regenerate the run with a "
+                "DiscoGMPI version that writes divergence diagnostics, or pass "
+                "--skip-divergence."
+            )
 
 
 def marker_spacing(values: list[float]) -> int:
@@ -380,14 +530,20 @@ def marker_spacing(values: list[float]) -> int:
 def apply_scientific_formatter(axis: plt.Axes) -> None:
     formatter = ScalarFormatter(useMathText=True)
     formatter.set_powerlimits((-2, 2))
+    formatter.set_useOffset(False)
     axis.yaxis.set_major_formatter(formatter)
 
 
-def style_axis(axis: plt.Axes, panel_label: str, ylabel: str) -> None:
-    axis.set_xlabel(r"Time $t$")
+def style_axis(
+    axis: plt.Axes,
+    panel_label: str,
+    ylabel: str,
+    show_xlabel: bool,
+) -> None:
+    axis.set_xlabel(r"Time $t$" if show_xlabel else "")
     axis.set_ylabel(ylabel)
-    axis.grid(True, which="major", color="0.86", linestyle="-", linewidth=0.65)
-    axis.grid(True, which="minor", color="0.92", linestyle=":", linewidth=0.5)
+    axis.grid(True, which="major", color="0.86", linestyle="-", linewidth=0.58)
+    axis.grid(True, which="minor", color="0.93", linestyle="-", linewidth=0.32)
     axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
     axis.xaxis.set_minor_locator(AutoMinorLocator())
     if axis.get_yscale() == "log":
@@ -405,13 +561,15 @@ def style_axis(axis: plt.Axes, panel_label: str, ylabel: str) -> None:
         axis.yaxis.set_major_locator(MaxNLocator(nbins=5))
     if axis.get_yscale() == "linear":
         axis.yaxis.set_minor_locator(AutoMinorLocator())
-    axis.tick_params(top=True, right=True)
+    axis.tick_params(top=True, right=True, pad=2.5)
     axis.margins(x=0.01)
     if axis.get_yscale() != "log":
         apply_scientific_formatter(axis)
+    for spine in axis.spines.values():
+        spine.set_linewidth(0.9)
     axis.text(
         0.025,
-        0.94,
+        0.955,
         panel_label,
         transform=axis.transAxes,
         ha="left",
@@ -421,7 +579,7 @@ def style_axis(axis: plt.Axes, panel_label: str, ylabel: str) -> None:
             "boxstyle": "round,pad=0.16",
             "facecolor": "white",
             "edgecolor": "0.82",
-            "alpha": 0.94,
+            "alpha": 0.96,
         },
     )
 
@@ -431,12 +589,15 @@ def plot_quantity(
     series: list[DiagnosticsSeries],
     quantity: PlotQuantity,
     panel_label: str,
+    show_xlabel: bool,
+    line_width: float,
+    marker_size: float,
 ) -> None:
     series_values = [
         (item, quantity.getter(item))
         for item in series
     ]
-    log_floor = 1.0e-300
+    log_floor = 1.0e-16
     if quantity.log:
         positive_values = [
             value
@@ -445,7 +606,7 @@ def plot_quantity(
             if math.isfinite(value) and value > 0.0
         ]
         if positive_values:
-            log_floor = max(min(positive_values) * 1.0e-3, log_floor)
+            log_floor = 10.0 ** (math.floor(math.log10(min(positive_values))) - 1)
 
     plotted_values: list[float] = []
     for index, item in enumerate(series):
@@ -468,6 +629,11 @@ def plot_quantity(
             markevery=marker_spacing(item.time),
             markerfacecolor="white",
             markeredgecolor=color,
+            markeredgewidth=0.85,
+            markersize=marker_size,
+            linewidth=line_width,
+            alpha=0.98,
+            zorder=2.0 + 0.05 * index,
             label=item.label,
         )
     if quantity.symlog:
@@ -486,7 +652,7 @@ def plot_quantity(
                 ymin /= 10.0
                 ymax *= 10.0
             axis.set_ylim(ymin, ymax)
-    style_axis(axis, panel_label, quantity.ylabel)
+    style_axis(axis, panel_label, quantity.ylabel, show_xlabel)
 
 
 def write_figure(
@@ -496,44 +662,42 @@ def write_figure(
     dpi: int,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output)
+    figure.savefig(
+        output,
+        facecolor="white",
+        metadata={"Creator": "DiscoGMPI invariant-panel postprocessor"},
+    )
 
     if png_output is not None:
         png_output.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(png_output, dpi=dpi)
+        figure.savefig(png_output, dpi=dpi, facecolor="white")
 
 
 def summary_quantities(charge_scale: str) -> tuple[PlotQuantity, ...]:
     charges_symlog = charge_scale == "symlog"
     return (
         PlotQuantity(
-            "(a)",
             r"Total energy $\mathcal{H}_h$",
             lambda item: item.values("total_energy"),
         ),
         PlotQuantity(
-            "(b)",
             r"Optical chirality $\chi_h$",
             lambda item: item.values("optical_chirality"),
         ),
         PlotQuantity(
-            "(c)",
             r"Linear momentum $\|\mathbf{P}_h\|_2$",
             lambda item: item.magnitude("linear_momentum"),
         ),
         PlotQuantity(
-            "(d)",
             r"Angular momentum $\|\mathbf{L}_h\|_2$",
             lambda item: item.magnitude("angular_momentum"),
         ),
         PlotQuantity(
-            "(e)",
             r"Electric charge $\int_{\Omega}\nabla\!\cdot(\varepsilon E_h)\,dx$",
             lambda item: item.values("electric_charge"),
             symlog=charges_symlog,
         ),
         PlotQuantity(
-            "(f)",
             r"Magnetic charge $\int_{\Omega}\nabla\!\cdot(\mu H_h)\,dx$",
             lambda item: item.values("magnetic_charge"),
             symlog=charges_symlog,
@@ -545,37 +709,31 @@ def component_quantities(momentum_scale: str) -> tuple[PlotQuantity, ...]:
     symlog = momentum_scale == "symlog"
     return (
         PlotQuantity(
-            "(a)",
             r"Linear momentum $P_x$",
             lambda item: item.values("linear_momentum_x"),
             symlog=symlog,
         ),
         PlotQuantity(
-            "(b)",
             r"Angular momentum $L_x$",
             lambda item: item.values("angular_momentum_x"),
             symlog=symlog,
         ),
         PlotQuantity(
-            "(c)",
             r"Linear momentum $P_y$",
             lambda item: item.values("linear_momentum_y"),
             symlog=symlog,
         ),
         PlotQuantity(
-            "(d)",
             r"Angular momentum $L_y$",
             lambda item: item.values("angular_momentum_y"),
             symlog=symlog,
         ),
         PlotQuantity(
-            "(e)",
             r"Linear momentum $P_z$",
             lambda item: item.values("linear_momentum_z"),
             symlog=symlog,
         ),
         PlotQuantity(
-            "(f)",
             r"Angular momentum $L_z$",
             lambda item: item.values("angular_momentum_z"),
             symlog=symlog,
@@ -587,13 +745,11 @@ def error_quantities(error_scale: str) -> tuple[PlotQuantity, ...]:
     log_scale = error_scale == "log"
     return (
         PlotQuantity(
-            "(a)",
             r"Energy error $|\mathcal{H}-\mathcal{H}_h|$",
             lambda item: item.absolute_error("total_energy", "exact_total_energy"),
             log=log_scale,
         ),
         PlotQuantity(
-            "(b)",
             r"Chirality error $|\chi-\chi_h|$",
             lambda item: item.absolute_error(
                 "optical_chirality",
@@ -602,19 +758,16 @@ def error_quantities(error_scale: str) -> tuple[PlotQuantity, ...]:
             log=log_scale,
         ),
         PlotQuantity(
-            "(c)",
             r"Linear momentum error $\|\mathbf{P}-\mathbf{P}_h\|_2$",
             lambda item: item.vector_error("linear_momentum"),
             log=log_scale,
         ),
         PlotQuantity(
-            "(d)",
             r"Angular momentum error $\|\mathbf{L}-\mathbf{L}_h\|_2$",
             lambda item: item.vector_error("angular_momentum"),
             log=log_scale,
         ),
         PlotQuantity(
-            "(e)",
             r"Electric-charge error $|Q_E-Q_{E,h}|$",
             lambda item: item.absolute_error(
                 "electric_charge",
@@ -623,13 +776,37 @@ def error_quantities(error_scale: str) -> tuple[PlotQuantity, ...]:
             log=log_scale,
         ),
         PlotQuantity(
-            "(f)",
             r"Magnetic-charge error $|Q_H-Q_{H,h}|$",
             lambda item: item.absolute_error(
                 "magnetic_charge",
                 "exact_magnetic_charge",
             ),
             log=log_scale,
+        ),
+    )
+
+
+def divergence_quantities() -> tuple[PlotQuantity, ...]:
+    return (
+        PlotQuantity(
+            r"$\|\nabla_h\!\cdot(\varepsilon\mathbf{E}_h)\|_{L^2(\Omega)}$",
+            lambda item: item.values("electric_divergence_l2"),
+            log=True,
+        ),
+        PlotQuantity(
+            r"$\|\nabla_h\!\cdot(\mu\mathbf{H}_h)\|_{L^2(\Omega)}$",
+            lambda item: item.values("magnetic_divergence_l2"),
+            log=True,
+        ),
+        PlotQuantity(
+            r"$\|\nabla_h\!\cdot(\varepsilon\mathbf{E}_h)\|_{L^\infty(\Omega)}$",
+            lambda item: item.values("electric_divergence_linf"),
+            log=True,
+        ),
+        PlotQuantity(
+            r"$\|\nabla_h\!\cdot(\mu\mathbf{H}_h)\|_{L^\infty(\Omega)}$",
+            lambda item: item.values("magnetic_divergence_linf"),
+            log=True,
         ),
     )
 
@@ -642,24 +819,70 @@ def plot_grid_panel(
     dpi: int,
     show: bool,
     legend_title: str,
+    figure_width: float,
+    figure_height: float,
+    legend_columns: int,
+    line_width: float,
+    marker_size: float,
+    title: str | None,
 ) -> None:
+    nquantities = len(quantities)
+    if nquantities == 4:
+        nrows, ncols = 2, 2
+    elif nquantities == 6:
+        nrows, ncols = 3, 2
+    else:
+        raise ValueError(f"Unsupported panel size: {nquantities} quantities.")
+
     figure, axes = plt.subplots(
-        3,
-        2,
-        figsize=(7.8, 8.4),
+        nrows,
+        ncols,
+        figsize=(figure_width, figure_height),
         sharex=True,
-        constrained_layout=True,
+    )
+    subplot_top = 0.855 if title else 0.9
+    legend_y = 0.935 if title else 0.985
+    figure.subplots_adjust(
+        left=0.105,
+        right=0.985,
+        bottom=0.065,
+        top=subplot_top,
+        wspace=0.3,
+        hspace=0.16,
     )
 
-    for axis, quantity in zip(axes.ravel(), quantities):
-        plot_quantity(axis, series, quantity, quantity.label)
+    flat_axes = tuple(axes.ravel())
+    first_bottom_axis = (nrows - 1) * ncols
+    for index, (axis, quantity) in enumerate(zip(flat_axes, quantities)):
+        plot_quantity(
+            axis,
+            series,
+            quantity,
+            PANEL_LABELS[index],
+            index >= first_bottom_axis,
+            line_width,
+            marker_size,
+        )
 
-    axes[0, 0].legend(
-        loc="best",
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    columns = legend_columns if legend_columns > 0 else min(max(len(series), 1), 4)
+    legend = figure.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, legend_y),
         title=legend_title,
         title_fontsize=9.0,
-        ncol=1,
+        ncol=columns,
+        columnspacing=1.05,
+        handletextpad=0.5,
     )
+    legend.get_frame().set_linewidth(0.8)
+
+    if title:
+        figure.suptitle(title, y=0.995, fontsize=10.5)
+
+    figure.align_ylabels(flat_axes)
 
     write_figure(figure, output, png_output, dpi)
 
@@ -702,6 +925,11 @@ def main() -> None:
         write_png,
         args.error_png_output,
     )
+    divergence_png = png_default(
+        args.divergence_output,
+        write_png,
+        args.divergence_png_output,
+    )
 
     plot_grid_panel(
         series,
@@ -711,6 +939,12 @@ def main() -> None:
         args.dpi,
         args.show,
         args.legend_title,
+        args.figure_width,
+        args.figure_height,
+        args.legend_columns,
+        args.line_width,
+        args.marker_size,
+        args.title,
     )
     plot_grid_panel(
         series,
@@ -720,6 +954,12 @@ def main() -> None:
         args.dpi,
         args.show,
         args.legend_title,
+        args.figure_width,
+        args.figure_height,
+        args.legend_columns,
+        args.line_width,
+        args.marker_size,
+        args.title,
     )
     plot_grid_panel(
         series,
@@ -729,7 +969,31 @@ def main() -> None:
         args.dpi,
         args.show,
         args.legend_title,
+        args.figure_width,
+        args.figure_height,
+        args.legend_columns,
+        args.line_width,
+        args.marker_size,
+        args.title,
     )
+    if not args.skip_divergence:
+        require_columns(series, DIVERGENCE_COLUMNS, "divergence panel")
+        divergence_height = args.figure_height * (2.0 / 3.0)
+        plot_grid_panel(
+            series,
+            divergence_quantities(),
+            args.divergence_output,
+            divergence_png,
+            args.dpi,
+            args.show,
+            args.legend_title,
+            args.figure_width,
+            divergence_height,
+            args.legend_columns,
+            args.line_width,
+            args.marker_size,
+            args.title,
+        )
 
     print(f"Wrote {args.summary_output}")
     if summary_png is not None:
@@ -740,8 +1004,12 @@ def main() -> None:
     print(f"Wrote {args.error_output}")
     if error_png is not None:
         print(f"Wrote {error_png}")
+    if not args.skip_divergence:
+        print(f"Wrote {args.divergence_output}")
+        if divergence_png is not None:
+            print(f"Wrote {divergence_png}")
     for item in series:
-        print(f"Read p={item.order}: {item.path}")
+        print(f"Read {args.series_id_label}={item.order}: {item.path}")
 
 
 if __name__ == "__main__":

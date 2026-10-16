@@ -1,0 +1,919 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!60!black}
+
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\rank}{\mathrm{rank}}
+\newcommand{\owned}{\mathcal O}
+\newcommand{\ghost}{\mathcal G}
+\newcommand{\faces}{\mathcal F}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\perm}{\pi}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{DiscoGMPI: Distributed-Memory Implementation of a Three-Dimensional DG Maxwell Solver}
+\author{DiscoGMPI project}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the distributed-memory implementation currently present
+in DiscoGMPI.  The focus is not to describe an idealized design, but the
+solver architecture as implemented in the repository: tetrahedral
+discontinuous Galerkin (DG) Maxwell operators, owned-plus-halo mesh storage,
+MPI face-trace exchange, periodic distributed coupling, distributed
+diagnostics, restart/checkpoint files, and production drivers for cavity,
+periodic, nonlinear-PML, and scattering/RCS workflows.  The intended audience
+is computational mathematicians and computational physicists who need to
+understand how the mathematical discretization is mapped onto rank-local data
+structures and MPI communication.
+\end{abstract}
+
+\tableofcontents
+
+\section{Scope and Code Basis}
+
+The implementation described here is the code currently wired through
+\path{src/DiscoGMPI.jl}.  The public module includes the serial DG kernels,
+distributed mesh construction, distributed DG wrappers, heterogeneous
+material support, nonlinear PML support, distributed diagnostics, ParaView
+output, checkpoint/restart support, and run-layout utilities.  The principal
+source files inspected for this report are
+\begin{itemize}
+  \item \path{src/DistributedMesh3D.jl},
+        \path{src/DistributedDG.jl},
+        \path{src/DistributedIO.jl},
+        and \path{src/TraceMaps.jl};
+  \item \path{src/solver/data_containers.jl} and the kernels under
+        \path{src/solver/kernels/};
+  \item \path{src/PhysicalCoverage.jl}, \path{src/NonlinearPML.jl},
+        \path{src/MaxwellDiagnostics.jl}, \path{src/MaxwellOutput.jl},
+        \path{src/RunLayout.jl}, and \path{src/MaxwellDriverSupport.jl};
+  \item the production and validation drivers under \path{examples/};
+  \item MPI and validation tests under \path{test/};
+  \item mesh-generation and post-processing scripts under
+        \path{examples/meshes/}, \path{examples/}, and
+        \path{benchmark/}.
+\end{itemize}
+There is no separate \path{drivers/} directory in the inspected tree; the
+production entry points are Julia scripts in \path{examples/}.  The file
+\path{src/rhs.jl} contains an older lower-level MPI RHS prototype, but it is
+not included by \path{src/DiscoGMPI.jl}; therefore it is not part of the
+current module load path documented as the production solver.
+
+\section{High-Level Architecture}
+
+DiscoGMPI is organized around a deliberate layering:
+\begin{enumerate}
+  \item A serial tetrahedral DG kernel constructs topology, geometry,
+        reference operators, trace maps, flux faces, and Maxwell RHS kernels.
+  \item A distributed mesh layer selects rank-local owned elements and a
+        one-face ghost halo from a global partition.
+  \item A distributed DG wrapper converts the local owned-plus-halo mesh into
+        an ordinary \code{DGDiscretization}, then adds persistent MPI trace
+        buffers and neighbor face metadata.
+  \item Time-integration drivers call the same Maxwell RHS kernels on each
+        rank after refreshing ghost face traces.
+  \item Diagnostics and output integrate or write owned elements only, then
+        use MPI reductions or rank-local files plus root-owned manifests.
+\end{enumerate}
+This architecture keeps most numerical kernels independent of MPI.  A rank
+sees a local \code{RawVTUMesh} containing owned and ghost tetrahedra, and the
+serial DG routines assemble local volume and face operators for that mesh.
+Distributed correctness is enforced by ownership: ghost unknowns are used to
+provide neighbor traces but ghost residuals and ghost diagnostic
+contributions are removed.
+
+\begin{longtable}{p{0.29\textwidth}p{0.64\textwidth}}
+\caption{Primary implementation modules relevant to distributed Maxwell runs.}
+\label{tab:module-map}\\
+\toprule
+\textbf{File} & \textbf{Implemented responsibility}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{File} & \textbf{Implemented responsibility}\\
+\midrule
+\endhead
+\path{src/DistributedMesh3D.jl} &
+Owned/ghost element selection, local node and element maps, boundary tags,
+material IDs, face neighbor records, and MPI neighbor communication tables.\\
+\path{src/DistributedDG.jl} &
+\code{DistributedDGDiscretization}, local DG construction from distributed
+meshes, persistent Maxwell send/receive buffers, ghost-trace exchange,
+distributed RHS wrappers, distributed energy, and distributed time-step
+wrappers.\\
+\path{src/PhysicalCoverage.jl} &
+Heterogeneous element material arrays, material-aware volume and surface
+operators, material-aware distributed RHS functions, physical invariant
+diagnostics, and distributed periodic Maxwell exchange.\\
+\path{src/NonlinearPML.jl} &
+Nodal nonlinear PML damping data, polynomial profiles, PML source terms, and
+serial/distributed PML RHS and ESPRK/RK wrappers.\\
+\path{src/DistributedIO.jl} &
+Rank-local mesh-cache files, manifest/checksum validation, distributed
+checkpoint/restart files, and run metadata/partition metadata.\\
+\path{src/MaxwellDiagnostics.jl} &
+Cubature-based distributed energy, field errors, component errors, charge,
+linear momentum, angular momentum, optical chirality, and mesh-quality
+metrics.\\
+\path{src/MaxwellOutput.jl} &
+Parallel VTK/PVTK field output, ParaView time-series collection files,
+integration-point CSV output, and checkpoint pointer files.\\
+\path{src/RunLayout.jl} &
+Isolated run directory layout, configuration/input/status files, compatibility
+links, and run-root naming utilities.\\
+\path{examples/*.jl} &
+Thin-to-medium production frontends for cavity, periodic, PML validation,
+metallic-sphere scattering/RCS, NASA almond scattering/RCS, convergence, and
+validation-matrix workflows.\\
+\bottomrule
+\end{longtable}
+
+\section{Maxwell DG State and Local Discretization}
+
+The electromagnetic state is stored as six nodal arrays,
+\begin{equation}
+  U_h = (E_x,E_y,E_z,H_x,H_y,H_z),
+\end{equation}
+where each component has dimensions $N_p\times K_{\mathrm{loc}}$ on a rank.
+Here $N_p=(N+1)(N+2)(N+3)/6$ is the number of nodal basis functions on a
+degree-$N$ tetrahedron, and $K_{\mathrm{loc}}$ includes owned and ghost
+tetrahedra.  The concrete storage type is \code{MaxwellField}, defined in
+\path{src/solver/data_containers.jl}; RHS storage is the analogous
+\code{MaxwellRHS}.
+
+The local DG discretization is built by \code{DGDiscretization} in
+\path{src/solver/kernels/dg_discretization.jl}.  It contains:
+\begin{itemize}
+  \item the raw tetrahedral mesh \code{RawVTUMesh};
+  \item element and boundary topology;
+  \item geometric mappings and physical metrics;
+  \item a \code{ReferenceTet} with nodal points, Vandermonde matrices,
+        derivative matrices, weak derivative matrices, and mass matrix;
+  \item reference face mass/lift operators;
+  \item physical derivative operators on each affine tetrahedron;
+  \item interior and boundary trace maps with face-node permutations;
+  \item flux-face geometry and coloring information.
+\end{itemize}
+The serial kernels therefore retain the usual DG structure.  MPI is not
+embedded in reference-element or physical-element operators; distributed
+execution is obtained by presenting each rank with a consistent local mesh
+and by exchanging just enough data to evaluate traces on partition interfaces.
+
+\subsection{Semidiscrete Maxwell System}
+
+On each element $K$, DiscoGMPI advances source-free Maxwell equations in the
+form
+\begin{equation}
+  \eps_K \partial_t \vect E = \nabla\times\vect H,
+  \qquad
+  \mu_K \partial_t \vect H = -\nabla\times\vect E,
+  \label{eq:maxwell}
+\end{equation}
+with positive scalar permittivity $\eps_K$ and permeability $\mu_K$.  The
+homogeneous path passes scalar \code{epsilon} and \code{mu}; the
+heterogeneous path uses \code{MaxwellElementMaterials} with one value per
+rank-local element.
+
+For affine tetrahedra, the element mass matrix is
+\begin{equation}
+  M_K = |J_K|M,
+\end{equation}
+where $M$ is the reference nodal mass matrix and $J_K$ is the affine mapping
+Jacobian.  The mass-matrix energy used by the implementation is
+\begin{equation}
+  \mathcal H_h =
+  \frac12\sum_K |J_K|\left[
+    \eps_K\sum_{a\in\{x,y,z\}} E_{a,K}^T M E_{a,K}
+    +
+    \mu_K\sum_{a\in\{x,y,z\}} H_{a,K}^T M H_{a,K}
+  \right].
+  \label{eq:discrete-energy}
+\end{equation}
+In distributed runs the sum in \eqref{eq:discrete-energy} is performed over
+owned elements only on each rank, followed by \code{MPI.Allreduce}.
+
+\subsection{Hesthaven--Warburton and Poisson-Bracket Paths}
+
+Two Maxwell formulations are represented by concrete types:
+\code{HesthavenWarburtonFormulation} and \code{PoissonBracketFormulation}.
+Both use the same field storage but different volume/surface operators.
+The Hesthaven--Warburton path uses strong physical derivative operators for
+the curl terms.  The Poisson-bracket path uses weak derivative matrices for
+one partition and transposed weak derivative matrices for the complementary
+partition, matching the implemented discrete skew pairing.
+
+The Poisson-bracket surface operator supports centered and alternating flux
+kinds.  Upwind flux is rejected for \code{PoissonBracketFormulation} because
+the implemented upwind penalty is dissipative and does not define the
+partitioned Poisson-bracket operator used by the ESPRK path.  The implemented
+Poisson-bracket centered face correction is
+\begin{equation}
+  F_E^{PB}
+  =-\frac{1}{2\eps}\vect n\times(\vect H^- - \vect H^+),
+  \qquad
+  F_H^{PB}
+  =-\frac{1}{2\mu}\vect n\times(\vect E^- + \vect E^+).
+  \label{eq:pb-centered-flux}
+\end{equation}
+For the alternating variant, the implementation selects
+\begin{equation}
+  \theta(\vect n)=
+  \begin{cases}
+  1, & n_x+n_y+n_z>0,\\
+  0, & n_x+n_y+n_z<0,\\
+  1/2, & n_x+n_y+n_z=0,
+  \end{cases}
+\end{equation}
+sets $\alpha=1-\theta$, and uses
+\begin{align}
+  \widehat{\vect E} &= \theta \vect E^+ + \alpha \vect E^- ,\\
+  F_E^{alt} &=
+  -\frac{\alpha}{\eps}\vect n\times(\vect H^- - \vect H^+),\\
+  F_H^{alt} &=
+  -\frac{1}{\mu}\vect n\times\widehat{\vect E}.
+\end{align}
+Interior and distributed periodic alternating faces are implemented.  For
+physical boundaries, the Poisson-bracket alternating code currently handles
+PEC by returning no boundary contribution, and rejects PMC or absorbing
+boundary kinds for this flux choice.
+
+\section{Distributed Mesh Model}
+
+\subsection{Global Partition Input}
+
+The distributed mesh constructor accepts a global tetrahedral mesh and an
+element-to-rank vector.  METIS-style element partitions are read by
+\code{read\_metis\_epart}; internally ranks are zero-based to match MPI
+rank IDs.  The constructor validates that the partition has exactly one entry
+per tetrahedron and that all entries lie in the active rank range.
+
+The implementation supports three practical setup modes:
+\begin{enumerate}
+  \item \code{build\_distributed\_dg}: every rank has the global mesh and
+        partition available.
+  \item \code{build\_distributed\_dg\_from\_root}: only a root rank provides
+        the global mesh and partition; root builds rank-local mesh packets
+        and sends them to the other ranks.
+  \item \code{build\_distributed\_dg\_from\_partition}: each rank loads a
+        previously written rank-local mesh shard from a distributed mesh
+        cache.
+\end{enumerate}
+The production drivers expose this through \code{--distributed-mesh-dir},
+\code{--rebuild-distributed-mesh}, and
+\code{--collective-distributed-mesh-prep}.  The root-distribution path is
+simple and robust but has a rank-zero setup bottleneck.  The collective mesh
+preparation path trades memory during preprocessing for avoiding root-built
+rank-local packets.  Once the distributed mesh cache exists, each rank reads
+only its own serialized shard.
+
+\subsection{Owned and Ghost Elements}
+
+For a rank $r$, the owned global element set is
+\begin{equation}
+  \owned_r = \{K_i:\mathrm{owner}(K_i)=r\}.
+\end{equation}
+The ghost set is the one-face halo
+\begin{equation}
+  \ghost_r =
+  \{K_j\notin\owned_r:\exists K_i\in\owned_r
+  \text{ such that } K_i \text{ and } K_j
+  \text{ share a triangular face}\}.
+\end{equation}
+This is constructed in \code{build\_ghost\_global\_elements\_face\_halo}.
+Only a one-layer face halo is required because Maxwell surface fluxes depend
+on immediate plus traces only.
+
+The rank stores the sorted union $\owned_r\cup\ghost_r$, with separate local
+index lists \code{partition.owned} and \code{partition.ghosts}.  This design
+is important: ghost elements occupy ordinary element slots in the local
+\code{DGDiscretization}, so the serial DG face-map machinery can identify
+partition-interface faces as ordinary interior faces between an owned element
+and a ghost element.  Ownership is then enforced outside the serial kernels.
+
+\subsection{Local Node and Element Maps}
+
+The local node set is the set of global vertices touched by all stored
+owned and ghost tetrahedra.  The implementation stores
+\begin{equation}
+  \mathrm{local\_node}\leftrightarrow \mathrm{global\_node}
+\end{equation}
+maps in \code{LocalNodeGeometry}.  Element-level maps are stored in
+\code{LocalElementTopology}: local vertices, global element IDs,
+global-to-local element lookup, owner ranks, ownership flags, material IDs,
+and per-face neighbor records.  The material ID vector is carried through
+the distributed mesh so that heterogeneous material lookup remains local
+after partitioning.
+
+\subsection{Face Keys, Boundary Tags, and Non-Manifold Guards}
+
+A tetrahedral face is keyed by sorting its three global vertex IDs.  A face
+with one adjacent local record is treated as a boundary face, a face with two
+records is an interior face, and any face with more than two records is
+rejected as non-manifold.  Boundary condition tags are stored in a dictionary
+from sorted global face key to integer boundary ID and are copied into
+\code{FaceNeighborInfo.bc\_tag}.  This is used for PEC, PMC, absorbing, PML,
+periodic, and scatterer-surface tags depending on the driver.
+
+\section{Distributed DG Construction}
+
+\code{build\_distributed\_dg\_from\_local\_mesh} converts a
+\code{DistributedMesh} into a local \code{RawVTUMesh}.  The local mesh contains
+all stored tetrahedra, including ghosts.  Boundary triangles are reconstructed
+from faces that appear once in the rank-local stored mesh and are given the
+corresponding boundary ID.  Faces between owned and ghost elements appear
+twice, so they are not physical boundary faces in the local DG topology.
+
+After the local \code{RawVTUMesh} is built, the ordinary serial
+\code{DGDiscretization} constructor creates all reference, metric, trace, and
+flux structures.  Finally, \code{build\_distributed\_maxwell\_exchange}
+matches the distributed mesh communication table to the local DG face-node
+arrays and allocates persistent send and receive buffers.
+
+This construction means that most Maxwell kernels are blind to MPI.  A
+distributed RHS call performs:
+\begin{enumerate}
+  \item face-trace exchange to refresh ghost face nodes;
+  \item local Maxwell RHS evaluation using the serial DG kernels over the
+        owned-plus-ghost local mesh;
+  \item zeroing of all ghost RHS entries;
+  \item owned-only use of the resulting RHS in time integration.
+\end{enumerate}
+
+\section{MPI Communication Strategy}
+
+\subsection{Interface Metadata}
+
+Partition-interface faces are represented by \code{DistributedDGInterfaceFace}.
+Each entry stores the sorted global face key, neighbor rank, owned element and
+face, owned face nodes, ghost element and face, and ghost face nodes.  Entries
+are grouped by neighbor rank in \code{DistributedMaxwellExchange}.
+
+For each neighbor $q$, the exchange object stores
+\begin{equation}
+  \code{send\_buffers}[q],\quad \code{recv\_buffers}[q]
+  \in \mathbb R^{6N_{fp}N_{faces}(q)}.
+\end{equation}
+The factor six corresponds to $E_x,E_y,E_z,H_x,H_y,H_z$.  The buffers are
+allocated once when the distributed DG object is built and reused on every
+RHS call.  The send faces are sorted deterministically by global face key, so
+both communicating ranks agree on buffer layout.
+
+\subsection{Halo Exchange Algorithm}
+
+The implemented Maxwell halo exchange is \code{exchange\_maxwell\_ghost\_traces!}.
+Conceptually, for each neighbor rank $q$ it performs:
+\begin{lstlisting}[language={},caption={Implemented Maxwell ghost-trace exchange.}]
+for neighbor q
+    pack owned face-node values of Ex,Ey,Ez,Hx,Hy,Hz into send_buffer[q]
+end
+for neighbor q
+    post MPI.Irecv!(recv_buffer[q], source=q, tag=24017)
+end
+for neighbor q
+    post MPI.Isend(send_buffer[q], dest=q, tag=24017)
+end
+MPI.Waitall(requests)
+for neighbor q
+    unpack recv_buffer[q] into ghost face-node slots
+end
+\end{lstlisting}
+The implementation uses nonblocking receives and sends, but all requests are
+waited on before RHS assembly starts.  Thus the current production path avoids
+deadlock and has persistent buffers, but it does not yet overlap communication
+with local volume or owned-interior surface work.
+
+Only face-node values are required for partition-interface fluxes.  Ghost
+element interiors are not synchronized.  This is consistent with the local
+RHS flow because the physically relevant owned-element surface fluxes only
+need plus traces on shared faces.  RHS values on ghost elements are filled by
+the local serial call and then explicitly zeroed by
+\code{zero\_ghost\_maxwell\_rhs!}.
+
+\subsection{Distributed RHS Flow}
+
+For homogeneous materials, the distributed RHS wrapper in
+\path{src/DistributedDG.jl} is
+\begin{equation}
+  R_r(U_r) =
+  \mathrm{zeroGhost}\left(
+  R_{\mathrm{DG}}(\mathrm{exchange}(U_r))
+  \right).
+\end{equation}
+For heterogeneous materials, \path{src/PhysicalCoverage.jl} defines analogous
+overloads that pass \code{MaxwellElementMaterials} to material-aware volume,
+interior-face, and boundary-face routines.  The material-aware distributed
+RHS accepts optional \code{MaxwellBoundaryData}; this is used by scattering
+drivers for time-dependent incident PEC data.
+
+\subsection{Performance Consequences}
+
+The communication volume per RHS evaluation scales like
+\begin{equation}
+  N_{\mathrm{send}} =
+  6 N_{fp} \sum_{q\in\mathcal N_r} N_{\faces}(r,q),
+\end{equation}
+where $N_{\faces}(r,q)$ is the number of local owned faces adjacent to
+neighbor $q$.  Since
+$N_{fp}=(N+1)(N+2)/2$, surface communication grows quadratically with
+polynomial order, whereas element storage grows cubically through $N_p$.
+The one-face ghost halo adds memory overhead proportional to the partition
+surface area; the per-rank metadata written by \code{write\_distributed\_run\_metadata}
+records owned elements, ghost elements, ghost DOFs, neighbors, interface
+faces, send/receive values, and halo ratios.
+
+\section{Distributed Periodic Coupling}
+
+Periodic problems need an additional communication layer because two physical
+boundary faces may be paired even when they are not adjacent in the local
+tetrahedral topology.  The implemented type is
+\code{DistributedPeriodicMaxwellExchange} in \path{src/PhysicalCoverage.jl}.
+The construction process is:
+\begin{enumerate}
+  \item each rank describes its owned boundary faces for the requested
+        periodic boundary IDs;
+  \item rank zero gathers descriptors and pairs minus/plus faces by centroid
+        after applying the prescribed translation;
+  \item face areas and face-node permutations are checked;
+  \item the paired descriptors are broadcast to all ranks;
+  \item each rank builds local \code{DistributedPeriodicFace} entries,
+        including local partners when both faces are on the same rank and
+        MPI-buffer offsets when the partner is remote.
+\end{enumerate}
+
+For a rectangular periodic box, the default boundary pairs are
+\begin{equation}
+  1\leftrightarrow 2,\qquad
+  3\leftrightarrow 4,\qquad
+  5\leftrightarrow 6,
+\end{equation}
+with translations $(-L_x,0,0)$, $(0,-L_y,0)$, and $(0,0,-L_z)$.  The
+periodic mesh must be topologically compatible: translated partner faces
+must have matching centroids, areas, and nodal locations within tolerance.
+The earlier unstructured periodic mesh issue is consistent with this
+requirement; if opposite surfaces are not translationally paired face by face,
+the numerical periodic coupling is not the intended physical topology.
+
+The periodic RHS first performs the ordinary ghost exchange, then performs
+periodic trace exchange using tag \code{24018}.  Local periodic partners are
+read directly from the local field arrays.  Remote partners are read from the
+periodic receive buffers.  Periodic surface contributions are then added
+before remaining physical boundary contributions are processed.
+
+\section{Boundary Conditions and Physical Coverage}
+
+Boundary conditions are imposed by constructing an exterior trace.  The
+implemented boundary kinds are \code{MaxwellBC\_PEC},
+\code{MaxwellBC\_PMC}, \code{MaxwellBC\_Absorbing}, and
+\code{MaxwellBC\_None}.
+
+For PEC boundaries, the exterior trace is
+\begin{equation}
+  \vect E^+ = -\vect E^- + 2(\vect n\cdot\vect E^-)\vect n,
+  \qquad
+  \vect H^+ = \vect H^-,
+\end{equation}
+so the averaged trace satisfies $\vect n\times\vect E=0$.  For PMC,
+\begin{equation}
+  \vect E^+ = \vect E^-,
+  \qquad
+  \vect H^+ = -\vect H^- + 2(\vect n\cdot\vect H^-)\vect n.
+\end{equation}
+The absorbing boundary trace zeroes the incoming characteristic using the
+local impedance $Z=\sqrt{\mu/\eps}$ while retaining normal components.
+
+The heterogeneous material path stores per-element $\eps_K$ and $\mu_K$ in
+\code{MaxwellElementMaterials}.  For Hesthaven--Warburton fluxes, the
+material-aware upwind flux uses minus and plus impedances.  For the
+Poisson-bracket path, material-aware face fluxes call the implemented
+Poisson-bracket surface flux with the minus-side material coefficients.
+
+\section{Nonlinear PML Implementation}
+
+The nonlinear PML implementation is contained in \path{src/NonlinearPML.jl}.
+It stores nodal damping profiles
+\begin{equation}
+  \sigma_x,\quad \sigma_y,\quad \sigma_z
+\end{equation}
+as matrices matching the Maxwell field layout.  The helper
+\code{polynomial\_pml\_sigma} evaluates one-sided polynomial damping profiles
+that are zero in the interior and rise to \code{sigma\_max} at the outer
+boundary.  \code{build\_six\_sided\_nonlinear\_pml} constructs Cartesian PML
+slabs from distributed mesh bounds.
+
+The PML appears as a nonlinear source added after the Maxwell spatial RHS.
+At a node with electric field $\vect E$, magnetic field $\vect H$, and
+damping vector $\vect\sigma$, the implementation computes auxiliary vectors
+from $\vect E\times\vect H$ with denominators depending on the PML parameter
+$a\in(0,1)$, $\eps$, $\mu$, and a positive regularization.  The resulting
+electric and magnetic PML source components are added to the RHS.  Distributed
+PML source addition is restricted to owned elements:
+\begin{equation}
+  R_r^{PML}(U_r) =
+  \mathrm{zeroGhost}\left(
+  R_r^{Maxwell}(U_r) + S_r^{PML}(U_r)\big|_{\owned_r}
+  \right).
+\end{equation}
+Both homogeneous and heterogeneous-material PML RHS overloads are implemented,
+as are distributed periodic PML variants.
+
+For Poisson-bracket production paths, the code contains partitioned ESPRK PML
+wrappers such as
+\code{distributed\_maxwell\_nonlinear\_pml\_partitioned\_symplectic\_rk\_step!}.
+Older helper routines for standard explicit RK PML time marching remain in
+the code, but production Poisson-bracket drivers use ESPRK when PML is
+enabled.
+
+\section{Time Integration}
+
+\subsection{Explicit RK}
+
+\path{src/solver/kernels/time_integration.jl} implements classical explicit
+RK methods of orders one through five, including a fifth-order
+Dormand--Prince update without adaptive time stepping.  The workspace
+\code{MaxwellRKWorkspace} stores the initial state, one stage state, and a
+vector of stage RHS fields.
+
+\subsection{Explicit Partitioned Symplectic RK}
+
+The Poisson-bracket production drivers use explicit partitioned symplectic
+Runge--Kutta (ESPRK) methods.  The scheme object stores
+\begin{equation}
+  a_i=\code{first\_weights}[i],
+  \qquad
+  b_i=\code{second\_weights}[i],
+\end{equation}
+and a first partition, either electric or magnetic.  The production Maxwell
+drivers use magnetic-first stepping for Poisson-bracket Maxwell runs.  A
+generic ESPRK substep computes the full RHS and applies it only to the active
+partition:
+\begin{lstlisting}[language={},caption={Implemented partitioned symplectic step.}]
+for stage i
+    if first_weight[i] != 0
+        rhs!(rhs, U)
+        U[first_partition] += dt * first_weight[i] * rhs[first_partition]
+    end
+    if second_weight[i] != 0
+        rhs!(rhs, U)
+        U[second_partition] += dt * second_weight[i] * rhs[second_partition]
+    end
+end
+\end{lstlisting}
+The timestep is estimated by \code{estimate\_maxwell\_dt} from element-size
+diagnostics, polynomial order, material wave speed, and the user CFL value.
+Production drivers then choose an integer number of steps so that the final
+step lands exactly at \code{--final-time}.
+
+\subsection{Nonautonomous Boundary Forcing}
+
+The metallic-sphere and NASA-almond scattering drivers solve for scattered
+fields with time-dependent incident PEC boundary data.  The incident boundary
+data are stored in \code{MaxwellBoundaryData}, which contains a mutable
+reference to the current physical time.  The ordinary ESPRK scheme object
+does not store classical Runge--Kutta abscissas $c_i$.  For nonautonomous
+forcing, the scattering driver therefore reconstructs the physical substep
+clock from the cumulative composition weights.
+
+For an H-first split, the driver keeps two clocks:
+\begin{equation}
+  t_H^{(0)}=t^n,\qquad t_E^{(0)}=t^n.
+\end{equation}
+Before a nonzero H-partition substep with weight $a_i$, it sets
+\code{boundary\_data.time} to $t_H$, evaluates the RHS, updates the magnetic
+partition, and then advances $t_H\leftarrow t_H+\Delta t\,a_i$.  Before a
+nonzero E-partition substep with weight $b_i$, it sets the boundary time to
+$t_E$, evaluates the RHS, updates the electric partition, and advances
+$t_E\leftarrow t_E+\Delta t\,b_i$.  At the end of the step it sets the
+boundary time to $t^{n+1}$.  This is implemented in
+\code{timed\_partitioned\_symplectic\_rk\_step!} in
+\path{examples/distributed_metallic_sphere_scattering.jl}.  The detail is
+essential: evaluating incident fields only at integer step times would use
+the wrong nonautonomous data inside the composition.
+
+\section{Diagnostics and Invariants}
+
+\path{src/MaxwellDiagnostics.jl} computes diagnostics by integrating over
+owned elements only and reducing the resulting sums.  The quadrature
+diagnostic uses Jaskowiec--Sukumar tetrahedral cubature, usually with order
+\begin{equation}
+  q=\max(2,2N+4)
+\end{equation}
+unless the user requests another cubature order.  The implemented diagnostic
+quantities include:
+\begin{itemize}
+  \item electric, magnetic, and total energy;
+  \item exact energy and energy error for analytical cases;
+  \item $L^2$ norms and relative errors for $\vect E$, $\vect H$, and the
+        combined field;
+  \item per-component errors for $E_x,E_y,E_z,H_x,H_y,H_z$;
+  \item energy-density norms and errors;
+  \item optical chirality and optical-chirality density errors;
+  \item electric and magnetic charge,
+        $\int_\Omega \nabla\cdot(\eps\vect E_h)\dd x$ and
+        $\int_\Omega \nabla\cdot(\mu\vect H_h)\dd x$;
+  \item linear momentum based on $\eps\mu\,\vect E_h\times\vect H_h$;
+  \item angular momentum based on
+        $\vect x\times(\eps\mu\,\vect E_h\times\vect H_h)$;
+  \item mesh-quality metrics for convergence CSVs.
+\end{itemize}
+The diagnostic values are not volume-normalized by default.  They are
+physical integrals or $L^2$ norms over the computational domain, with the
+normalization appearing only where an explicit relative error or RMS quantity
+is computed.
+
+The output schema for \code{diagnostics/quadrature\_diagnostics.csv} is
+written by \code{write\_quadrature\_diagnostics\_header} and
+\code{write\_quadrature\_diagnostics\_row}.  The energy history
+\code{diagnostics/energy.csv} is written separately using the DG
+mass-matrix energy.
+
+\section{Output, Metadata, and Restart}
+
+\subsection{Run Layout}
+
+\path{src/RunLayout.jl} defines an isolated run directory layout:
+\begin{equation}
+\begin{array}{ll}
+\code{config/} & resolved configuration, layout, run metadata, partition metadata,\\
+\code{input/} & input manifest,\\
+\code{diagnostics/} & CSV diagnostics,\\
+\code{fields/} & ParaView PVTK/PVTU files,\\
+\code{checkpoints/} & restart state shards,\\
+\code{logs/},\code{plots/},\code{tables/} & downstream artifacts.
+\end{array}
+\end{equation}
+The production drivers support either a fixed \code{--output-dir} or an
+isolated timestamped directory under \code{--run-root} with a sanitized
+\code{--run-name}.  Compatibility symlinks for common files such as
+\code{energy.csv}, \code{quadrature\_diagnostics.csv}, and
+\code{run\_metadata.toml} are created at the run root.
+
+\subsection{Distributed Mesh Cache}
+
+\code{write\_distributed\_mesh\_partition} writes one serialized mesh shard per
+rank:
+\begin{equation}
+  \code{mesh\_rank0000.bin},\quad
+  \code{mesh\_rank0001.bin},\quad \ldots
+\end{equation}
+Rank zero writes \code{mesh\_manifest.toml} only after all pieces are written.
+The manifest records the format version, MPI rank count, global element
+count, user metadata, per-rank file names, checksums, owned/ghost counts,
+local nodes, and neighbor ranks.  \code{load\_distributed\_mesh\_partition}
+checks the manifest, rank count, file existence, checksum, payload format,
+payload version, and payload rank before returning the local mesh shard.
+
+\subsection{Checkpoint and Restart}
+
+\code{write\_distributed\_checkpoint} stores only owned Maxwell degrees of
+freedom on each rank.  A checkpoint payload records the rank, MPI size, DG
+order, nodes per element, owned global element IDs, and six field-component
+arrays restricted to owned elements.  Rank zero writes
+\code{checkpoint\_manifest.toml} with step, time, dt, metadata, file names, and
+checksums.  Restart currently requires the same MPI rank count, DG order, and
+element partition.  On load, the code verifies that the stored owned global
+IDs match the current distributed mesh and then refreshes ghost traces.
+
+\subsection{ParaView and Integration-Point Output}
+
+Parallel field output uses \code{write\_parallel\_maxwell\_fields}.  Each rank
+writes owned elements only as VTK Lagrange tetrahedra.  The fields include
+numerical electric and magnetic fields, exact fields when supplied, field
+errors, magnitudes, global element IDs, owner rank, polynomial order, and time.
+The time series is indexed by \code{paraview\_series.csv} and
+\code{fields.pvd}.  The \code{--paraview-every} driver option controls
+snapshot cadence while still writing initial and final states in production
+drivers.
+
+Final integration-point output is written as one CSV per rank.  It contains
+physical coordinates, quadrature weights, numerical and exact field values,
+energy densities, chirality density, charge densities, linear momentum, and
+angular momentum at cubature points of owned elements.
+
+\section{Scattering and RCS as a Distributed Workflow}
+
+Although this report focuses on the distributed Maxwell implementation, the
+metallic-sphere and NASA-almond RCS drivers exercise several important
+distributed features simultaneously: incident time-dependent PEC data,
+scattered-field evolution, nonlinear PML, owned-surface integration, and MPI
+reductions.
+
+The metallic-sphere driver \path{examples/distributed_metallic_sphere_scattering.jl}
+solves for the scattered field:
+\begin{equation}
+  \vect E_h=\vect E_{\mathrm{scat},h},\qquad
+  \vect H_h=\vect H_{\mathrm{scat},h}.
+\end{equation}
+The incident plane wave is supplied by \path{src/MaxwellExactSolutions.jl}.
+For a PEC scatterer surface, the total-field boundary condition is
+\begin{equation}
+  \vect n\times
+  (\vect E_{\mathrm{scat}}+\vect E_{\mathrm{inc}})=0,
+\end{equation}
+which is imposed in the exterior trace as
+\begin{equation}
+  \vect n\times\vect E_{\mathrm{scat}}
+  =-\vect n\times\vect E_{\mathrm{inc}}.
+\end{equation}
+The incident-aware exterior trace is implemented by
+\code{pec\_incident\_boundary\_plus\_trace!} and routed through
+\code{MaxwellBoundaryData}.
+
+The RCS path samples owned PEC scatterer faces only.  It forms the total
+magnetic field on the surface, computes the surface current
+\begin{equation}
+  \vect J_s = \vect n\times
+  (\vect H_{\mathrm{scat},h}+\vect H_{\mathrm{inc}}),
+\end{equation}
+and accumulates a time-windowed Fourier sample at the incident angular
+frequency.  For an observation direction $\widehat{\vect r}$, the implemented
+spatial phase in the surface-current integral is
+\begin{equation}
+  \exp\left(-ik\,\widehat{\vect r}\cdot\vect x\right),
+\end{equation}
+and a Hann window is applied after \code{--rcs-start-time}.  The reduced
+far-field amplitude is converted into
+\begin{equation}
+  \sigma(\theta,\phi)
+  =
+  4\pi
+  \frac{|\vect E_\infty(\theta,\phi)|^2}{|\vect E_{\mathrm{inc}}|^2}.
+\end{equation}
+The output \code{diagnostics/rcs.csv} reports dimensional RCS values and dB
+values for the requested angular pattern.  Sphere post-processing compares
+against a Mie-series reference; almond post-processing compares against the
+Austin CEM benchmark reference data when available.
+
+\section{Convergence and Validation Infrastructure}
+
+The convergence drivers are:
+\begin{itemize}
+  \item \path{examples/convergence_distributed_poisson_bracket_maxwell.jl}
+        for PEC/PMC cavity eigenmodes;
+  \item \path{examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl}
+        for periodic plane waves;
+  \item \path{examples/convergence_distributed_periodic_isoresolution.jl}
+        for isoresolution studies.
+\end{itemize}
+They write CSV convergence tables with aggregate and per-component errors,
+rates, mesh-size information, and mesh-quality metrics.  Expected rates are
+checked explicitly rather than merely checking monotone error reduction.
+
+The validation-matrix orchestrator is
+\path{examples/validate_distributed_maxwell_matrix.jl}.  It can run PEC,
+PMC, periodic, and PML cases over selected rank counts and polynomial orders.
+It launches MPI tests, compares rank-one outputs against multi-rank outputs
+bitwise or within tolerance, checks convergence-rate policies, verifies
+diagnostic schemas, checks conservative energy drift, checks PML energy
+dissipation, and writes a machine-readable
+\code{validation\_summary.json}.
+
+The MPI regression tests include:
+\begin{itemize}
+  \item \path{test/test_mpi_metis_partition.jl}: partition reading,
+        owned/ghost mesh construction, neighbor tables, deterministic face
+        ordering, and lower-level trace exchange;
+  \item \path{test/test_mpi_distributed_maxwell.jl}: distributed DG
+        construction, mesh/cache/checkpoint I/O, ghost trace exchange,
+        distributed RHS matching serial RHS, ghost RHS zeroing, energy
+        matching serial energy, RK and ESPRK step matching, and PMC support;
+  \item \path{test/test_mpi_face_permutation.jl}: face permutation
+        correctness across interfaces;
+  \item \path{test/test_mpi_physical_coverage.jl}: material and physical
+        coverage paths;
+  \item \path{test/test_mpi_nonlinear_pml.jl}: distributed nonlinear PML
+        coverage.
+\end{itemize}
+
+\section{Memory and Scaling Considerations}
+
+The main rank-local Maxwell storage is six dense matrices of size
+$N_p\times K_{\mathrm{loc}}$ for the state, plus RHS and time-integration
+workspace arrays.  For ESPRK, \code{MaxwellPartitionedRKWorkspace} stores a
+single RHS field.  For classical explicit RK, \code{MaxwellRKWorkspace} stores
+one initial field, one stage field, and one RHS field per stage.  Therefore
+high-order classical RK has a larger memory footprint than ESPRK.
+
+The distributed mesh duplicates ghost elements and their local nodes.  This
+is a controlled overhead:
+\begin{equation}
+  \mathrm{halo\ overhead}\approx
+  \frac{|\ghost_r|N_p}{|\owned_r|N_p}
+  =
+  \frac{|\ghost_r|}{|\owned_r|}.
+\end{equation}
+The ratio is written in \code{partition\_metadata.csv}.  The overhead is
+largest for small partitions, high surface-to-volume partition shapes, and
+large rank counts at fixed global problem size.
+
+Persistent communication buffers remove per-RHS allocation for production
+Maxwell halo exchange.  Surface flux kernels use reusable
+\code{MaxwellSurfaceWorkspace} objects and precomputed face lifting operators.
+The implementation nevertheless has some known scaling limits:
+\begin{itemize}
+  \item nonblocking MPI calls are currently followed by \code{MPI.Waitall}
+        before computation, so there is no communication/computation overlap;
+  \item root-based mesh distribution can bottleneck setup for very large
+        meshes unless the distributed mesh cache or collective preparation
+        path is used;
+  \item diagnostics based on high-order cubature can be expensive because
+        many invariant and exact-error quantities are evaluated at every
+        diagnostic sample;
+  \item ParaView output writes high-order Lagrange tetrahedra for owned
+        elements, which is useful for visualization but can dominate storage
+        for frequent output.
+\end{itemize}
+These are implementation tradeoffs, not correctness defects.  They also
+identify the natural next optimization targets: overlap interior volume work
+with halo exchange, reduce global setup bottlenecks, and tune diagnostic and
+output cadence for production runs.
+
+\section{Implemented Production Workflows}
+
+The main distributed Maxwell frontends are:
+\begin{itemize}
+  \item \path{examples/distributed_poisson_bracket_maxwell.jl}: cavity
+        Poisson-bracket Maxwell run with PEC or PMC boundaries, centered or
+        alternating flux subject to the implemented boundary restrictions,
+        optional nonlinear PML, diagnostics, checkpoint/restart, and ParaView
+        time series.
+  \item \path{examples/distributed_periodic_poisson_bracket_maxwell.jl}:
+        periodic plane-wave run on axis-aligned translationally matching box
+        meshes, with automatic or user-supplied partitions, distributed
+        periodic exchange, diagnostics, checkpoint/restart, and ParaView
+        output.
+  \item \path{examples/distributed_poisson_bracket_pml_validation.jl}:
+        production PML validation driver with mesh/flux/PML parameter sweeps,
+        reflection diagnostics, metadata, and ParaView output.
+  \item \path{examples/distributed_metallic_sphere_scattering.jl}: PEC sphere
+        scattered-field driver with incident plane wave, nonlinear PML,
+        incident-aware PEC boundary flux, PEC boundary residual diagnostics,
+        optional RCS extraction, and ParaView output of scattered/incident
+        and total fields.
+  \item \path{examples/distributed_pec_almond_scattering.jl} and
+        \path{examples/distributed_pec_almond_austin_monostatic_rcs.jl}:
+        NASA PEC almond scattering/RCS workflows using the same distributed
+        Maxwell, incident-boundary, PML, residual, and RCS infrastructure.
+\end{itemize}
+
+\section{What Is Not Implemented or Not Yet General}
+
+The following limitations are visible from the inspected implementation:
+\begin{itemize}
+  \item dynamic load balancing is not implemented; partitions are fixed for a
+        run;
+  \item communication/computation overlap is not implemented in the production
+        RHS path;
+  \item checkpoint restart requires the same MPI rank count, DG order, and
+        element partition;
+  \item distributed periodic pairing requires matching opposite boundary
+        topology; arbitrary nonmatching periodic meshes are not supported;
+  \item Poisson-bracket alternating flux with physical PMC or absorbing
+        boundaries is not implemented;
+  \item the older \path{src/rhs.jl} MPI RHS prototype is not part of the
+        module include chain and should not be treated as the production
+        solver path.
+\end{itemize}
+
+\section{Conclusion}
+
+DiscoGMPI implements distributed-memory three-dimensional DG Maxwell time
+integration by combining a serial tetrahedral DG kernel with an owned-plus-halo
+mesh representation and nearest-neighbor MPI trace exchange.  The main design
+choice is pragmatic: ghost elements allow the serial face machinery to remain
+unchanged, while ownership masks prevent double-counting and prevent ghost
+states from advancing.  Global conservation diagnostics, convergence studies,
+PML validation, and RCS workflows are all built on the same pattern: compute
+rank-local owned contributions and reduce or gather them explicitly.
+
+The current implementation is therefore already suitable for research-grade
+MPI validation studies of PEC/PMC cavities, periodic plane waves, nonlinear
+PML behavior, and PEC scattering/RCS workflows.  The remaining engineering
+work is mostly about scalability and maintainability rather than establishing
+the basic distributed numerical model: removing setup bottlenecks, overlapping
+MPI exchange with computation, keeping drivers thin, and making the validation
+matrix the strict release gate before large algorithmic changes.
+
+\end{document}

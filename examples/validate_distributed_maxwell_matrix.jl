@@ -46,6 +46,10 @@ const MPI_TEST_SPECS = (
      script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
                        "test_mpi_physical_coverage.jl"),
      ranks = (2, 4)),
+    (name = "magnetic-charge-null-invariant",
+     script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
+                       "test_mpi_magnetic_charge_null_invariant.jl"),
+     ranks = (1, 2, 4)),
     (name = "nonlinear-pml",
      script = joinpath(VALIDATION_REPOSITORY_ROOT, "test",
                        "test_mpi_nonlinear_pml.jl"),
@@ -89,6 +93,10 @@ const INVARIANT_REQUIRED_COLUMNS = [
     "magnetic_charge",
     "exact_electric_charge",
     "exact_magnetic_charge",
+    "electric_divergence_l2",
+    "magnetic_divergence_l2",
+    "electric_divergence_linf",
+    "magnetic_divergence_linf",
     "linear_momentum_x",
     "linear_momentum_y",
     "linear_momentum_z",
@@ -126,6 +134,7 @@ Base.@kwdef struct ValidationConfig
     cases::Vector{Symbol} = [:cavity_pec, :cavity_pmc, :periodic, :pml]
     ranks::Vector{Int} = [1, 2, 4]
     orders::Vector{Int} = [2]
+    nodal_set::Symbol = :equispaced
     cavity_cells::Vector{Int} = [1, 2, 3]
     periodic_nx_targets::Vector{Int} = [2, 4]
     convergence_final_time::Float64 = 0.05
@@ -251,6 +260,7 @@ Options:
   --cases=a,b                 cavity-pec,cavity-pmc,periodic,pml by default
   --ranks=a,b                 MPI rank counts. Default: 1,2,4
   --orders=a,b                DG orders. Default depends on --profile
+  --nodal-set=NAME           Convergence nodes: equispaced or warp-blend.
   --cavity-cells=a,b          Structured cavity convergence levels
   --periodic-nx-targets=a,b   Periodic Gmsh convergence levels
   --final-time=T              Convergence final time
@@ -286,6 +296,8 @@ Checks:
     count, using the selected comparison mode.
   - Invariant diagnostics: production-driver CSVs must contain finite E/H
     errors, energy, charge, linear and angular momentum, and optical chirality.
+  - Magnetic-charge null invariant: the matrix-free Poisson-bracket RHS is
+    checked on 1, 2, and 4 MPI ranks for centered and alternating fluxes.
   - PML is a smoke/dissipation case: it skips exact invariant targets and
     instead checks finite diagnostics plus non-increasing total energy.
   - Standalone MPI regression tests are launched from this same orchestrator.
@@ -318,6 +330,11 @@ function parse_validation_arguments(args::Vector{String})
         elseif startswith(arg, "--orders=")
             config = ValidationConfig(; pairs(merge_config(config,
                 orders = parse_integer_list(split(arg, "=", limit = 2)[2])))...)
+        elseif startswith(arg, "--nodal-set=")
+            config = ValidationConfig(; pairs(merge_config(config,
+                nodal_set = parse_symbol_option(
+                    replace(split(arg, "=", limit = 2)[2], '-' => '_'),
+                    (:equispaced, :warp_blend))))...)
         elseif startswith(arg, "--cavity-cells=") ||
                startswith(arg, "--cells=")
             config = ValidationConfig(; pairs(merge_config(config,
@@ -599,6 +616,9 @@ end
 
 function convergence_command(config::ValidationConfig, case::Symbol, ranks::Int)
     output = convergence_output_path(config, case, ranks)
+    # The orchestrator owns the exit status so it can collect every case's CSV.
+    common = ["--rate-policy=report", "--rate-tolerance=$(config.rate_tolerance)",
+              "--nodal-set=$(config.nodal_set)"]
     if case in (:cavity_pec, :cavity_pmc)
         args = [
             "--mesh-family=structured",
@@ -609,7 +629,7 @@ function convergence_command(config::ValidationConfig, case::Symbol, ranks::Int)
             "--boundary-condition=$(boundary_condition(case))",
             "--output=$(output)",
         ]
-        return validation_command(config, ranks, CAVITY_CONVERGENCE_SCRIPT, args)
+        return validation_command(config, ranks, CAVITY_CONVERGENCE_SCRIPT, vcat(args, common))
     elseif case == :periodic
         args = [
             "--nx-targets=$(comma_join(config.periodic_nx_targets))",
@@ -618,7 +638,7 @@ function convergence_command(config::ValidationConfig, case::Symbol, ranks::Int)
             "--cfl=$(config.cfl)",
             "--output=$(output)",
         ]
-        return validation_command(config, ranks, PERIODIC_CONVERGENCE_SCRIPT, args)
+        return validation_command(config, ranks, PERIODIC_CONVERGENCE_SCRIPT, vcat(args, common))
     end
     throw(ArgumentError("Unknown validation case $case."))
 end
@@ -807,6 +827,24 @@ function add_rate_checks!(
     isempty(rows) && error("No convergence rows in $csv_path.")
     finals = final_rows_by_order(rows)
 
+    if all(row -> get(row, "schema_version", "") == "2", values(finals))
+        for order in sort(collect(keys(finals)))
+            row = finals[order]
+            for name in ("electric", "magnetic", "total", "ex", "ey", "ez", "hx", "hy", "hz")
+                status = get(row, "status_$name", "MISSING")
+                informational = status in ("INFO", "SKIP_ROUNDOFF")
+                passed = status in ("PASS", "PASS_FLOOR", "SKIP_ROUNDOFF", "INFO")
+                push_check!(checks, case_label(case), "convergence-rate", ranks,
+                    "$name Linf(time) L2(space) N=$order", get(row, "rate_$name", ""),
+                    get(row, "expected_rate_$name", ""),
+                    "h_max; tolerance $(config.rate_tolerance)",
+                    informational ? :SKIP : status_from_pass(config, passed),
+                    "Schema v2 rate status: $status.")
+            end
+        end
+        return
+    end
+
     for (column, label, expected_fn) in rate_specs(case)
         for order in sort(collect(keys(finals)))
             row = finals[order]
@@ -976,7 +1014,7 @@ function add_invariant_schema_checks!(
         "",
         isempty(missing_columns) ? :PASS : :FAIL,
         isempty(missing_columns) ?
-        "Diagnostics contain E/H, energy, charge, momentum, and chirality columns." :
+        "Diagnostics contain E/H, energy, charge, divergence, momentum, and chirality columns." :
         "Diagnostics are missing required columns.",
     )
     isempty(missing_columns) || return
@@ -1484,6 +1522,7 @@ function run_validation_matrix(config::ValidationConfig)
     println("orders:           ", config.orders)
     println("rate targets:     cavity E=N+1, cavity H=N; periodic E=N+1, H=N, Ez=N+1, Hy=N")
     println("rate policy:      ", config.rate_policy)
+    println("convergence nodes:", config.nodal_set)
     println("comparison:       ", config.comparison)
     println("MPI tests:        ", config.run_mpi_tests ? "enabled" : "disabled")
     println("output directory: ", config.output_dir)

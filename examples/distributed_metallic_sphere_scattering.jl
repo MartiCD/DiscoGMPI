@@ -14,14 +14,19 @@ const DEFAULT_METALLIC_SPHERE_MESH = joinpath(
 )
 
 const OUTER_PML_BOUNDARY_IDS = 1:6
-const METALLIC_SPHERE_PEC_BOUNDARY_ID = 10
+const DEFAULT_PEC_SCATTERER_BOUNDARY_ID = 10
+const METALLIC_SPHERE_PEC_BOUNDARY_ID = DEFAULT_PEC_SCATTERER_BOUNDARY_ID
 
 Base.@kwdef struct MetallicSphereScatteringConfig
     mesh::String = DEFAULT_METALLIC_SPHERE_MESH
     radius::Float64 = 1.0
+    scatterer_name::String = "metallic sphere"
+    pec_boundary_id::Int = DEFAULT_PEC_SCATTERER_BOUNDARY_ID
     wavelength::Float64 = 1.0
     frequency::Float64 = 0.0
     amplitude::Float64 = 1.0
+    incident_direction::NTuple{3, Float64} = (0.0, 0.0, 1.0)
+    incident_polarization::NTuple{3, Float64} = (1.0, 0.0, 0.0)
     order::Int = 2
     esprk_order::Int = 3
     final_time::Float64 = 0.0
@@ -62,12 +67,21 @@ Core options:
   --mesh PATH                  Legacy ASCII VTK tetrahedral mesh. Default:
                                examples/meshes/metallic_sphere_scattering.vtk
   --radius R                   Metallic sphere radius used for validation.
+                               Use 0 to skip the sphere-radius bounds check.
                                Default: 1
+  --scatterer-name NAME        Label written to metadata and logs.
+                               Default: "metallic sphere"
+  --pec-boundary-id ID         PEC scatterer boundary tag. Default: 10
   --wavelength L               Incident wavelength. Default: 1
   --frequency F                Incident frequency in cycles per time. If F > 0,
                                it overrides wavelength through L = c/F.
                                Default: 0
   --amplitude A                Incident electric-field amplitude. Default: 1
+  --incident-direction X,Y,Z   Incident propagation direction. The vector is
+                               normalized internally. Default: 0,0,1
+  --incident-polarization X,Y,Z
+                               Incident electric-field polarization. Must be
+                               transverse to --incident-direction. Default: 1,0,0
   --order N                    DG polynomial order. Default: 2
   --esprk-order N              ESPRK order in 1:6. Default: 3
   --final-time T               Final simulation time. Default: two periods
@@ -98,12 +112,12 @@ Additional options:
   --rcs-phi-degrees LIST       Comma-separated azimuth angles. Default: 0
   --help                       Show this message.
 
-The driver solves for the scattered field. The inner sphere enforces the
+The driver solves for the scattered field. The PEC scatterer surface enforces the
 incident-aware PEC condition n x E_scat = -n x E_inc. ParaView snapshots write
 explicit scattered, incident, and total fields. The RCS diagnostic uses the
-metallic sphere PEC surface current J = n x H_total and a time-windowed Fourier
+PEC surface current J = n x H_total and a time-windowed Fourier
 extraction at the incident frequency. The PEC residual diagnostic writes the
-sphere-surface norm ||n x E_total|| to diagnostics/pec_boundary_residual.csv.
+surface norm ||n x E_total|| to diagnostics/pec_boundary_residual.csv.
 """)
 end
 
@@ -131,6 +145,13 @@ function parse_float_list(value::AbstractString, option::AbstractString)
     return [parse(Float64, item) for item in parse_comma_list(value, option)]
 end
 
+function parse_vector3(value::AbstractString, option::AbstractString)
+    entries = parse_float_list(value, option)
+    length(entries) == 3 ||
+        error("$option requires exactly three comma-separated values.")
+    return (entries[1], entries[2], entries[3])
+end
+
 function parse_config(args::Vector{String})
     values = Dict{Symbol, Any}(
         field => getfield(MetallicSphereScatteringConfig(), field)
@@ -139,9 +160,13 @@ function parse_config(args::Vector{String})
     option_fields = Dict(
         "--mesh" => (:mesh, String),
         "--radius" => (:radius, Float64),
+        "--scatterer-name" => (:scatterer_name, String),
+        "--pec-boundary-id" => (:pec_boundary_id, Int),
         "--wavelength" => (:wavelength, Float64),
         "--frequency" => (:frequency, Float64),
         "--amplitude" => (:amplitude, Float64),
+        "--incident-direction" => (:incident_direction, :vector3),
+        "--incident-polarization" => (:incident_polarization, :vector3),
         "--order" => (:order, Int),
         "--esprk-order" => (:esprk_order, Int),
         "--final-time" => (:final_time, Float64),
@@ -197,6 +222,8 @@ function parse_config(args::Vector{String})
             parse_maxwell_flux_kind(raw_value)
         elseif type == :float_list
             parse_float_list(raw_value, option)
+        elseif type == :vector3
+            parse_vector3(raw_value, option)
         else
             parse(type, raw_value)
         end
@@ -204,7 +231,8 @@ function parse_config(args::Vector{String})
     end
 
     config = MetallicSphereScatteringConfig(; values...)
-    config.radius > 0.0 || error("--radius must be positive.")
+    config.radius >= 0.0 || error("--radius must be non-negative.")
+    config.pec_boundary_id > 0 || error("--pec-boundary-id must be positive.")
     config.wavelength > 0.0 || error("--wavelength must be positive.")
     config.frequency >= 0.0 || error("--frequency must be non-negative.")
     config.amplitude != 0.0 || error("--amplitude must be non-zero.")
@@ -239,6 +267,14 @@ function parse_config(args::Vector{String})
         error("--rcs-theta-min-degrees cannot exceed --rcs-theta-max-degrees.")
     isempty(config.rcs_phi_degrees) &&
         error("--rcs-phi-degrees requires at least one value.")
+    IncidentPlaneWaveParameters(
+        propagation_direction = config.incident_direction,
+        polarization = config.incident_polarization,
+        wavelength = config.wavelength,
+        amplitude = config.amplitude,
+        epsilon = config.epsilon,
+        mu = config.mu,
+    )
     return config
 end
 
@@ -386,10 +422,10 @@ function validate_scattering_mesh!(
     missing_outer = setdiff(Set(OUTER_PML_BOUNDARY_IDS), boundary_ids)
     isempty(missing_outer) ||
         error("Mesh is missing outer PML boundary tags: $missing_outer.")
-    METALLIC_SPHERE_PEC_BOUNDARY_ID in boundary_ids ||
+    config.pec_boundary_id in boundary_ids ||
         error(
-            "Mesh is missing PEC metallic sphere boundary tag " *
-            "$METALLIC_SPHERE_PEC_BOUNDARY_ID.",
+            "Mesh is missing PEC scatterer boundary tag " *
+            "$(config.pec_boundary_id).",
         )
 
     lower = vec(minimum(mesh.points; dims = 2))
@@ -404,17 +440,21 @@ function validate_scattering_mesh!(
         )
     maximum(abs.(lower .+ upper)) <= 0.25 * maximum(lengths) ||
         @warn "The mesh box is not centered near the origin." lower upper
-    maximum(sqrt.(sum(abs2, mesh.points; dims = 1))) >= config.radius ||
-        error("Mesh bounds do not contain radius $(config.radius).")
+    if config.radius > 0.0
+        maximum(sqrt.(sum(abs2, mesh.points; dims = 1))) >= config.radius ||
+            error("Mesh bounds do not contain radius $(config.radius).")
+    end
     return lower, upper
 end
 
-function scattering_boundary_registry()
+function scattering_boundary_registry(
+    pec_boundary_id::Integer = DEFAULT_PEC_SCATTERER_BOUNDARY_ID,
+)
     kinds = Dict{Int, MaxwellBoundaryKind}()
     for tag in OUTER_PML_BOUNDARY_IDS
         kinds[tag] = MaxwellBC_Absorbing
     end
-    kinds[METALLIC_SPHERE_PEC_BOUNDARY_ID] = MaxwellBC_PEC
+    kinds[Int(pec_boundary_id)] = MaxwellBC_PEC
     return MaxwellBoundaryRegistry(kinds)
 end
 
@@ -441,8 +481,8 @@ end
 function incident_wave(config::MetallicSphereScatteringConfig)
     wave_values = resolved_wave_values(config)
     wave = IncidentPlaneWaveParameters(
-        propagation_direction = (0.0, 0.0, 1.0),
-        polarization = (1.0, 0.0, 0.0),
+        propagation_direction = config.incident_direction,
+        polarization = config.incident_polarization,
         wavelength = wave_values.wavelength,
         amplitude = config.amplitude,
         epsilon = config.epsilon,
@@ -705,7 +745,7 @@ end
 """
     RCSFaceSample
 
-Owned quadrature data on one PEC sphere face. The same face samples are reused
+Owned quadrature data on one PEC scatterer face. The same face samples are reused
 by the RCS surface-current integral and the `n x E_total` PEC residual.
 """
 struct RCSFaceSample
@@ -847,18 +887,20 @@ function rcs_time_window(time::Float64, start_time::Float64, end_time::Float64)
     return 0.5 * (1.0 - cos(2.0 * pi * ξ))
 end
 
-function build_pec_sphere_face_samples(
+function build_pec_scatterer_face_samples(
     distributed_dg::DistributedDGDiscretization;
-    context::AbstractString = "PEC sphere surface diagnostic",
+    pec_boundary_id::Integer = DEFAULT_PEC_SCATTERER_BOUNDARY_ID,
+    context::AbstractString = "PEC scatterer surface diagnostic",
 )
     dg = distributed_dg.dg
     mesh = dg.mesh
     ref = dg.ref
     owned = Set(distributed_dg.distributed_mesh.partition.owned)
     samples = RCSFaceSample[]
+    boundary_id = Int(pec_boundary_id)
 
     for ff in dg.flux_faces.boundary
-        ff.boundary_id == METALLIC_SPHERE_PEC_BOUNDARY_ID || continue
+        ff.boundary_id == boundary_id || continue
         ff.trace.elem in owned || continue
 
         face = ff.trace.face
@@ -893,14 +935,29 @@ function build_pec_sphere_face_samples(
     global_faces > 0 ||
         error(
             "$context needs owned faces with boundary tag " *
-            "$METALLIC_SPHERE_PEC_BOUNDARY_ID, but none were found.",
+            "$boundary_id, but none were found.",
         )
     return samples
 end
 
-function build_rcs_face_samples(distributed_dg::DistributedDGDiscretization)
-    return build_pec_sphere_face_samples(
+function build_pec_sphere_face_samples(
+    distributed_dg::DistributedDGDiscretization;
+    context::AbstractString = "PEC sphere surface diagnostic",
+)
+    return build_pec_scatterer_face_samples(
         distributed_dg;
+        pec_boundary_id = METALLIC_SPHERE_PEC_BOUNDARY_ID,
+        context = context,
+    )
+end
+
+function build_rcs_face_samples(
+    distributed_dg::DistributedDGDiscretization,
+    pec_boundary_id::Integer = DEFAULT_PEC_SCATTERER_BOUNDARY_ID,
+)
+    return build_pec_scatterer_face_samples(
+        distributed_dg;
+        pec_boundary_id = pec_boundary_id,
         context = "RCS",
     )
 end
@@ -908,10 +965,12 @@ end
 function PECBoundaryResidualWorkspace(
     distributed_dg::DistributedDGDiscretization,
     incident_amplitude::Real,
+    pec_boundary_id::Integer = DEFAULT_PEC_SCATTERER_BOUNDARY_ID,
 )
     return PECBoundaryResidualWorkspace(
-        build_pec_sphere_face_samples(
+        build_pec_scatterer_face_samples(
             distributed_dg;
+            pec_boundary_id = pec_boundary_id,
             context = "PEC boundary residual",
         ),
         abs(Float64(incident_amplitude)),
@@ -1011,7 +1070,7 @@ function RCSWorkspace(
 )
     observations = rcs_observation_directions(config)
     isempty(observations) && error("RCS needs at least one observation angle.")
-    faces = build_rcs_face_samples(distributed_dg)
+    faces = build_rcs_face_samples(distributed_dg, config.pec_boundary_id)
     ndirections = length(observations)
     return RCSWorkspace(
         observations,
@@ -1033,7 +1092,7 @@ end
     accumulate_rcs_sample!(workspace, U, wave, time)
 
 Accumulate one windowed Fourier sample of the PEC surface current
-`J_s = n x (H_scat + H_inc)` over owned sphere faces for every observation
+`J_s = n x (H_scat + H_inc)` over owned scatterer faces for every observation
 direction.
 """
 function accumulate_rcs_sample!(
@@ -1277,6 +1336,7 @@ end
 
 function config_dictionary(
     config::MetallicSphereScatteringConfig;
+    wave::IncidentPlaneWaveParameters,
     wave_values,
     mesh_lower,
     mesh_upper,
@@ -1290,9 +1350,12 @@ function config_dictionary(
     return Dict{String, Any}(
         "driver" => "distributed_metallic_sphere_scattering",
         "mesh" => config.mesh,
+        "scatterer_name" => config.scatterer_name,
         "radius" => config.radius,
-        "incident_propagation_direction" => [0.0, 0.0, 1.0],
-        "incident_polarization" => [1.0, 0.0, 0.0],
+        "pec_boundary_id" => config.pec_boundary_id,
+        "incident_propagation_direction" =>
+            collect(wave.propagation_direction),
+        "incident_polarization" => collect(wave.polarization),
         "wavelength" => wave_values.wavelength,
         "frequency" => wave_values.frequency,
         "angular_frequency" => wave_values.angular_frequency,
@@ -1327,7 +1390,7 @@ function config_dictionary(
         "mesh_lower" => collect(mesh_lower),
         "mesh_upper" => collect(mesh_upper),
         "outer_boundary_ids" => collect(OUTER_PML_BOUNDARY_IDS),
-        "pec_sphere_boundary_id" => METALLIC_SPHERE_PEC_BOUNDARY_ID,
+        "pec_sphere_boundary_id" => config.pec_boundary_id,
         "solution_state" => "scattered field",
         "paraview_primary_fields" => "total field = scattered + incident",
     )
@@ -1373,12 +1436,12 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     incident_electric = (x, y, z, t) ->
         incident_electric_plane_wave(x, y, z, t, wave)
     boundary_data = incident_pec_boundary_data(
-        METALLIC_SPHERE_PEC_BOUNDARY_ID,
+        config.pec_boundary_id,
         incident_electric;
         time = 0.0,
     )
 
-    registry = scattering_boundary_registry()
+    registry = scattering_boundary_registry(config.pec_boundary_id)
     formulation = PoissonBracketFormulation(config.flux)
     U = interpolate_maxwell_field(
         distributed_dg,
@@ -1409,6 +1472,7 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     pec_residual_workspace = PECBoundaryResidualWorkspace(
         distributed_dg,
         abs(config.amplitude),
+        config.pec_boundary_id,
     )
     resolved_rcs_start_time =
         rcs_workspace === nothing ? -1.0 : rcs_workspace.start_time
@@ -1437,6 +1501,7 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     )
     configuration = config_dictionary(
         config;
+        wave = wave,
         wave_values = wave_values,
         mesh_lower = mesh_lower,
         mesh_upper = mesh_upper,
@@ -1468,7 +1533,8 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
             "mesh_path" => config.mesh,
             "partition" => "generated balanced spatial partition",
             "outer_boundary_ids" => collect(OUTER_PML_BOUNDARY_IDS),
-            "pec_sphere_boundary_id" => METALLIC_SPHERE_PEC_BOUNDARY_ID,
+            "pec_boundary_id" => config.pec_boundary_id,
+            "pec_sphere_boundary_id" => config.pec_boundary_id,
         ),
     )
     write_distributed_run_metadata(
@@ -1548,13 +1614,16 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     end
 
     if rank == 0
-        println("Distributed metallic-sphere scattering")
+        println("Distributed ", config.scatterer_name, " scattering")
         println("--------------------------------------")
         println("MPI ranks:          ", nranks)
         println("mesh:               ", config.mesh)
         println("domain lower:       ", box.lower)
         println("domain upper:       ", box.upper)
-        println("radius:             ", config.radius)
+        if config.radius > 0.0
+            println("radius:             ", config.radius)
+        end
+        println("PEC boundary tag:   ", config.pec_boundary_id)
         println("wavelength:         ", wave_values.wavelength)
         println("frequency:          ", wave_values.frequency)
         println("DG / ESPRK order:   ", config.order, " / ", config.esprk_order)
@@ -1721,7 +1790,7 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     )
 
     if rank == 0
-        println("Completed metallic-sphere scattering run.")
+        println("Completed ", config.scatterer_name, " scattering run.")
         println("  elapsed seconds:         ", elapsed)
         println(
             "  final scattered energy:  ",

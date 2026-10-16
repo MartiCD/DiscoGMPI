@@ -573,6 +573,33 @@ function partitioned_symplectic_rk_step!(
     return U
 end
 
+function partitioned_symplectic_rk_step_partitioned_rhs!(
+    U::MaxwellField,
+    work::MaxwellPartitionedRKWorkspace,
+    scheme::ExplicitPartitionedSymplecticRKScheme,
+    dt::Float64,
+    rhs_partition_function!::Function,
+)
+    validate_partitioned_symplectic_rk_scheme(scheme)
+    first_partition = normalize_maxwell_partition(scheme.first_partition)
+    second_partition = complementary_maxwell_partition(first_partition)
+    for i in 1:num_stages(scheme)
+        first_weight = scheme.first_weights[i]
+        if first_weight != 0.0
+            rhs_partition_function!(work.rhs, U, first_partition)
+            add_scaled_partition_rhs_to_field!(U, work.rhs, first_partition,
+                                                dt * first_weight)
+        end
+        second_weight = scheme.second_weights[i]
+        if second_weight != 0.0
+            rhs_partition_function!(work.rhs, U, second_partition)
+            add_scaled_partition_rhs_to_field!(U, work.rhs, second_partition,
+                                                dt * second_weight)
+        end
+    end
+    return U
+end
+
 function make_maxwell_rhs_function(
     ref::ReferenceTet,
     fops::ReferenceTetFaceOperators,

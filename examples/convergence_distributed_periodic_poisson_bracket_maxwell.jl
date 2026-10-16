@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
 
 # MPI convergence study for the periodic Poisson-bracket Maxwell plane wave.
-#
+
 # From the DiscoGMPI repository root:
 #   mpiexec -n 2 julia --project=. \
 #     examples/convergence_distributed_periodic_poisson_bracket_maxwell.jl
@@ -14,51 +14,7 @@ const PERIODIC_CONVERGENCE_RATE_TOLERANCE = 0.5
 const PERIODIC_COMPONENT_RATE_ERROR_FLOOR = 1e-12
 const PERIODIC_REFERENCE_TET_VOLUME = 4.0 / 3.0
 
-# struct DistributedPeriodicConvergenceResult
-#     mpi_ranks::Int
-#     boundary_condition::Symbol
-#     order::Int
-#     esprk_order::Int
-#     cubature_order::Int
-#     mesh_level::Int
-#     nx_target::Int
-#     target_h::Float64
-#     nelements::Int
-#     min_owned_elements::Int
-#     max_owned_elements::Int
-#     characteristic_h::Float64
-#     h_min::Float64
-#     h_max::Float64
-#     dt::Float64
-#     nsteps::Int
-#     elapsed_seconds::Float64
-#     l2_electric_error::Float64
-#     l2_magnetic_error::Float64
-#     l2_total_error::Float64
-#     l2_ex_error::Float64
-#     l2_ey_error::Float64
-#     l2_ez_error::Float64
-#     l2_hx_error::Float64
-#     l2_hy_error::Float64
-#     l2_hz_error::Float64
-#     relative_total_error::Float64
-#     linf_electric_error::Float64
-#     linf_magnetic_error::Float64
-#     linf_total_error::Float64
-#     energy_error::Float64
-#     relative_energy_error::Float64
-#     electric_charge::Float64
-#     magnetic_charge::Float64
-#     rate_electric::Union{Missing, Float64}
-#     rate_magnetic::Union{Missing, Float64}
-#     rate_total::Union{Missing, Float64}
-#     rate_ex::Union{Missing, Float64}
-#     rate_ey::Union{Missing, Float64}
-#     rate_ez::Union{Missing, Float64}
-#     rate_hx::Union{Missing, Float64}
-#     rate_hy::Union{Missing, Float64}
-#     rate_hz::Union{Missing, Float64}
-# end
+
 
 struct DistributedPeriodicConvergenceResult
     mpi_ranks::Int
@@ -96,6 +52,7 @@ struct DistributedPeriodicConvergenceResult
     max_l2_electric_error::Float64
     max_l2_magnetic_error::Float64
     max_l2_total_error::Float64
+    max_l2_component_errors::NTuple{6, Float64}
     l2_ex_error::Float64
     l2_ey_error::Float64
     l2_ez_error::Float64
@@ -111,31 +68,8 @@ struct DistributedPeriodicConvergenceResult
     electric_charge::Float64
     magnetic_charge::Float64
 
-    # Rates based on characteristic_h
-    rate_electric::Union{Missing, Float64}
-    rate_magnetic::Union{Missing, Float64}
-    rate_total::Union{Missing, Float64}
-    rate_max_electric::Union{Missing, Float64}
-    rate_max_magnetic::Union{Missing, Float64}
-    rate_max_total::Union{Missing, Float64}
-
-    # Additional aggregate rates based on h_min
-    rate_electric_hmin::Union{Missing, Float64}
-    rate_magnetic_hmin::Union{Missing, Float64}
-    rate_total_hmin::Union{Missing, Float64}
-
-    # Additional aggregate rates based on h_max
-    rate_electric_hmax::Union{Missing, Float64}
-    rate_magnetic_hmax::Union{Missing, Float64}
-    rate_total_hmax::Union{Missing, Float64}
-
-    # Component rates based on characteristic_h
-    rate_ex::Union{Missing, Float64}
-    rate_ey::Union{Missing, Float64}
-    rate_ez::Union{Missing, Float64}
-    rate_hx::Union{Missing, Float64}
-    rate_hy::Union{Missing, Float64}
-    rate_hz::Union{Missing, Float64}
+    initial_energy::Float64
+    final_energy::Float64
 end
 
 function parse_periodic_integer_list(value::AbstractString)
@@ -168,15 +102,26 @@ Options:
                       Structured uses in-memory [0,2]x[0,1]x[0,1]
                       meshes with ny=nz=nx/2. Default: unstructured
   --nx-target=N       Base NxTarget / x-direction cell count. Four levels use
-                      N, 2N, 4N, and 8N. Default: 2
+                      N, 2N, 4N, and 8N. A comma-separated list is accepted as
+                      an alias for --nx-targets. Default: 2
   --levels=L          Number of uniform h-refinement levels. Default: 4
-  --nx-targets=a,b    Explicit NxTarget family. Consecutive entries must
-                      double. This overrides --nx-target and --levels.
+  --nx-targets=a,b    Explicit NxTarget family. Values must be strictly
+                      increasing. Structured meshes additionally require
+                      even values that double consecutively. This overrides
+                      --nx-target and --levels.
   --geo=PATH          Parameterized periodic Gmsh geometry for unstructured
                       meshes. Default: examples/meshes/periodic_box_unstructured.geo
   --mesh-dir=PATH     Generated unstructured VTK mesh directory. Default:
                       <output-directory>/periodic_convergence_meshes
-  --orders=a,b,c      DG polynomial orders in 2:5. Default: 2,3,4
+  --orders=a,b,c      DG polynomial orders in 1:5. Default: 2,3,4
+  --nodal-set=NAME    equispaced (default) or warp-blend.
+  --magnetic-initialization=MODE  interpolate (default) or curl-potential.
+  --electric-initialization=MODE  interpolate (default) or curl-potential.
+  --rate-policy=NAME  fail (default) or report. Results are written before failure.
+  --rate-tolerance=X  Allowed shortfall from the expected rate. Default: 0.5
+  --error-mode=MODE   Error sampling: final or max-time. Default: max-time.
+  --error-every=N     In max-time mode, sample every N steps and at the final
+                      step. Default: 1.
   --final-time=T      Final physical time. Default: 0.25
   --time=T            Alias for --final-time.
   --periods=P         Final time as P plane-wave periods. Mutually exclusive
@@ -232,6 +177,13 @@ function parse_periodic_convergence_arguments(args::Vector{String})
     mu = 1.0
     wave_number = DEFAULT_WAVE_NUMBER
     flux_kind = MaxwellFlux_Central
+    nodal_set = :equispaced
+    magnetic_initialization = :interpolate
+    electric_initialization = :interpolate
+    rate_policy = :fail
+    rate_tolerance = PERIODIC_CONVERGENCE_RATE_TOLERANCE
+    error_every = 1
+    error_mode = :max_time
     geo_path = joinpath(
         @__DIR__,
         "meshes",
@@ -250,7 +202,12 @@ function parse_periodic_convergence_arguments(args::Vector{String})
                startswith(arg, "--mesh-type=")
             mesh_family = Symbol(lowercase(split(arg, "=", limit = 2)[2]))
         elseif startswith(arg, "--nx-target=")
-            base_nx_target = parse(Int, split(arg, "=", limit = 2)[2])
+            value = split(arg, "=", limit = 2)[2]
+            if occursin(',', value)
+                explicit_nx_targets = parse_periodic_integer_list(value)
+            else
+                base_nx_target = parse(Int, value)
+            end
         elseif startswith(arg, "--levels=")
             number_levels = parse(Int, split(arg, "=", limit = 2)[2])
         elseif startswith(arg, "--nx-targets=") ||
@@ -264,6 +221,20 @@ function parse_periodic_convergence_arguments(args::Vector{String})
         elseif startswith(arg, "--orders=")
             orders =
                 parse_periodic_integer_list(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--magnetic-initialization=")
+            magnetic_initialization = parse_magnetic_initialization(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--electric-initialization=")
+            electric_initialization = parse_electric_initialization(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--nodal-set=")
+            nodal_set = parse_convergence_nodal_set(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--rate-policy=")
+            rate_policy = Symbol(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--rate-tolerance=")
+            rate_tolerance = parse(Float64, split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--error-every=")
+            error_every = parse(Int, split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--error-mode=")
+            error_mode = Symbol(replace(lowercase(split(arg, "=", limit = 2)[2]), '-' => '_'))
         elseif startswith(arg, "--final-time=") || startswith(arg, "--time=")
             periods === nothing ||
                 throw(
@@ -314,20 +285,22 @@ function parse_periodic_convergence_arguments(args::Vector{String})
     nx_targets = explicit_nx_targets === nothing ?
                  [base_nx_target * 2^level for level in 0:(number_levels - 1)] :
                  explicit_nx_targets
-    length(nx_targets) >= 2 ||
-        throw(ArgumentError("At least two mesh levels are required."))
+    length(nx_targets) >= 1 ||
+        throw(ArgumentError("At least one mesh level is required."))
     all(>=(1), nx_targets) ||
         throw(ArgumentError("NxTarget values must be positive."))
-    all(
-        level -> nx_targets[level + 1] == 2 * nx_targets[level],
-        1:(length(nx_targets) - 1),
-    ) ||
-        throw(
-            ArgumentError(
-                "NxTarget values must define uniform halving: N,2N,4N,...",
-            ),
-        )
+    all(nx_targets[level + 1] > nx_targets[level]
+        for level in 1:(length(nx_targets) - 1)) ||
+        throw(ArgumentError("NxTarget values must be strictly increasing."))
     if mesh_family == :structured
+        all(nx_targets[level + 1] == 2 * nx_targets[level]
+            for level in 1:(length(nx_targets) - 1)) ||
+            throw(
+                ArgumentError(
+                    "Structured NxTarget values must define uniform halving: " *
+                    "N,2N,4N,...",
+                ),
+            )
         all(iseven, nx_targets) ||
             throw(
                 ArgumentError(
@@ -335,13 +308,8 @@ function parse_periodic_convergence_arguments(args::Vector{String})
                 ),
             )
     end
-    all(order -> 2 <= order <= 5, orders) ||
-        throw(
-            ArgumentError(
-                "--orders must be in 2:5. Order 1 aliases the plane wave on " *
-                "coarse structured levels, and ESPRK order is N+1.",
-            ),
-        )
+    all(order -> 1 <= order <= 5, orders) ||
+        throw(ArgumentError("--orders must be in 1:5."))
     if periods === nothing
         final_time > 0.0 ||
             throw(ArgumentError("--final-time must be positive."))
@@ -386,6 +354,9 @@ function parse_periodic_convergence_arguments(args::Vector{String})
             (mesh_dir = joinpath(dirname(abspath(output)), "periodic_convergence_meshes"))
     end
 
+    validate_convergence_policy(rate_policy, rate_tolerance)
+    validate_convergence_error_sampling(error_mode, error_every)
+    length(nx_targets) * length(orders) == 1 && (rate_policy = :report)
     return DistributedPeriodicConvergenceConfig(
         mesh_family,
         nx_targets,
@@ -401,6 +372,13 @@ function parse_periodic_convergence_arguments(args::Vector{String})
         geo_path,
         mesh_dir,
         abspath(output),
+        nodal_set,
+        rate_tolerance,
+        rate_policy,
+        magnetic_initialization,
+        electric_initialization,
+        error_every,
+        error_mode,
     )
 end
 
@@ -422,6 +400,9 @@ function generate_periodic_convergence_mesh(
         config.mesh_dir,
         "periodic_box_unstructured_nx$(nx_target).vtk",
     )
+    if isfile(mesh_path)
+        return mesh_path, load_periodic_mesh(mesh_path)
+    end
     command = `$(gmsh) $(config.geo_path) -3 -format vtk -bin 0 -nt 1 -v 1 -setnumber NxTarget $(nx_target) -o $(mesh_path)`
     run(command)
     isfile(mesh_path) ||
@@ -568,121 +549,67 @@ function periodic_time_error_update!(
 end
 
 function advance_distributed_periodic_convergence_case!(
-    U::MaxwellField,
-    distributed_dg::DistributedDGDiscretization,
-    periodic::DistributedPeriodicMaxwellExchange,
-    registry::MaxwellBoundaryRegistry,
-    scheme::ExplicitPartitionedSymplecticRKScheme,
-    dt::Float64,
-    nsteps::Int;
-    epsilon::Float64,
-    mu::Float64,
-    wave::PlaneWaveParameters,
-    flux_kind::MaxwellFluxKind,
-    cubature_order::Int,
-    track_time_l2_maxima::Bool = true,
-    compute_time_error_norms::Bool = false,
+    U::MaxwellField, distributed_dg::DistributedDGDiscretization,
+    periodic::DistributedPeriodicMaxwellExchange, registry::MaxwellBoundaryRegistry,
+    scheme::ExplicitPartitionedSymplecticRKScheme, dt::Float64, nsteps::Int;
+    epsilon::Float64, mu::Float64, wave::PlaneWaveParameters,
+    flux_kind::MaxwellFluxKind, cubature_order::Int,
+    track_time_l2_maxima::Bool = true, compute_time_error_norms::Bool = false,
+    error_every::Int = 1,
 )
     workspace = MaxwellPartitionedRKWorkspace(U, scheme)
-    formulation = PoissonBracketFormulation(flux_kind)
-    max_l2_electric = NaN
-    max_l2_magnetic = NaN
-    max_l2_total = NaN
-    previous_time_errors = nothing
-    time_l2_squared = zeros(Float64, 9)
-    time_linf = zeros(Float64, 9)
-    if track_time_l2_maxima
-        initial_diagnostics = distributed_quadrature_diagnostics(
-            U,
-            distributed_dg,
-            0.0,
-            cubature_order;
-            epsilon = epsilon,
-            mu = mu,
-            wave = wave,
-        )
-        max_l2_electric = initial_diagnostics.electric_error_l2
-        max_l2_magnetic = initial_diagnostics.magnetic_error_l2
-        max_l2_total = initial_diagnostics.field_error_l2
-    end
-    if compute_time_error_norms
-        error_workspace = DistributedMaxwellComponentL2Workspace(
-            distributed_dg,
-            cubature_order,
-        )
-        previous_time_errors = periodic_space_l2_error_vector(
+    error_workspace = track_time_l2_maxima ?
+        DistributedMaxwellComponentL2Workspace(distributed_dg, cubature_order) : nothing
+    if error_workspace !== nothing
+        electric_scale = -wave.wave_number * wave.magnetic_amplitude /
+                         (wave.angular_frequency * epsilon)
+        phase_x(x) = wave.wave_number * (x - wave.x_origin)
+        precompute_maxwell_exact_spatial_modes!(
             error_workspace,
-            U,
-            distributed_dg,
-            0.0,
-            cubature_order;
-            epsilon = epsilon,
-            mu = mu,
-            wave = wave,
+            (x, y, z) -> (0.0, 0.0, electric_scale * sin(phase_x(x)),
+                          0.0, wave.magnetic_amplitude * sin(phase_x(x)), 0.0),
+            (x, y, z) -> (0.0, 0.0, electric_scale * cos(phase_x(x)),
+                          0.0, wave.magnetic_amplitude * cos(phase_x(x)), 0.0),
         )
-        time_linf .= previous_time_errors
     end
-
+    formulation = PoissonBracketFormulation(flux_kind)
+    rhs_partition_function! = make_distributed_periodic_maxwell_partition_rhs_function(
+        distributed_dg, periodic, registry, formulation; ε = epsilon, μ = mu)
+    function evaluate(t)
+        c = cos(wave.angular_frequency * t)
+        s = -sin(wave.angular_frequency * t)
+        components = distributed_maxwell_component_l2_errors_separable!(
+            error_workspace, U, distributed_dg, ntuple(_ -> c, 6), ntuple(_ -> s, 6))
+        electric = sqrt(sum(components[index]^2 for index in 1:3))
+        magnetic = sqrt(sum(components[index]^2 for index in 4:6))
+        return (electric, magnetic, hypot(electric, magnetic), components...)
+    end
+    previous = track_time_l2_maxima ? evaluate(0.0) : nothing
+    maxima = previous === nothing ? ntuple(_ -> 0.0, 9) :
+             maxwell_error_maxima(ntuple(_ -> 0.0, 9), previous)
+    time_l2_squared = zeros(Float64, 9)
+    previous_sample_step = 0
     for step in 1:nsteps
-        distributed_periodic_partitioned_symplectic_rk_step!(
-            U,
-            workspace,
-            scheme,
-            dt,
-            distributed_dg,
-            periodic,
-            registry,
-            formulation;
-            ε = epsilon,
-            μ = mu,
-        )
-        if track_time_l2_maxima
-            diagnostics = distributed_quadrature_diagnostics(
-                U,
-                distributed_dg,
-                step * dt,
-                cubature_order;
-                epsilon = epsilon,
-                mu = mu,
-                wave = wave,
-            )
-            max_l2_electric = max(
-                max_l2_electric,
-                diagnostics.electric_error_l2,
-            )
-            max_l2_magnetic = max(
-                max_l2_magnetic,
-                diagnostics.magnetic_error_l2,
-            )
-            max_l2_total = max(max_l2_total, diagnostics.field_error_l2)
-        end
-        if compute_time_error_norms
-            current_time_errors = periodic_space_l2_error_vector(
-                error_workspace,
-                U,
-                distributed_dg,
-                step * dt,
-                cubature_order;
-                epsilon = epsilon,
-                mu = mu,
-                wave = wave,
-            )
-            periodic_time_error_update!(
-                time_l2_squared,
-                time_linf,
-                previous_time_errors,
-                current_time_errors,
-                dt,
-            )
-            previous_time_errors = current_time_errors
+        partitioned_symplectic_rk_step_partitioned_rhs!(
+            U, workspace, scheme, dt, rhs_partition_function!)
+        if track_time_l2_maxima && (step == nsteps || step % error_every == 0)
+            current = evaluate(step * dt)
+            maxima = maxwell_error_maxima(maxima, current)
+            if compute_time_error_norms && previous !== nothing
+                sample_dt = (step - previous_sample_step) * dt
+                for i in 1:9
+                    time_l2_squared[i] +=
+                        0.5 * sample_dt * (previous[i]^2 + current[i]^2)
+                end
+            end
+            previous = current
+            previous_sample_step = step
         end
     end
     return (
-        electric = max_l2_electric,
-        magnetic = max_l2_magnetic,
-        total = max_l2_total,
+        electric = maxima[1], magnetic = maxima[2], total = maxima[3],
+        time_linf = maxima,
         time_l2 = compute_time_error_norms ? Tuple(sqrt.(time_l2_squared)) : nothing,
-        time_linf = compute_time_error_norms ? Tuple(time_linf) : nothing,
     )
 end
 
@@ -694,18 +621,18 @@ function run_distributed_periodic_convergence_case(
     comm::MPI.Comm,
     root_mesh::Union{Nothing, RawVTUMesh},
     ;
+    root_partition = nothing,
     nsteps_override::Union{Nothing, Int} = nothing,
     dt_limit_out = nothing,
     track_time_l2_maxima::Bool = true,
     time_error_norms_out = nothing,
     enforce_cfl_limit::Bool = true,
+    validity_callback = nothing,
 )
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
-    root_partition =
-        rank == 0 ?
-        balanced_spatial_partition(root_mesh, nranks) :
-        nothing
+    root_partition = rank == 0 && root_partition === nothing ?
+                     balanced_spatial_partition(root_mesh, nranks) : root_partition
     nelements = MPI.bcast(
         rank == 0 ? size(root_mesh.tets, 2) : 0,
         comm;
@@ -717,6 +644,7 @@ function run_distributed_periodic_convergence_case(
         root_partition,
         polynomial_order;
         comm = comm,
+        nodal_set = config.nodal_set,
     )
     box = distributed_periodic_box(distributed_dg)
     periods = config.wave_number * periodic_box_lengths(box)[1] / (2.0 * pi)
@@ -753,6 +681,29 @@ function run_distributed_periodic_convergence_case(
         periodic_boundary_specs(box),
     )
 
+    if config.magnetic_initialization == :curl_potential
+        materials = homogeneous_maxwell_materials(size(U.Hx, 2);
+            epsilon = config.epsilon, permeability = config.mu)
+        potential = (x, y, z, t) -> periodic_magnetic_vector_potential(x, y, z, t;
+            mu = config.mu, wave)
+        initialize_magnetic_from_potential!(U, distributed_dg, materials, potential;
+            nodal_set = config.nodal_set, periodic)
+        initial_divergence = magnetic_initialization_diagnostics(U, distributed_dg, materials)
+        rank == 0 && println("Initial magnetic divergence: ", initial_divergence)
+    end
+
+    if config.electric_initialization == :curl_potential
+        materials = homogeneous_maxwell_materials(size(U.Ex, 2);
+            epsilon = config.epsilon, permeability = config.mu)
+        potential = (x, y, z, t) -> periodic_electric_vector_potential(x, y, z, t;
+            epsilon = config.epsilon, wave)
+        initialize_electric_from_potential!(U, distributed_dg, materials, potential;
+            nodal_set = config.nodal_set, periodic)
+        initial_divergence = electric_initialization_diagnostics(U, distributed_dg, materials)
+        rank == 0 && println("Initial electric divergence: ", initial_divergence)
+    end
+
+    validity_callback === nothing || validity_callback("initial", U, distributed_dg)
     local_dt, _ = estimate_maxwell_dt(
         distributed_dg.dg.mesh,
         distributed_dg.dg.geometry,
@@ -809,6 +760,7 @@ function run_distributed_periodic_convergence_case(
             cubature_order = cubature_order,
             track_time_l2_maxima = track_time_l2_maxima,
             compute_time_error_norms = time_error_norms_out !== nothing,
+            error_every = config.error_every,
         )
     end
     if time_error_norms_out !== nothing
@@ -819,7 +771,7 @@ function run_distributed_periodic_convergence_case(
     end
     elapsed = MPI.Allreduce(local_elapsed, max, comm)
 
-    diagnostics = distributed_quadrature_diagnostics(
+    diagnostics = distributed_periodic_quadrature_diagnostics(
         U,
         distributed_dg,
         config.final_time,
@@ -853,14 +805,19 @@ function run_distributed_periodic_convergence_case(
         ε = config.epsilon,
         μ = config.mu,
     )
+    validity_callback === nothing || validity_callback("final", U, distributed_dg)
     relative_energy_error =
         (final_energy.total - initial_energy.total) /
         max(initial_energy.total, eps(Float64))
-    l2_maxima = track_time_l2_maxima ? time_l2_maxima[] : (
-        electric = diagnostics.electric_error_l2,
-        magnetic = diagnostics.magnetic_error_l2,
-        total = diagnostics.field_error_l2,
-    )
+    l2_maxima = time_l2_maxima[]
+    if config.error_mode == :final
+        final_electric = sqrt(sum(component_errors[index]^2 for index in 1:3))
+        final_magnetic = sqrt(sum(component_errors[index]^2 for index in 4:6))
+        final_total = hypot(final_electric, final_magnetic)
+        final_vector = (final_electric, final_magnetic, final_total, component_errors...)
+        l2_maxima = (electric = final_electric, magnetic = final_magnetic,
+                     total = final_total, time_linf = final_vector, time_l2 = nothing)
+    end
 
     characteristic_h = periodic_distributed_characteristic_h(distributed_dg)
     quality = distributed_mesh_quality_metrics(distributed_dg)
@@ -901,6 +858,7 @@ function run_distributed_periodic_convergence_case(
         l2_maxima.electric,
         l2_maxima.magnetic,
         l2_maxima.total,
+        time_l2_maxima[].time_linf[4:9],
         component_errors...,
         diagnostics.field_relative_error,
         linf_electric,
@@ -910,628 +868,37 @@ function run_distributed_periodic_convergence_case(
         relative_energy_error,
         diagnostics.electric_charge,
         diagnostics.magnetic_charge,
-        # missing,
-        # missing,
-        # missing,
-        # missing,
-        # missing,
-        # missing,
-        # missing,
-        # missing,
-        # missing,
-        missing, # rate_electric
-        missing, # rate_magnetic
-        missing, # rate_total
-        missing, # rate_max_electric
-        missing, # rate_max_magnetic
-        missing, # rate_max_total
-        missing, # rate_electric_hmin
-        missing, # rate_magnetic_hmin
-        missing, # rate_total_hmin
-        missing, # rate_electric_hmax
-        missing, # rate_magnetic_hmax
-        missing, # rate_total_hmax
-        missing, # rate_ex
-        missing, # rate_ey
-        missing, # rate_ez
-        missing, # rate_hx
-        missing, # rate_hy
-        missing, # rate_hz
+        initial_energy.total,
+        final_energy.total,
     )
 
     MPI.Barrier(comm)
     return result
 end
 
-function periodic_convergence_rate(
-    coarse_error::Float64,
-    fine_error::Float64,
-    coarse_h::Float64,
-    fine_h::Float64,
-)
-    return observed_convergence_rate(
-        coarse_error,
-        fine_error,
-        coarse_h,
-        fine_h,
-    )
-end
-
-function add_periodic_convergence_rates(
-    results::Vector{DistributedPeriodicConvergenceResult},
-)
-    rated = DistributedPeriodicConvergenceResult[]
-
-    for order in sort(unique(result.order for result in results))
-        subset = sort(
-            filter(result -> result.order == order, results);
-            by = result -> result.mesh_level,
-        )
-        previous = nothing
-
-        for result in subset
-            rate_electric = missing
-            rate_magnetic = missing
-            rate_total = missing
-            rate_max_electric = missing
-            rate_max_magnetic = missing
-            rate_max_total = missing
-            rate_electric_hmin = missing
-            rate_magnetic_hmin = missing
-            rate_total_hmin = missing
-            rate_electric_hmax = missing
-            rate_magnetic_hmax = missing
-            rate_total_hmax = missing
-            component_rates = ntuple(_ -> missing, 6)
-            if previous !== nothing
-                rate_electric = periodic_convergence_rate(
-                    result.l2_electric_error,
-                    previous.l2_electric_error,
-                    result.characteristic_h,
-                    previous.characteristic_h,
-                )
-                rate_magnetic = periodic_convergence_rate(
-                    result.l2_magnetic_error,
-                    previous.l2_magnetic_error,
-                    result.characteristic_h,
-                    previous.characteristic_h,
-                )
-                rate_total = periodic_convergence_rate(
-                    result.l2_total_error,
-                    previous.l2_total_error,
-                    result.characteristic_h,
-                    previous.characteristic_h,
-                )
-                rate_max_electric = periodic_convergence_rate(
-                    result.max_l2_electric_error,
-                    previous.max_l2_electric_error,
-                    result.characteristic_h,
-                    previous.characteristic_h,
-                )
-                rate_max_magnetic = periodic_convergence_rate(
-                    result.max_l2_magnetic_error,
-                    previous.max_l2_magnetic_error,
-                    result.characteristic_h,
-                    previous.characteristic_h,
-                )
-                rate_max_total = periodic_convergence_rate(
-                    result.max_l2_total_error,
-                    previous.max_l2_total_error,
-                    result.characteristic_h,
-                    previous.characteristic_h,
-                )
-                rate_electric_hmin = periodic_convergence_rate(
-                    result.l2_electric_error,
-                    previous.l2_electric_error,
-                    result.h_min,
-                    previous.h_min,
-                )
-                rate_magnetic_hmin = periodic_convergence_rate(
-                    result.l2_magnetic_error,
-                    previous.l2_magnetic_error,
-                    result.h_min,
-                    previous.h_min,
-                )
-                rate_total_hmin = periodic_convergence_rate(
-                    result.l2_total_error,
-                    previous.l2_total_error,
-                    result.h_min,
-                    previous.h_min,
-                )
-
-                rate_electric_hmax = periodic_convergence_rate(
-                    result.l2_electric_error,
-                    previous.l2_electric_error,
-                    result.h_max,
-                    previous.h_max,
-                )
-                rate_magnetic_hmax = periodic_convergence_rate(
-                    result.l2_magnetic_error,
-                    previous.l2_magnetic_error,
-                    result.h_max,
-                    previous.h_max,
-                )
-                rate_total_hmax = periodic_convergence_rate(
-                    result.l2_total_error,
-                    previous.l2_total_error,
-                    result.h_max,
-                    previous.h_max,
-                )
-                fine_components = (
-                    result.l2_ex_error,
-                    result.l2_ey_error,
-                    result.l2_ez_error,
-                    result.l2_hx_error,
-                    result.l2_hy_error,
-                    result.l2_hz_error,
-                )
-                coarse_components = (
-                    previous.l2_ex_error,
-                    previous.l2_ey_error,
-                    previous.l2_ez_error,
-                    previous.l2_hx_error,
-                    previous.l2_hy_error,
-                    previous.l2_hz_error,
-                )
-                component_rates = ntuple(
-                    component ->
-                        coarse_components[component] > PERIODIC_COMPONENT_RATE_ERROR_FLOOR ?
-                        periodic_convergence_rate(
-                            fine_components[component],
-                            coarse_components[component],
-                            result.characteristic_h,
-                            previous.characteristic_h,
-                        ) :
-                        missing,
-                    6,
-                )
-            end
-
-            push!(
-                rated,
-                DistributedPeriodicConvergenceResult(
-                    result.mpi_ranks,
-                    result.boundary_condition,
-                    result.flux,
-                    result.mesh_family,
-                    result.order,
-                    result.esprk_order,
-                    result.cubature_order,
-                    result.mesh_level,
-                    result.nx_target,
-                    result.target_h,
-                    result.nelements,
-                    result.min_owned_elements,
-                    result.max_owned_elements,
-                    result.characteristic_h,
-                    result.h_min,
-                    result.h_max,
-                    result.h_ratio,
-                    result.volume_min,
-                    result.volume_max,
-                    result.volume_total,
-                    result.volume_ratio,
-                    result.edge_min,
-                    result.edge_max,
-                    result.edge_ratio,
-                    result.mean_ratio_min,
-                    result.mean_ratio_avg,
-                    result.dt,
-                    result.nsteps,
-                    result.elapsed_seconds,
-                    result.l2_electric_error,
-                    result.l2_magnetic_error,
-                    result.l2_total_error,
-                    result.max_l2_electric_error,
-                    result.max_l2_magnetic_error,
-                    result.max_l2_total_error,
-                    result.l2_ex_error,
-                    result.l2_ey_error,
-                    result.l2_ez_error,
-                    result.l2_hx_error,
-                    result.l2_hy_error,
-                    result.l2_hz_error,
-                    result.relative_total_error,
-                    result.linf_electric_error,
-                    result.linf_magnetic_error,
-                    result.linf_total_error,
-                    result.energy_error,
-                    result.relative_energy_error,
-                    result.electric_charge,
-                    result.magnetic_charge,
-                    rate_electric,
-                    rate_magnetic,
-                    rate_total,
-                    rate_max_electric,
-                    rate_max_magnetic,
-                    rate_max_total,
-                    rate_electric_hmin,
-                    rate_magnetic_hmin,
-                    rate_total_hmin,
-                    rate_electric_hmax,
-                    rate_magnetic_hmax,
-                    rate_total_hmax,
-                    component_rates...,
-                ),
-            )
-            previous = result
-        end
-    end
-    return rated
-end
-
-function formatted_periodic_rate(rate::Union{Missing, Float64})
-    return ismissing(rate) ? "-" : @sprintf("%.3f", rate)
-end
-
-function periodic_rate_pass(
-    rate::Union{Missing, Float64},
-    expected::Float64,
-    tolerance::Float64,
-)
-    ismissing(rate) && return false
-    return isfinite(rate) && rate >= expected - tolerance
-end
-
-function formatted_periodic_rate_verdict(
-    rate::Union{Missing, Float64},
-    expected::Float64,
-    tolerance::Float64,
-)
-    return periodic_rate_pass(rate, expected, tolerance) ? "PASS" : "FAIL"
-end
-
-function print_periodic_convergence_results(
-    results::Vector{DistributedPeriodicConvergenceResult},
-)
-    println()
-    println("Distributed periodic Poisson-bracket Maxwell convergence")
-    println("---------------------------------------------------------")
-    println(
-        rpad("N", 4),
-        rpad("ESPRK", 7),
-        rpad("mesh", 13),
-        rpad("level", 7),
-        rpad("NxTarget", 10),
-        rpad("Ne", 9),
-        rpad("owned", 11),
-        rpad("h target", 12),
-        rpad("h char", 12),
-        rpad("h min", 12),
-        rpad("h max", 12),
-        rpad("q min", 10),
-        rpad("dt", 12),
-        rpad("steps", 7),
-        rpad("L2 E", 13),
-        rpad("L2 H", 13),
-        rpad("L2 total", 13),
-        rpad("max_t E", 13),
-        rpad("max_t H", 13),
-        rpad("max_t tot", 13),
-        rpad("rate E", 9),
-        rpad("rate H", 9),
-        rpad("r max E", 9),
-        rpad("r max H", 9),
-        rpad("rate", 9),
-        "seconds",
-    )
-
-    for result in results
-        owned =
-            "$(result.min_owned_elements):$(result.max_owned_elements)"
-        println(
-            rpad(string(result.order), 4),
-            rpad(string(result.esprk_order), 7),
-            rpad(string(result.mesh_family), 13),
-            rpad(string(result.mesh_level), 7),
-            rpad(string(result.nx_target), 10),
-            rpad(string(result.nelements), 9),
-            rpad(owned, 11),
-            rpad(@sprintf("%.3e", result.target_h), 12),
-            rpad(@sprintf("%.3e", result.characteristic_h), 12),
-            rpad(@sprintf("%.3e", result.h_min), 12),
-            rpad(@sprintf("%.3e", result.h_max), 12),
-            rpad(@sprintf("%.3f", result.mean_ratio_min), 10),
-            rpad(@sprintf("%.3e", result.dt), 12),
-            rpad(string(result.nsteps), 7),
-            rpad(@sprintf("%.3e", result.l2_electric_error), 13),
-            rpad(@sprintf("%.3e", result.l2_magnetic_error), 13),
-            rpad(@sprintf("%.3e", result.l2_total_error), 13),
-            rpad(@sprintf("%.3e", result.max_l2_electric_error), 13),
-            rpad(@sprintf("%.3e", result.max_l2_magnetic_error), 13),
-            rpad(@sprintf("%.3e", result.max_l2_total_error), 13),
-            rpad(formatted_periodic_rate(result.rate_electric), 9),
-            rpad(formatted_periodic_rate(result.rate_magnetic), 9),
-            rpad(formatted_periodic_rate(result.rate_max_electric), 9),
-            rpad(formatted_periodic_rate(result.rate_max_magnetic), 9),
-            rpad(formatted_periodic_rate(result.rate_total), 9),
-            @sprintf("%.3f", result.elapsed_seconds),
-        )
-    end
-
-    println()
-    println("Component-wise L2 errors and characteristic-h rates")
-    println("----------------------------------------------------")
-    println(
-        rpad("N", 4),
-        rpad("level", 7),
-        rpad("L2 Ex", 13),
-        rpad("r Ex", 8),
-        rpad("L2 Ey", 13),
-        rpad("r Ey", 8),
-        rpad("L2 Ez", 13),
-        rpad("r Ez", 8),
-        rpad("L2 Hx", 13),
-        rpad("r Hx", 8),
-        rpad("L2 Hy", 13),
-        rpad("r Hy", 8),
-        rpad("L2 Hz", 13),
-        "r Hz",
-    )
-    for result in results
-        println(
-            rpad(string(result.order), 4),
-            rpad(string(result.mesh_level), 7),
-            rpad(@sprintf("%.3e", result.l2_ex_error), 13),
-            rpad(formatted_periodic_rate(result.rate_ex), 8),
-            rpad(@sprintf("%.3e", result.l2_ey_error), 13),
-            rpad(formatted_periodic_rate(result.rate_ey), 8),
-            rpad(@sprintf("%.3e", result.l2_ez_error), 13),
-            rpad(formatted_periodic_rate(result.rate_ez), 8),
-            rpad(@sprintf("%.3e", result.l2_hx_error), 13),
-            rpad(formatted_periodic_rate(result.rate_hx), 8),
-            rpad(@sprintf("%.3e", result.l2_hy_error), 13),
-            rpad(formatted_periodic_rate(result.rate_hy), 8),
-            rpad(@sprintf("%.3e", result.l2_hz_error), 13),
-            formatted_periodic_rate(result.rate_hz),
-        )
-    end
-
-    println()
-    println("Plane-wave transverse leakage")
-    println("-----------------------------")
-    println(
-        rpad("N", 4),
-        rpad("level", 7),
-        rpad("h char", 12),
-        rpad("L2 E transverse", 18),
-        "L2 H transverse",
-    )
-    for result in results
-        electric_transverse =
-            hypot(result.l2_ex_error, result.l2_ey_error)
-        magnetic_transverse =
-            hypot(result.l2_hx_error, result.l2_hz_error)
-        println(
-            rpad(string(result.order), 4),
-            rpad(string(result.mesh_level), 7),
-            rpad(@sprintf("%.3e", result.characteristic_h), 12),
-            rpad(@sprintf("%.3e", electric_transverse), 18),
-            @sprintf("%.3e", magnetic_transverse),
-        )
-    end
-
-    println()
-    println("Aggregate convergence rates by mesh-size definition")
-    println("---------------------------------------------------")
-    println(
-        rpad("N", 4),
-        rpad("level", 7),
-        rpad("E char", 10),
-        rpad("E hmin", 10),
-        rpad("E hmax", 10),
-        rpad("H char", 10),
-        rpad("H hmin", 10),
-        rpad("H hmax", 10),
-        rpad("tot char", 10),
-        rpad("tot hmin", 10),
-        "tot hmax",
-    )
-
-    for result in results
-        println(
-            rpad(string(result.order), 4),
-            rpad(string(result.mesh_level), 7),
-            rpad(formatted_periodic_rate(result.rate_electric), 10),
-            rpad(formatted_periodic_rate(result.rate_electric_hmin), 10),
-            rpad(formatted_periodic_rate(result.rate_electric_hmax), 10),
-            rpad(formatted_periodic_rate(result.rate_magnetic), 10),
-            rpad(formatted_periodic_rate(result.rate_magnetic_hmin), 10),
-            rpad(formatted_periodic_rate(result.rate_magnetic_hmax), 10),
-            rpad(formatted_periodic_rate(result.rate_total), 10),
-            rpad(formatted_periodic_rate(result.rate_total_hmin), 10),
-            formatted_periodic_rate(result.rate_total_hmax),
-        )
-    end
-
-    first_order = minimum(result.order for result in results)
-    mesh_rows = sort(
-        filter(result -> result.order == first_order, results);
-        by = result -> result.mesh_level,
-    )
-    println()
-    println("Mesh-size ratios used by the rate calculation")
-    println("---------------------------------------------")
-    for index in 2:length(mesh_rows)
-        coarse = mesh_rows[index - 1]
-        fine = mesh_rows[index]
-        @printf(
-            "level %d -> %d: target ratio %.6f, characteristic ratio %.6f, h_min ratio %.6f, h_max ratio %.6f\n",
-            coarse.mesh_level,
-            fine.mesh_level,
-            coarse.target_h / fine.target_h,
-            coarse.characteristic_h / fine.characteristic_h,
-            coarse.h_min / fine.h_min,
-            coarse.h_max / fine.h_max,
-        )
-    end
-end
-
-function periodic_convergence_csv_header()
-    return (
-        "mpi_ranks,boundary_condition,flux,mesh_family,order,esprk_order,cubature_order,mesh_level," *
-        "nx_target,target_h,nelements,min_owned_elements,max_owned_elements," *
-        "characteristic_h,h_min,h_max,h_ratio,volume_min,volume_max," *
-        "volume_total,volume_ratio,edge_min,edge_max,edge_ratio," *
-        "mean_ratio_min,mean_ratio_avg,dt,nsteps,elapsed_seconds,l2_electric_error," *
-        "l2_magnetic_error,l2_total_error," *
-        "max_l2_electric_error,max_l2_magnetic_error,max_l2_total_error," *
-        "l2_ex_error,l2_ey_error,l2_ez_error,l2_hx_error,l2_hy_error,l2_hz_error," *
-        "relative_total_error," *
-        "linf_electric_error,linf_magnetic_error,linf_total_error," *
-        "energy_error,relative_energy_error,electric_charge," *
-        # "magnetic_charge,rate_electric,rate_magnetic,rate_total," *
-        # "rate_ex,rate_ey,rate_ez,rate_hx,rate_hy,rate_hz"
-        "magnetic_charge,rate_electric,rate_magnetic,rate_total," *
-        "rate_max_electric,rate_max_magnetic,rate_max_total," *
-        "rate_electric_hmin,rate_magnetic_hmin,rate_total_hmin," *
-        "rate_electric_hmax,rate_magnetic_hmax,rate_total_hmax," *
-        "rate_ex,rate_ey,rate_ez,rate_hx,rate_hy,rate_hz"
-    )
-end
-
-function write_periodic_convergence_results(
-    path::String,
-    results::Vector{DistributedPeriodicConvergenceResult},
-)
-    mkpath(dirname(path))
-    open(path, "w") do io
-        println(io, periodic_convergence_csv_header())
-        for result in results
-            values = (
-                result.mpi_ranks,
-                result.boundary_condition,
-                result.flux,
-                result.mesh_family,
-                result.order,
-                result.esprk_order,
-                result.cubature_order,
-                result.mesh_level,
-                result.nx_target,
-                result.target_h,
-                result.nelements,
-                result.min_owned_elements,
-                result.max_owned_elements,
-                result.characteristic_h,
-                result.h_min,
-                result.h_max,
-                result.h_ratio,
-                result.volume_min,
-                result.volume_max,
-                result.volume_total,
-                result.volume_ratio,
-                result.edge_min,
-                result.edge_max,
-                result.edge_ratio,
-                result.mean_ratio_min,
-                result.mean_ratio_avg,
-                result.dt,
-                result.nsteps,
-                result.elapsed_seconds,
-                result.l2_electric_error,
-                result.l2_magnetic_error,
-                result.l2_total_error,
-                result.max_l2_electric_error,
-                result.max_l2_magnetic_error,
-                result.max_l2_total_error,
-                result.l2_ex_error,
-                result.l2_ey_error,
-                result.l2_ez_error,
-                result.l2_hx_error,
-                result.l2_hy_error,
-                result.l2_hz_error,
-                result.relative_total_error,
-                result.linf_electric_error,
-                result.linf_magnetic_error,
-                result.linf_total_error,
-                result.energy_error,
-                result.relative_energy_error,
-                result.electric_charge,
-                result.magnetic_charge,
-                ismissing(result.rate_electric) ? "" : result.rate_electric,
-                ismissing(result.rate_magnetic) ? "" : result.rate_magnetic,
-                ismissing(result.rate_total) ? "" : result.rate_total,
-                ismissing(result.rate_max_electric) ? "" : result.rate_max_electric,
-                ismissing(result.rate_max_magnetic) ? "" : result.rate_max_magnetic,
-                ismissing(result.rate_max_total) ? "" : result.rate_max_total,
-                ismissing(result.rate_electric_hmin) ? "" : result.rate_electric_hmin,
-                ismissing(result.rate_magnetic_hmin) ? "" : result.rate_magnetic_hmin,
-                ismissing(result.rate_total_hmin) ? "" : result.rate_total_hmin,
-                ismissing(result.rate_electric_hmax) ? "" : result.rate_electric_hmax,
-                ismissing(result.rate_magnetic_hmax) ? "" : result.rate_magnetic_hmax,
-                ismissing(result.rate_total_hmax) ? "" : result.rate_total_hmax,
-                ismissing(result.rate_ex) ? "" : result.rate_ex,
-                ismissing(result.rate_ey) ? "" : result.rate_ey,
-                ismissing(result.rate_ez) ? "" : result.rate_ez,
-                ismissing(result.rate_hx) ? "" : result.rate_hx,
-                ismissing(result.rate_hy) ? "" : result.rate_hy,
-                ismissing(result.rate_hz) ? "" : result.rate_hz,
-            )
-            println(io, join(values, ','))
-        end
-    end
-    return path
-end
-
-function periodic_convergence_verdict(
-    results::Vector{DistributedPeriodicConvergenceResult},
-)
-    verdict = true
-    messages = String[]
-
-    for order in sort(unique(result.order for result in results))
-        subset = sort(
-            filter(result -> result.order == order, results);
-            by = result -> result.mesh_level,
-        )
-        finest = subset[end]
-        expected_electric = order + 1.0
-        expected_magnetic = Float64(order)
-        ez_pass = periodic_rate_pass(
-            finest.rate_ez,
-            expected_electric,
-            PERIODIC_CONVERGENCE_RATE_TOLERANCE,
-        )
-        hy_pass = periodic_rate_pass(
-            finest.rate_hy,
-            expected_magnetic,
-            PERIODIC_CONVERGENCE_RATE_TOLERANCE,
-        )
-        verdict &= ez_pass && hy_pass
-        push!(
-            messages,
-            @sprintf(
-                "N=%d physical components: Ez rate=%s, target %.1f: %s; Hy rate=%s, target %.1f: %s",
-                order,
-                formatted_periodic_rate(finest.rate_ez),
-                expected_electric,
-                formatted_periodic_rate_verdict(
-                    finest.rate_ez,
-                    expected_electric,
-                    PERIODIC_CONVERGENCE_RATE_TOLERANCE,
-                ),
-                formatted_periodic_rate(finest.rate_hy),
-                expected_magnetic,
-                formatted_periodic_rate_verdict(
-                    finest.rate_hy,
-                    expected_magnetic,
-                    PERIODIC_CONVERGENCE_RATE_TOLERANCE,
-                ),
-            ),
-        )
-        push!(
-            messages,
-            @sprintf(
-                "N=%d aggregate rates: final E=%s, final H=%s; max_t E=%s, max_t H=%s",
-                order,
-                formatted_periodic_rate(finest.rate_electric),
-                formatted_periodic_rate(finest.rate_magnetic),
-                formatted_periodic_rate(finest.rate_max_electric),
-                formatted_periodic_rate(finest.rate_max_magnetic),
-            ),
-        )
-    end
-    return verdict, messages
+function periodic_convergence_row(r::DistributedPeriodicConvergenceResult, config)
+    maxima = (r.max_l2_electric_error, r.max_l2_magnetic_error, r.max_l2_total_error,
+              r.max_l2_component_errors...)
+    final_errors = (r.l2_electric_error, r.l2_magnetic_error, r.l2_total_error,
+                    r.l2_ex_error, r.l2_ey_error, r.l2_ez_error,
+                    r.l2_hx_error, r.l2_hy_error, r.l2_hz_error)
+    metadata = merge(maxwell_convergence_metadata(r), (
+        case = "periodic", nodal_set = config.nodal_set, mesh_parameter = r.nx_target,
+        magnetic_initialization = string(config.magnetic_initialization),
+        electric_initialization = string(config.electric_initialization),
+        mesh_source = config.mesh_family == :structured ? "structured_periodic_box" :
+                      joinpath(config.mesh_dir, "periodic_box_unstructured_nx$(r.nx_target).vtk"),
+        final_time = config.final_time, epsilon = config.epsilon, mu = config.mu,
+        wave_number = config.wave_number,
+        effective_cfl = effective_periodic_convergence_cfl(config),
+        nodes_per_element = num_tet_nodes(r.order),
+        error_samples = config.error_mode == :final ? 1 :
+                        2 + fld(r.nsteps - 1, config.error_every),
+        error_mode = replace(string(config.error_mode), '_' => '-'),
+        error_every = config.error_every,
+        relative_energy_drift = r.relative_energy_error,
+        rate_tolerance = config.rate_tolerance, rate_policy = config.rate_policy))
+    return maxwell_convergence_row(metadata, maxima, final_errors)
 end
 
 function run_periodic_convergence_study(
@@ -1556,7 +923,8 @@ function run_periodic_convergence_study(
             println("generated meshes:   ", config.mesh_dir)
         end
         println("NxTarget levels:    ", config.nx_targets)
-        println("target h ratios:    1, 1/2, 1/4, ...")
+        target_h_ratios = config.nx_targets[1] ./ config.nx_targets
+        println("target h ratios:    ", join(target_h_ratios, ", "))
         if config.periods !== nothing
             println("wave periods:       ", config.periods)
             println("wave period:        ", periodic_wave_period(config))
@@ -1572,15 +940,19 @@ function run_periodic_convergence_study(
         println("cubature rule:      Jaskowiec-Sukumar max(2,2N+4)")
         println("analytical mode:    traveling plane wave along +x")
         println("output:             ", config.output)
+        println("error mode/every:   ", replace(string(config.error_mode), '_' => '-'), " / ", config.error_every)
         println()
     end
 
     results = DistributedPeriodicConvergenceResult[]
     root_meshes = Dict{Int, Union{Nothing, RawVTUMesh}}()
+    root_partitions = Dict{Int, Any}()
     for nx_target in config.nx_targets
         _, root_mesh =
             root_periodic_convergence_mesh(config, nx_target, comm)
         root_meshes[nx_target] = root_mesh
+        root_partitions[nx_target] = rank == 0 ?
+            balanced_spatial_partition(root_mesh, nranks) : nothing
     end
 
     for order in config.orders
@@ -1604,28 +976,17 @@ function run_periodic_convergence_study(
                     mesh_level,
                     config,
                     comm,
-                    root_meshes[nx_target],
+                    root_meshes[nx_target];
+                    root_partition = root_partitions[nx_target],
+                    track_time_l2_maxima = config.error_mode == :max_time,
                 ),
             )
         end
     end
 
-    rated_results = add_periodic_convergence_rates(results)
-    if rank == 0
-        print_periodic_convergence_results(rated_results)
-        write_periodic_convergence_results(config.output, rated_results)
-        verdict, messages = periodic_convergence_verdict(rated_results)
-        println()
-        println("Convergence checks")
-        println("------------------")
-        foreach(println, messages)
-        println(
-            "Overall expected-rate convergence: ",
-            verdict ? "PASS" : "FAIL",
-        )
-        println("Wrote CSV: ", config.output)
-    end
-    return rated_results
+    rows = rank == 0 ? [periodic_convergence_row(r, config) for r in results] : NamedTuple[]
+    finish_maxwell_convergence(rows, config.output, comm; policy = config.rate_policy)
+    return results
 end
 
 function main_periodic_convergence(args::Vector{String})

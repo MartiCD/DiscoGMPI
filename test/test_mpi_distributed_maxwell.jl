@@ -647,6 +647,16 @@ if NPROCS == 2
             COMM,
         )
         @test error <= 1e-10
+
+        optimized_U = localize_maxwell_field(global_U, distributed_dg)
+        optimized_work = MaxwellPartitionedRKWorkspace(optimized_U, scheme)
+        partition_rhs! = make_distributed_maxwell_partition_rhs_function(
+            distributed_dg, registry, formulation)
+        partitioned_symplectic_rk_step_partitioned_rhs!(
+            optimized_U, optimized_work, scheme, dt, partition_rhs!)
+        optimized_error = MPI.Allreduce(
+            owned_field_error(serial_U, optimized_U, distributed_dg), max, COMM)
+        @test optimized_error <= 1e-10
     end
 elseif NPROCS == 4
     mesh = chain_pec_mesh()

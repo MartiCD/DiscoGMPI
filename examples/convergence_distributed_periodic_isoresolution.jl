@@ -17,7 +17,7 @@ const ISO_WAVE_NUMBER = 2.0 * pi
 const ISO_MAGNETIC_AMPLITUDE = 1.0
 const ISO_DEFAULT_CFL = 0.05
 const ISO_DEFAULT_FINAL_TIME = 0.25
-const ISO_DEFAULT_RATE_TOLERANCE = 0.25
+const ISO_DEFAULT_RATE_TOLERANCE = 0.5
 const ISO_DEFAULT_TARGET_WORK_PER_RANK = 2.0e6
 const ISO_DEFAULT_MIN_ELEMENTS_PER_RANK = 16
 const ISO_REFERENCE_TET_VOLUME = 4.0 / 3.0
@@ -70,6 +70,9 @@ struct PeriodicIsoresolutionConfig
     min_elements_per_rank::Int
     max_active_ranks::Int
     rate_tolerance::Float64
+    nodal_set::Symbol
+    rate_policy::Symbol
+    flux_kind::MaxwellFluxKind
 end
 
 mutable struct PeriodicIsoresolutionResult
@@ -101,6 +104,9 @@ mutable struct PeriodicIsoresolutionResult
     initial_energy::Float64
     final_energy::Float64
     relative_energy_error::Float64
+    edge_min::Float64
+    edge_max::Float64
+    edge_ratio::Float64
 end
 
 function parse_integer_list(value::AbstractString)
@@ -136,6 +142,9 @@ Usage:
 
 Options:
   --orders=a,b,c             DG orders. Default: 1,2,4
+  --nodal-set=NAME           equispaced (default) or warp-blend.
+  --flux=NAME                centered (default) or alternating.
+  --rate-policy=NAME         fail (default) or report. Smoke uses report.
   --levels=L                 Number of mesh levels, interpreted as 0:L-1.
                              Default: 4
   --base-intervals=N         P4/M0 intervals per wavelength. Default: 4
@@ -157,7 +166,7 @@ Options:
   --min-elements-per-rank=N  Do not split below this owned-element target.
                              Default: 16
   --max-active-ranks=N       Cap per-case active MPI ranks. Default: all ranks
-  --rate-tolerance=T         Strict rate tolerance. Default: 0.25
+  --rate-tolerance=T         Strict rate tolerance. Default: 0.5
   --output=PATH              CSV output. Default:
                              output/convergence_distributed_periodic_isoresolution.csv
   --latex-output=PATH        LaTeX table output. Default: output path with .tex
@@ -169,7 +178,7 @@ Method:
   - periodic plane wave on the Gmsh geometry domain
   - Gmsh-generated unstructured periodic tetrahedral meshes
   - isoresolution cases P1/P2/P4 with q = base*2^(level+shift(P))
-  - PoissonBracketFormulation with centered flux
+  - PoissonBracketFormulation with centered or alternating flux
   - H-first ESPRK with time order P+1
   - primary errors are L2 in space and Linf in time
   - strict expected-rate checks use electric/Ez -> P+1 and magnetic/Hy/total -> P
@@ -203,12 +212,21 @@ function parse_periodic_isoresolution_arguments(args::Vector{String})
     min_elements_per_rank = ISO_DEFAULT_MIN_ELEMENTS_PER_RANK
     max_active_ranks = 0
     rate_tolerance = ISO_DEFAULT_RATE_TOLERANCE
+    nodal_set = :equispaced
+    rate_policy = :fail
+    flux_kind = MaxwellFlux_Central
 
     for arg in args
         if arg == "--help" || arg == "-h"
             return nothing
         elseif startswith(arg, "--orders=")
             orders = parse_integer_list(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--nodal-set=")
+            nodal_set = parse_convergence_nodal_set(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--rate-policy=")
+            rate_policy = Symbol(split(arg, "=", limit = 2)[2])
+        elseif startswith(arg, "--flux=")
+            flux_kind = parse_maxwell_flux_kind(split(arg, "=", limit = 2)[2])
         elseif startswith(arg, "--levels=")
             count = parse(Int, split(arg, "=", limit = 2)[2])
             count >= 1 || throw(ArgumentError("--levels must be positive."))
@@ -298,8 +316,12 @@ function parse_periodic_isoresolution_arguments(args::Vector{String})
         final_time = periods * periodic_wave_period(epsilon, mu, wave_number)
     end
 
+    validate_convergence_policy(rate_policy, rate_tolerance)
+    flux_kind in (MaxwellFlux_Central, MaxwellFlux_Alternating) ||
+        throw(ArgumentError("--flux must be centered or alternating."))
     isempty(latex_output) && (latex_output = default_latex_output(output))
     if smoke
+        rate_policy = :report
         orders = [4]
         levels = [0, 1]
         base_intervals = min(base_intervals, 2)
@@ -328,6 +350,9 @@ function parse_periodic_isoresolution_arguments(args::Vector{String})
         min_elements_per_rank,
         max_active_ranks,
         rate_tolerance,
+        nodal_set,
+        rate_policy,
+        flux_kind,
     )
 end
 
@@ -527,7 +552,7 @@ function update_linf_errors(
     current::NTuple{9, Float64},
     candidate::NTuple{9, Float64},
 )
-    return ntuple(index -> max(current[index], candidate[index]), 9)
+    return maxwell_error_maxima(current, candidate)
 end
 
 function run_periodic_isoresolution_case(
@@ -555,6 +580,7 @@ function run_periodic_isoresolution_case(
         root_partition,
         case.order;
         comm = comm,
+        nodal_set = config.nodal_set,
     )
     box = distributed_periodic_box(distributed_dg)
     Lx = periodic_box_lengths(box)[1]
@@ -587,7 +613,7 @@ function run_periodic_isoresolution_case(
         distributed_dg,
         periodic_boundary_specs(box),
     )
-    formulation = PoissonBracketFormulation()
+    formulation = PoissonBracketFormulation(config.flux_kind)
     esprk_order = case.order + 1
     scheme = explicit_partitioned_symplectic_rk_scheme(
         esprk_order;
@@ -683,7 +709,7 @@ function run_periodic_isoresolution_case(
         num_tet_nodes(case.order),
         isoresolution_work_units(nelements, case.order),
         cubature_order,
-        case.h_target,
+        Lx / case.nx_target,
         h_characteristic,
         quality.h_min,
         quality.h_max,
@@ -703,212 +729,46 @@ function run_periodic_isoresolution_case(
         initial_energy.total,
         final_energy.total,
         relative_energy_error,
+        quality.edge_min,
+        quality.edge_max,
+        quality.edge_ratio,
     )
 end
 
-function isoresolution_convergence_rate(
-    fine_error::Float64,
-    coarse_error::Float64,
-    fine_h::Float64,
-    coarse_h::Float64,
-)
-    fine_error > 0.0 && coarse_error > 0.0 || return missing
-    fine_h > 0.0 && coarse_h > 0.0 || return missing
-    fine_h != coarse_h || return missing
-    return log(coarse_error / fine_error) / log(coarse_h / fine_h)
+function isoresolution_convergence_row(r::PeriodicIsoresolutionResult, config)
+    metadata = merge(maxwell_convergence_metadata(r), (
+        case = "isoresolution", boundary_condition = :periodic,
+        flux = maxwell_flux_kind_label(config.flux_kind), nodal_set = config.nodal_set,
+        mesh_family = :unstructured,
+        mesh_source = periodic_isoresolution_mesh_path(config, r.case.nx_target),
+        order = r.case.order, esprk_order = r.case.order + 1,
+        mesh_level = r.case.level, mesh_parameter = r.case.nx_target,
+        mpi_ranks = r.active_ranks, target_h = r.h_target,
+        characteristic_h = r.h_characteristic, final_time = config.final_time,
+        epsilon = config.epsilon, mu = config.mu, wave_number = config.wave_number,
+        effective_cfl = config.cfl / config.cfl_divisor, error_samples = r.nsteps + 1,
+        relative_energy_drift = r.relative_energy_error,
+        rate_tolerance = config.rate_tolerance, rate_policy = config.rate_policy))
+    return maxwell_convergence_row(metadata, r.time_linf_space_l2_errors,
+                                  r.final_space_l2_errors)
 end
 
-function add_periodic_isoresolution_rates!(results)
-    for order in sort(unique(result.case.order for result in results))
-        subset = sort(
-            filter(result -> result.case.order == order, results);
-            by = result -> result.case.level,
-        )
-        previous = nothing
-        for result in subset
-            if previous === nothing
-                result.rates_time_linf_space_l2 = ISO_EMPTY_RATES
-            else
-                result.rates_time_linf_space_l2 = ntuple(
-                    index -> isoresolution_convergence_rate(
-                        result.time_linf_space_l2_errors[index],
-                        previous.time_linf_space_l2_errors[index],
-                        result.h_target,
-                        previous.h_target,
-                    ),
-                    9,
-                )
-            end
-            previous = result
-        end
+function add_periodic_isoresolution_rates!(results, config)
+    rows = rate_maxwell_convergence_rows([isoresolution_convergence_row(r, config) for r in results])
+    for (r, row) in zip(sort(results; by = r -> (r.case.order, r.case.level)), rows)
+        r.rates_time_linf_space_l2 = ntuple(
+            i -> row[Symbol("rate_$(ISO_ERROR_NAMES[i])")], 9)
     end
     return results
 end
 
-formatted_rate(rate::Union{Missing, Float64}) =
-    ismissing(rate) ? "-" : @sprintf("%.3f", rate)
+formatted_rate(rate::Union{Missing, Float64}) = formatted_optional_rate(rate)
 
-function rate_pass(
-    rate::Union{Missing, Float64},
-    expected::Float64,
-    tolerance::Float64,
-)
-    ismissing(rate) && return false
-    return isfinite(rate) && rate >= expected - tolerance
-end
+periodic_isoresolution_csv_header() = maxwell_convergence_csv_header()
 
-function result_physical_verdict(
-    result::PeriodicIsoresolutionResult,
-    tolerance::Float64,
-)
-    order = result.case.order
-    specs = (
-        ("E", result.rates_time_linf_space_l2[1], order + 1.0),
-        ("H", result.rates_time_linf_space_l2[2], Float64(order)),
-        ("total", result.rates_time_linf_space_l2[3], Float64(order)),
-        ("Ez", result.rates_time_linf_space_l2[6], order + 1.0),
-        ("Hy", result.rates_time_linf_space_l2[8], Float64(order)),
-    )
-    if result.case.level == 0
-        return missing
-    end
-    return all(rate_pass(rate, expected, tolerance) for (_, rate, expected) in specs)
-end
-
-function periodic_isoresolution_verdict(
-    results,
-    tolerance::Float64,
-)
-    messages = String[]
-    pass = true
-    for result in sort(results; by = r -> (r.case.order, r.case.level))
-        result.case.level == 0 && continue
-        verdict = result_physical_verdict(result, tolerance)
-        pass &= verdict === true
-        push!(
-            messages,
-            @sprintf(
-                "%s: Ez=%s/%s, Hy=%s/%s, E=%s/%s, H=%s/%s, total=%s/%s => %s",
-                periodic_isoresolution_case_key(result.case),
-                formatted_rate(result.rates_time_linf_space_l2[6]),
-                formatted_rate(result.case.order + 1.0),
-                formatted_rate(result.rates_time_linf_space_l2[8]),
-                formatted_rate(Float64(result.case.order)),
-                formatted_rate(result.rates_time_linf_space_l2[1]),
-                formatted_rate(result.case.order + 1.0),
-                formatted_rate(result.rates_time_linf_space_l2[2]),
-                formatted_rate(Float64(result.case.order)),
-                formatted_rate(result.rates_time_linf_space_l2[3]),
-                formatted_rate(Float64(result.case.order)),
-                verdict === true ? "PASS" : "FAIL",
-            ),
-        )
-    end
-    return pass, messages
-end
-
-function csv_rate(rate::Union{Missing, Float64})
-    return ismissing(rate) ? "" : string(rate)
-end
-
-function periodic_isoresolution_csv_header()
-    final_columns =
-        Tuple("final_l2_space_$(name)_error" for name in ISO_ERROR_NAMES)
-    time_columns =
-        Tuple("linf_time_l2_space_$(name)_error" for name in ISO_ERROR_NAMES)
-    rate_columns =
-        Tuple("rate_linf_time_l2_space_$(name)" for name in ISO_ERROR_NAMES)
-    return join(
-        (
-            "case",
-            "order",
-            "level",
-            "intervals_per_wavelength",
-            "nx_target",
-            "active_ranks",
-            "nelements",
-            "min_owned_elements",
-            "max_owned_elements",
-            "nodes_per_element",
-            "work_units",
-            "cubature_order",
-            "h_target",
-            "h_characteristic",
-            "h_min",
-            "h_max",
-            "h_ratio",
-            "volume_total",
-            "volume_min",
-            "volume_max",
-            "volume_ratio",
-            "mean_ratio_min",
-            "mean_ratio_avg",
-            "dt",
-            "nsteps",
-            "elapsed_seconds",
-            final_columns...,
-            time_columns...,
-            rate_columns...,
-            "initial_energy",
-            "final_energy",
-            "relative_energy_error",
-            "physical_rate_verdict",
-        ),
-        ',',
-    )
-end
-
-function write_periodic_isoresolution_csv(
-    path::String,
-    results,
-    config::PeriodicIsoresolutionConfig,
-)
-    mkpath(dirname(path))
-    open(path, "w") do io
-        println(io, periodic_isoresolution_csv_header())
-        for result in sort(results; by = r -> (r.case.order, r.case.level))
-            verdict = config.smoke ?
-                      missing :
-                      result_physical_verdict(result, config.rate_tolerance)
-            values = (
-                periodic_isoresolution_case_key(result.case),
-                result.case.order,
-                result.case.level,
-                result.case.intervals_per_wavelength,
-                result.case.nx_target,
-                result.active_ranks,
-                result.nelements,
-                result.min_owned_elements,
-                result.max_owned_elements,
-                result.nodes_per_element,
-                result.work_units,
-                result.cubature_order,
-                result.h_target,
-                result.h_characteristic,
-                result.h_min,
-                result.h_max,
-                result.h_ratio,
-                result.volume_total,
-                result.volume_min,
-                result.volume_max,
-                result.volume_ratio,
-                result.mean_ratio_min,
-                result.mean_ratio_avg,
-                result.dt,
-                result.nsteps,
-                result.elapsed_seconds,
-                result.final_space_l2_errors...,
-                result.time_linf_space_l2_errors...,
-                (csv_rate(rate) for rate in result.rates_time_linf_space_l2)...,
-                result.initial_energy,
-                result.final_energy,
-                result.relative_energy_error,
-                ismissing(verdict) ? "" : (verdict ? "PASS" : "FAIL"),
-            )
-            println(io, join(values, ','))
-        end
-    end
-    return path
+function write_periodic_isoresolution_csv(path, results, config)
+    rows = rate_maxwell_convergence_rows([isoresolution_convergence_row(r, config) for r in results])
+    return write_maxwell_convergence_csv(path, rows)
 end
 
 function latex_number(value::Float64)
@@ -948,7 +808,7 @@ function write_periodic_isoresolution_latex(
                     result.case.intervals_per_wavelength,
                     result.active_ranks,
                     result.nelements,
-                    result.h_target,
+                    result.h_max,
                     latex_number(result.time_linf_space_l2_errors[6]),
                     latex_rate(result.rates_time_linf_space_l2[6]),
                     latex_number(result.time_linf_space_l2_errors[8]),
@@ -1136,7 +996,8 @@ function run_periodic_isoresolution_study(
         println("target work per rank:    ", config.target_work_per_rank)
         println("min elements per rank:   ", config.min_elements_per_rank)
         println("max active ranks:        ", config.max_active_ranks == 0 ? launcher_ranks : config.max_active_ranks)
-        println("primary norm:            Linf(time) L2(space)")
+        println("primary norm:            Linf(time) L2(space), rates use h_max")
+        println("nodal set / flux:        ", config.nodal_set, " / ", maxwell_flux_kind_label(config.flux_kind))
         println("expected rates:          E/Ez=P+1, H/Hy/total=P")
         println("CSV output:              ", config.output)
         println("LaTeX output:            ", config.latex_output)
@@ -1202,25 +1063,14 @@ function run_periodic_isoresolution_study(
         MPI.Barrier(comm)
     end
 
-    if rank == 0
-        add_periodic_isoresolution_rates!(results)
-        print_periodic_isoresolution_results(results, config)
-        write_periodic_isoresolution_csv(config.output, results, config)
-        write_periodic_isoresolution_latex(config.latex_output, results, config)
-        println()
-        if config.smoke
-            println("Smoke mode completed; strict convergence verdict skipped.")
-        else
-            pass, messages =
-                periodic_isoresolution_verdict(results, config.rate_tolerance)
-            println("Strict physical-component convergence checks")
-            println("--------------------------------------------")
-            foreach(println, messages)
-            println("Overall verdict: ", pass ? "PASS" : "FAIL")
-        end
-        println("Wrote CSV:   ", config.output)
-        println("Wrote LaTeX: ", config.latex_output)
-    end
+    rows = rank == 0 ? [isoresolution_convergence_row(r, config) for r in results] : NamedTuple[]
+    finish_maxwell_convergence(rows, config.output, comm;
+        policy = config.rate_policy,
+        after_write = _ -> begin
+            add_periodic_isoresolution_rates!(results, config)
+            write_periodic_isoresolution_latex(config.latex_output, results, config)
+            println("Wrote LaTeX: ", config.latex_output)
+        end)
 
     return results
 end

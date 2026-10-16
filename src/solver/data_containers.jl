@@ -306,10 +306,13 @@ end
 abstract type AbstractBackend end
 
 struct SerialBackend <: AbstractBackend
+    maxwell_volume_workspace::Base.RefValue{Any}
     maxwell_surface_workspace::Base.RefValue{Any}
 end
 
-SerialBackend() = SerialBackend(Ref{Any}(nothing))
+SerialBackend() = SerialBackend(Ref{Any}(nothing), Ref{Any}(nothing))
+SerialBackend(surface_workspace::Base.RefValue{Any}) =
+    SerialBackend(Ref{Any}(nothing), surface_workspace)
 
 struct ThreadedBackend <: AbstractBackend
     maxwell_volume_workspace::Base.RefValue{Any}

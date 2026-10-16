@@ -365,6 +365,23 @@ end
 end
 
 @testset "Poisson-bracket alternating flux values" begin
+    diagonal_normals = (
+        (1.0, -1.0, 0.0),
+        (1.0, 0.0, -1.0),
+        (0.0, 1.0, -1.0),
+        (-1.0, 1.0, 0.0),
+    )
+    for normal in diagonal_normals
+        reversed = ntuple(i -> -normal[i], 3)
+        theta = DiscoGMPI.poisson_bracket_alternating_theta(normal)
+        reversed_theta = DiscoGMPI.poisson_bracket_alternating_theta(reversed)
+        @test theta in (0.0, 1.0)
+        @test reversed_theta == 1.0 - theta
+    end
+    @test_throws ArgumentError DiscoGMPI.poisson_bracket_alternating_theta(
+        (0.0, 0.0, 0.0),
+    )
+
     minus = (
         Ex = [1.0, 2.0],
         Ey = [3.0, 4.0],

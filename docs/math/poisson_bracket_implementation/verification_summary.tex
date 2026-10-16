@@ -1,0 +1,83 @@
+\subsection{Executed results}
+All three independent invocations (1, 2 and 4 MPI ranks) completed with
+exit status zero. Each wrote 173 measurements, of which 110 have explicit
+tolerance checks; all 110 passed. Positive-definiteness is additionally
+asserted in the script. These counts exclude the separate pre-existing tests.
+The tables below summarize the saved CSV values, not predicted tolerances.
+Float64 machine epsilon is \(2.220446049250313\times10^{-16}\).
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Reference check & Equispaced & Warp-blend\\\midrule
+\(p=1\) IBP residual & \(5.27\times10^{-16}\) & \(5.14\times10^{-16}\)\\
+\(p=2\) IBP residual & \(3.23\times10^{-15}\) & \(3.55\times10^{-15}\)\\
+\(p=3\) IBP residual & \(5.36\times10^{-13}\) & \(4.69\times10^{-13}\)\\
+\(p=4\) IBP residual & \(6.12\times10^{-11}\) & \(5.06\times10^{-11}\)\\
+\(p=4\) face moment cross-check & \(1.44\times10^{-11}\) & \(1.03\times10^{-11}\)\\
+\bottomrule
+\end{tabular}
+\end{center}
+The IBP entries are the maximum induced infinity norm over the three
+reference directions. All mass matrices tested were symmetric with positive
+eigenvalues. Constant and coordinate differentiation errors were at most
+\(4.28\times10^{-15}\) and \(1.08\times10^{-14}\), respectively; the
+nonorthogonal affine coordinate checks reached \(2.29\times10^{-14}\).
+Cubature moment errors were at most \(2.23\times10^{-16}\).
+The degree-four IBP residual is clearly larger than a few machine epsilons.
+Analytic real-arithmetic moments do not imply machine-precision Float64
+matrix identities after cancellation-prone Gram construction. The observed
+degree dependence is consistent with that conditioning issue, but these
+checks do not isolate its contribution from every other construction step.
+
+\begin{center}
+\begin{tabular}{p{0.64\linewidth}r}
+\toprule
+Complete-operator or MPI check & Maximum residual\\\midrule
+Scaled independent reconstruction, all tested cases & \(2.68\times10^{-16}\)\\
+Scaled weighted skew identity, closed cases & \(8.44\times10^{-16}\)\\
+Heterogeneous PEC reconstruction, 12 tets, \(p=1\) & \(1.39\times10^{-16}\)\\
+Absolute energy production, closed deterministic test states & \(4.72\times10^{-16}\)\\
+MPI owned-RHS difference, 1 rank versus serial & \(0\)\\
+MPI owned-RHS difference, 2 ranks versus serial & \(2.84\times10^{-14}\)\\
+MPI owned-RHS difference, 4 ranks versus serial & \(2.84\times10^{-14}\)\\
+\bottomrule
+\end{tabular}
+\end{center}
+The reconstruction/skew checks assemble every column at degrees 1 and 2.
+The MPI checks instead use a deterministic full coefficient vector at
+degrees 1--3 with both nodal families and both scalar flux choices. They
+exercise ordinary and periodic halo exchange, including poisoned ghost
+input, but are not exhaustive distributed column-by-column proofs.
+The absorbing symmetric-part eigenvalue test is nonpositive to its
+\(3\times10^{-12}\) tolerance; deterministic energy productions are
+\(-5.37\) and \(-5.87\) for degrees 1 and 2.
+
+\begin{center}
+\begin{tabular}{llrr}
+\toprule
+Mesh & Case & Scaled charge row residual & \(\|D_bL_{HE}\|_\infty\)\\\midrule
+6 tets & \(p=1\), periodic centered & \(6.25\times10^{-18}\) & 50\\
+6 tets & \(p=1\), periodic alternating & \(7.71\times10^{-18}\) & 70\\
+6 tets & \(p=2\), periodic centered & \(2.51\times10^{-17}\) & 564\\
+6 tets & \(p=2\), periodic alternating & \(2.69\times10^{-17}\) & 660\\
+12 tets & \(p=2\), periodic centered & \(1.26\times10^{-17}\) & 952\\
+12 tets & \(p=2\), periodic alternating & \(1.03\times10^{-17}\) & 1384\\
+6 tets & \(p=1\), PMC centered & \(4.08\times10^{-3}\) & 50\\
+\bottomrule
+\end{tabular}
+\end{center}
+The global periodic charge identity is consistent with roundoff on these
+meshes, while the complete broken divergence-of-curl map is plainly nonzero.
+These are compatible findings, not contradictory diagnoses. The PMC row
+also demonstrates that this particular charge diagnostic is not a universal
+null invariant across boundary closures, even though centered PMC conserves
+the Hamiltonian. No charge threshold was enforced in the diagnostic script;
+these are measured operator rows, interpreted with their specified scaling.
+
+Every material-aware alternating-versus-centered difference was exactly
+zero in the tested arrays, while the difference from the true scalar
+alternating operator was nonzero. For example the single-rank degree-three
+equispaced case differed by \(1.34\times10^2\) in maximum RHS entry.
+This independently corroborates the missing flux-selector dispatch, rather
+than attributing that difference to MPI or roundoff.

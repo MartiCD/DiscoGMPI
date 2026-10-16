@@ -1,896 +1,300 @@
 #!/usr/bin/env python3
+"""Compare Maxwell convergence using sampled Linf(time) L2(space) errors.
 
-"""Post-process DiscoGMPI distributed Maxwell convergence results."""
-
+Reads the common schema v2 and legacy CSVs containing time maxima and h_max.
+Final-time errors are never substituted for maximum-in-time errors.
+"""
 from __future__ import annotations
-
 import argparse
 import csv
 import math
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+import warnings
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FixedFormatter, FixedLocator, NullLocator
+from matplotlib.ticker import LogLocator, LogFormatterMathtext
+
+QUANTITIES = ("electric", "magnetic", "total", "ex", "ey", "ez", "hx", "hy", "hz")
+LABELS = (r"\mathbf{E}", r"\mathbf{H}", r"\mathbf{U}", "E_x", "E_y", "E_z", "H_x", "H_y", "H_z")
+ERROR = {name: f"linf_time_l2_space_{name}_error" for name in QUANTITIES}
+SERIES_FIELDS = ("case", "boundary_condition", "flux", "mesh_family", "nodal_set", "magnetic_initialization", "electric_initialization", "error_mode", "error_every",
+                 "final_time", "effective_cfl", "epsilon", "mu", "wave_number", "jitter", "seed")
+COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#6A51A3")
+STYLES = ("-", "--", (0, (6, 2)), (0, (3, 2)))
 
 
-params = {
-    "text.usetex": True,
-    "font.family": "serif",
-    "font.serif": ["TeX Gyre Schola"],
-    "font.size": 16,
-    "axes.labelsize": 18,
-    "axes.titlesize": 18,
-    "legend.fontsize": 14,
-    "xtick.labelsize": 12,
-    "ytick.labelsize": 12,
-
-    "axes.linewidth": 1.0,
-    "axes.grid": True,
-    "axes.grid.which": "both",
-    "grid.color": "0.85",
-    "grid.linestyle": "--",
-    "grid.linewidth": 0.8,
-    "axes.axisbelow": True,
-
-    "lines.linewidth": 2.0,
-    "lines.markersize": 6,
-    "lines.markeredgewidth": 0.8,
-
-    "xtick.direction": "in",
-    "ytick.direction": "in",
-    "xtick.major.size": 6,
-    "ytick.major.size": 6,
-    "xtick.minor.size": 3,
-    "ytick.minor.size": 3,
-    "xtick.major.width": 1.0,
-    "ytick.major.width": 1.0,
-    "xtick.minor.width": 0.8,
-    "ytick.minor.width": 0.8,
-
-    "legend.frameon": True,
-    "legend.handlelength": 2.5,
-    "legend.handletextpad": 0.4,
-
-    "savefig.dpi": 300,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.03,
-}
-
-plt.rcParams.update(params)
-# warnings.filterwarnings("ignore")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csv_paths", nargs="*", type=Path,
+                        default=[Path("output/convergence_distributed_poisson_bracket.csv")])
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--prefix", default="distributed_poisson_bracket")
+    parser.add_argument("--formats", default="png,pdf")
+    parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--title", default="Distributed Maxwell convergence")
+    parser.add_argument("--usetex", action="store_true", help="Use an installed LaTeX renderer.")
+    return parser.parse_args(argv)
 
 
-REQUIRED_COLUMNS = {
-    "mpi_ranks",
-    "order",
-    "esprk_order",
-    "cubature_order",
-    "mesh_level",
-    "cells_per_axis",
-    "nelements",
-    "min_owned_elements",
-    "max_owned_elements",
-    "characteristic_h",
-    "dt",
-    "nsteps",
-    "elapsed_seconds",
-    "l2_electric_error",
-    "l2_magnetic_error",
-    "l2_total_error",
-    "relative_total_error",
-    "linf_electric_error",
-    "linf_magnetic_error",
-    "linf_total_error",
-    "energy_error",
-    "relative_energy_error",
-    "electric_charge",
-    "magnetic_charge",
-    "rate_electric",
-    "rate_magnetic",
-    "rate_total",
-}
-
-INTEGER_COLUMNS = {
-    "mpi_ranks",
-    "order",
-    "esprk_order",
-    "cubature_order",
-    "mesh_level",
-    "cells_per_axis",
-    "nelements",
-    "min_owned_elements",
-    "max_owned_elements",
-    "nsteps",
-}
-
-TABLE_COLUMNS = (
-    "mpi_ranks",
-    "boundary_condition",
-    "order",
-    "esprk_order",
-    "mesh_level",
-    "cells_per_axis",
-    "nelements",
-    "characteristic_h",
-    "dt",
-    "nsteps",
-    "l2_electric_error",
-    "rate_electric",
-    "l2_magnetic_error",
-    "rate_magnetic",
-    "l2_total_error",
-    "rate_total",
-    "linf_electric_error",
-    "linf_magnetic_error",
-    "linf_total_error",
-    "relative_total_error",
-    "energy_error",
-    "relative_energy_error",
-    "electric_charge",
-    "magnetic_charge",
-    "elapsed_seconds",
-)
-
-
-@dataclass(frozen=True)
-class Result:
-    values: dict[str, float | int | str | None]
-
-    def integer(self, name: str) -> int:
-        value = self.values[name]
-        assert isinstance(value, int)
-        return value
-
-    def number(self, name: str) -> float:
-        value = self.values[name]
-        assert isinstance(value, (int, float))
-        return float(value)
-
-    def optional_number(self, name: str) -> float | None:
-        value = self.values[name]
-        assert value is None or isinstance(value, (int, float))
-        return None if value is None else float(value)
-
-    def text(self, name: str) -> str:
-        value = self.values[name]
-        assert isinstance(value, str)
-        return value
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Merge and post-process distributed Poisson-bracket Maxwell "
-            "convergence CSV files."
-        )
-    )
-    parser.add_argument(
-        "csv_paths",
-        nargs="*",
-        type=Path,
-        default=[
-            Path(
-                "output/convergence_distributed_poisson_bracket.csv"
-            )
-        ],
-        help=(
-            "One or more convergence CSV files. Results are merged and "
-            "duplicate cases must agree."
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        help=(
-            "Directory for generated files. Default: "
-            "<first CSV directory>/convergence_postprocessing"
-        ),
-    )
-    parser.add_argument(
-        "--prefix",
-        default="distributed_poisson_bracket",
-        help="Generated filename prefix (default: distributed_poisson_bracket)",
-    )
-    parser.add_argument(
-        "--formats",
-        default="png,pdf",
-        help="Comma-separated plot formats (default: png,pdf)",
-    )
-    parser.add_argument(
-        "--dpi",
-        type=int,
-        default=200,
-        help="Raster plot resolution in dots per inch (default: 200)",
-    )
-    parser.add_argument(
-        "--title",
-        default="Distributed Poisson-Bracket Maxwell Convergence",
-        help="Title used in plots and the LaTeX table caption.",
-    )
-    return parser.parse_args()
-
-
-def parse_value(name: str, text: str, path: Path, row_number: int):
-    text = text.strip()
-    if not text:
+def number(row, key, required=False):
+    value = row.get(key, "")
+    if value in ("", None):
+        if required:
+            raise ValueError(f"Missing required numeric column: {key}")
         return None
-    try:
-        if name in INTEGER_COLUMNS:
-            return int(text)
-        return float(text)
-    except ValueError as error:
-        raise ValueError(
-            f"Invalid value for {name!r} in {path} at row {row_number}: "
-            f"{text!r}"
-        ) from error
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"Non-finite value in {key}: {value}")
+    return result
 
 
-def read_results(paths: Iterable[Path]) -> list[Result]:
-    merged: dict[tuple[str, int, int, int, int], Result] = {}
-
-    for path in paths:
-        if not path.is_file():
-            raise FileNotFoundError(f"Convergence CSV not found: {path}")
-
-        with path.open(newline="", encoding="utf-8") as stream:
-            reader = csv.DictReader(stream)
-            available = set(reader.fieldnames or ())
-            missing = sorted(REQUIRED_COLUMNS - available)
-            if missing:
-                raise ValueError(
-                    f"{path} is missing required columns: "
-                    f"{', '.join(missing)}"
-                )
-
-            for row_number, row in enumerate(reader, start=2):
-                values = {
-                    name: parse_value(name, row[name], path, row_number)
-                    for name in REQUIRED_COLUMNS
-                }
-                boundary_condition = row.get(
-                    "boundary_condition",
-                    "pec",
-                ).strip().lower()
-                if boundary_condition not in {"pec", "pmc", "periodic"}:
-                    raise ValueError(
-                        "Invalid boundary_condition in "
-                        f"{path} at row {row_number}: "
-                        f"{boundary_condition!r}"
-                    )
-                values["boundary_condition"] = boundary_condition
-                result = Result(values)
-                key = (
-                    result.text("boundary_condition"),
-                    result.integer("mpi_ranks"),
-                    result.integer("order"),
-                    result.integer("mesh_level"),
-                    result.integer("cells_per_axis"),
-                )
-                previous = merged.get(key)
-                if previous is not None and previous != result:
-                    raise ValueError(
-                        "Conflicting duplicate convergence case "
-                        f"{key} in {path}"
-                    )
-                merged[key] = result
-
-    if not merged:
-        raise ValueError("No convergence results were found.")
-
-    results = sorted(
-        merged.values(),
-        key=lambda result: (
-            result.text("boundary_condition"),
-            result.integer("mpi_ranks"),
-            result.integer("order"),
-            result.integer("mesh_level"),
-        ),
-    )
-    validate_results(results)
-    return results
+def series_key(row):
+    return tuple(row.get(name, "") for name in SERIES_FIELDS) + (int(row["order"]),)
 
 
-def validate_results(results: list[Result]) -> None:
-    groups = group_results(results)
-    rank_counts = {result.integer("mpi_ranks") for result in results}
-    if len(rank_counts) != 1:
-        raise ValueError(
-            "All input results must use the same MPI rank count; found "
-            f"{sorted(rank_counts)}"
-        )
-    boundary_conditions = {
-        result.text("boundary_condition") for result in results
+def normalize_row(raw, path):
+    row = dict(raw)
+    current = row.get("schema_version") == "2"
+    if current and (row.get("error_norm") != "linf_time_l2_space" or row.get("rate_h") != "h_max"):
+        raise ValueError(f"{path}: incompatible error norm or mesh-size definition.")
+    defaults = {
+        "mesh_level": row.get("level", ""), "nodal_set": "equispaced",
+        "magnetic_initialization": "interpolate",
+        "electric_initialization": "interpolate",
+        "boundary_condition": "periodic" if "nx_target" in row else "pec",
+        "flux": "centered", "mesh_family": "legacy", "case": "legacy",
+        "rate_tolerance": "0.5", "rate_error_floor": "1e-12",
+        "mpi_ranks": row.get("active_ranks", ""),
+        "relative_energy_drift": row.get("relative_energy_error", ""),
     }
-    if len(boundary_conditions) != 1:
-        raise ValueError(
-            "All input results must use the same boundary condition; found "
-            f"{sorted(boundary_conditions)}"
-        )
-
-    for order, group in groups.items():
-        if len(group) < 2:
-            raise ValueError(
-                f"DG order {order} has only one mesh level; at least two "
-                "are needed for convergence post-processing."
-            )
-        h_values = [result.number("characteristic_h") for result in group]
-        if any(value <= 0.0 for value in h_values):
-            raise ValueError(f"DG order {order} contains non-positive h.")
-        if not all(
-            fine < coarse
-            for coarse, fine in zip(h_values, h_values[1:])
-        ):
-            raise ValueError(
-                f"DG order {order} is not ordered from coarse to fine mesh."
-            )
+    for key, value in defaults.items():
+        row.setdefault(key, value)
+    row["nodal_set"] = row["nodal_set"].replace("-", "_")
+    for name in QUANTITIES:
+        key = ERROR[name]
+        if key not in row:
+            legacy_name = "u" if name == "total" else name
+            aliases = (f"linf_l2_{legacy_name}_error", f"max_l2_{name}_error")
+            row[key] = next((row[a] for a in aliases if a in row), "")
+        value = number(row, key, required=current or name in QUANTITIES[:3])
+        if value is not None and value < 0:
+            raise ValueError(f"{path}: negative error in {key}.")
+    if number(row, "h_max", required=True) <= 0:
+        raise ValueError(f"{path}: h_max must be positive.")
+    for name in ("order", "mesh_level"):
+        row[name] = str(int(row[name]))
+    row["error_norm"], row["rate_h"] = "linf_time_l2_space", "h_max"
+    row["source_csv"] = str(path)
+    return row
 
 
-def group_results(results: list[Result]) -> dict[int, list[Result]]:
-    groups: dict[int, list[Result]] = {}
-    for result in results:
-        groups.setdefault(result.integer("order"), []).append(result)
+def expected_rate(row, name):
+    if row.get("schema_version") == "2":
+        return number(row, f"expected_rate_{name}")
+    order = int(row["order"])
+    if name == "electric":
+        return order + 1
+    if name in ("magnetic", "total"):
+        return order
+    active = {"periodic": ("ez", "hy"), "pec": ("ex", "ez", "hx", "hy", "hz"),
+              "pmc": ("ex", "ey", "ez", "hx", "hz")}[row["boundary_condition"]]
+    return (order + 1 if name.startswith("e") else order) if name in active else None
+
+
+def rate_check(coarse, fine, coarse_h, fine_h, expected, tolerance, floor):
+    if not (coarse_h > fine_h > 0):
+        raise ValueError("Mesh levels must strictly decrease measured h_max.")
+    rate = math.log(coarse / fine) / math.log(coarse_h / fine_h) if coarse > floor and fine > 0 else None
+    if coarse <= floor and fine <= floor:
+        status = "SKIP_ROUNDOFF"
+    elif expected is None:
+        status = "INFO"
+    elif coarse <= floor:
+        status = "FAIL"
+    elif fine <= floor:
+        status = "PASS_FLOOR"
+    else:
+        status = "PASS" if rate is not None and rate >= expected - tolerance else "FAIL"
+    return rate, status
+
+
+def group_results(rows):
+    groups = {}
+    for row in rows:
+        groups.setdefault(series_key(row), []).append(row)
     for group in groups.values():
-        group.sort(key=lambda result: result.integer("mesh_level"))
-    return dict(sorted(groups.items()))
+        group.sort(key=lambda r: -number(r, "h_max", required=True))
+        for level, row in enumerate(group):
+            row["mesh_level"] = str(level)
+    return dict(sorted(groups.items(), key=lambda item: repr(item[0])))
 
 
-def format_csv_value(
-    name: str,
-    value: float | int | str | None,
-) -> str:
-    if value is None:
-        return ""
-    if name == "boundary_condition":
-        return str(value)
-    if name in INTEGER_COLUMNS:
-        return str(int(value))
-    if name.startswith("rate_"):
-        return f"{float(value):.6f}"
-    if name == "elapsed_seconds":
-        return f"{float(value):.6f}"
-    return f"{float(value):.12e}"
+def read_results(paths):
+    merged = {}
+    for path in paths:
+        with path.open(newline="", encoding="utf-8") as stream:
+            records = list(csv.DictReader(stream))
+        if not records:
+            raise ValueError(f"No convergence rows in {path}.")
+        for raw in records:
+            row = normalize_row(raw, path)
+            mesh_identity = row.get("mesh_parameter") or row.get("nx_target") or row.get("cells_per_axis") or row["h_max"]
+            key = series_key(row) + (mesh_identity,)
+            if key in merged:
+                previous = {k: v for k, v in merged[key].items() if k != "source_csv"}
+                current = {k: v for k, v in row.items() if k != "source_csv"}
+                if previous != current:
+                    raise ValueError(f"Conflicting duplicate case in {path}: {key}. Keep separate studies in separate invocations.")
+            merged[key] = row
+        if row.get("schema_version") != "2":
+            warnings.warn(f"{path}: legacy CSV; unavailable maximum-in-time component errors remain blank.")
+    for group in group_results(merged.values()).values():
+        previous = None
+        for row in group:
+            statuses = []
+            for name in QUANTITIES:
+                value, expected = number(row, ERROR[name]), expected_rate(row, name)
+                rate, status = None, "NO_PAIR"
+                if previous is not None and value is not None and number(previous, ERROR[name]) is not None:
+                    rate, status = rate_check(
+                        number(previous, ERROR[name]), value,
+                        number(previous, "h_max"), number(row, "h_max"), expected,
+                        number(row, "rate_tolerance"), number(row, "rate_error_floor"))
+                elif value is None:
+                    status = "UNAVAILABLE"
+                stored = number(row, f"rate_{name}")
+                if row.get("schema_version") == "2" and (stored is not None or rate is not None):
+                    if stored is None or rate is None or not math.isclose(stored, rate, rel_tol=1e-9, abs_tol=1e-9):
+                        raise ValueError(f"Stored rate_{name} disagrees with time maxima and h_max in {row['source_csv']}.")
+                row[f"rate_{name}"] = "" if rate is None else f"{rate:.12g}"
+                row[f"expected_rate_{name}"] = "" if expected is None else str(expected)
+                row[f"status_{name}"] = status
+                statuses.append(status)
+            row["rate_verdict"] = "NO_PAIR" if previous is None else "FAIL" if "FAIL" in statuses else "PASS"
+            previous = row
+    return [row for group in group_results(merged.values()).values() for row in group]
 
 
-def write_table_csv(path: Path, results: list[Result]) -> None:
+def write_table_csv(path, rows):
+    columns = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(TABLE_COLUMNS)
-        for result in results:
-            writer.writerow(
-                [
-                    format_csv_value(name, result.values[name])
-                    for name in TABLE_COLUMNS
-                ]
-            )
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def latex_number(value: float) -> str:
-    if value == 0.0:
-        return r"$0$"
+def latex_escape(text):
+    replacements = {"_": r"\_", "%": r"\%", "&": r"\&", "#": r"\#", "{": r"\{",
+                    "}": r"\}", "$": r"\$", "\\": r"\textbackslash{}"}
+    return "".join(replacements.get(c, c) for c in str(text))
+
+
+def latex_number(value):
+    if value is None:
+        return "--"
+    if value == 0:
+        return "$0$"
     exponent = math.floor(math.log10(abs(value)))
-    mantissa = value / 10.0**exponent
-    if -2 <= exponent <= 2:
-        return f"${value:.4g}$"
-    return rf"${mantissa:.3f}\times 10^{{{exponent}}}$"
+    return "$" + rf"{value / 10**exponent:.3f}\times 10^{{{exponent}}}$"
 
 
-def latex_rate(value: float | None) -> str:
-    return "--" if value is None else f"${value:.3f}$"
+def series_description(row):
+    return (f"p={row['order']}, {row['nodal_set'].replace('_', '-')}, "
+            f"{row['boundary_condition']}, {row['flux']}, {row['mesh_family']}, "
+            f"error={row.get('error_mode', 'max-time')}, "
+            f"H-init={row.get('magnetic_initialization', 'interpolate').replace('_', '-')}, "
+            f"E-init={row.get('electric_initialization', 'interpolate').replace('_', '-')}")
 
 
-def latex_escape(text: str) -> str:
-    replacements = {
-        "\\": r"\textbackslash{}",
-        "&": r"\&",
-        "%": r"\%",
-        "$": r"\$",
-        "#": r"\#",
-        "_": r"\_",
-        "{": r"\{",
-        "}": r"\}",
-        "~": r"\textasciitilde{}",
-        "^": r"\textasciicircum{}",
-    }
-    return "".join(replacements.get(character, character) for character in text)
+def write_latex_table(path, rows, caption):
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write("% Requires amsmath and booktabs. Rates use measured h_max.\n")
+        for group in group_results(rows).values():
+            for names in (QUANTITIES[:3], QUANTITIES[3:6], QUANTITIES[6:]):
+                stream.write("\\begin{table}[htbp]\n\\centering\\small\n")
+                stream.write(r"\setlength{\tabcolsep}{3pt}" + "\n")
+                norm_text = (r"Errors are $\|u_h(T)-u(T)\|_{L^2(\Omega)}$"
+                             if group[0].get("error_mode") == "final" else
+                             r"Errors are sampled $\max_n\|u_h(t_n)-u(t_n)\|_{L^2(\Omega)}$")
+                stream.write(r"\caption{" + latex_escape(caption + ": " + series_description(group[0])) +
+                             ". " + norm_text + ".}\n")
+                stream.write(r"\begin{tabular}{rr" + "rr" * len(names) + "}\n\\toprule\n")
+                header = ["Level", r"$h_{\max}$"]
+                for name in names:
+                    header.extend(["$" + LABELS[QUANTITIES.index(name)] + "$ error", "Rate"])
+                stream.write(" & ".join(header) + r" \\" + "\n\\midrule\n")
+                for row in group:
+                    entries = [row["mesh_level"], latex_number(number(row, "h_max"))]
+                    for name in names:
+                        rate = number(row, f"rate_{name}")
+                        entries.extend([latex_number(number(row, ERROR[name])), "--" if rate is None else f"{rate:.3f}"])
+                    stream.write(" & ".join(entries) + r" \\" + "\n")
+                stream.write("\\bottomrule\n\\end{tabular}\n\\end{table}\n\n")
 
 
-def write_latex_table(
-    path: Path,
-    results: list[Result],
-    caption: str,
-) -> None:
-    groups = group_results(results)
-    rank_count = results[0].integer("mpi_ranks")
-    boundary_condition = results[0].text("boundary_condition").upper()
-    lines = [
-        "% Requires \\usepackage{amsmath,booktabs}",
-        r"\begin{table}[htbp]",
-        r"  \centering",
-        r"  \small",
-        r"  \setlength{\tabcolsep}{4pt}",
-        r"  \begin{tabular}{rrrrrrrrrr}",
-        r"    \toprule",
-        (
-            r"    $N$ & Cells & $N_e$ & $h$ & "
-            r"$\lVert E-E_h\rVert_2$ & Rate & "
-            r"$\lVert H-H_h\rVert_2$ & Rate & "
-            r"$\lVert U-U_h\rVert_2$ & Rate \\"
-        ),
-        r"    \midrule",
-    ]
-
-    orders = list(groups)
-    for group_index, order in enumerate(orders):
-        for result in groups[order]:
-            lines.append(
-                "    "
-                + " & ".join(
-                    (
-                        str(order),
-                        str(result.integer("cells_per_axis")),
-                        str(result.integer("nelements")),
-                        latex_number(result.number("characteristic_h")),
-                        latex_number(result.number("l2_electric_error")),
-                        latex_rate(
-                            result.optional_number("rate_electric")
-                        ),
-                        latex_number(result.number("l2_magnetic_error")),
-                        latex_rate(
-                            result.optional_number("rate_magnetic")
-                        ),
-                        latex_number(result.number("l2_total_error")),
-                        latex_rate(result.optional_number("rate_total")),
-                    )
-                )
-                + r" \\"
-            )
-        if group_index != len(orders) - 1:
-            lines.append(r"    \midrule")
-
-    lines.extend(
-        (
-            r"    \bottomrule",
-            r"  \end{tabular}",
-            (
-                "  \\caption{"
-                + latex_escape(caption)
-                + f" using {rank_count} MPI ranks and "
-                + f"{boundary_condition} boundaries."
-                + "}"
-            ),
-            r"  \label{tab:distributed-maxwell-convergence}",
-            r"\end{table}",
-            "",
-        )
-    )
-    path.write_text("\n".join(lines), encoding="utf-8")
+def plot_errors(rows, names, output, args, rates=False):
+    ncols = 3 if len(names) == 3 else 2
+    nrows = math.ceil(len(names) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(10, 2.8 * nrows), squeeze=False)
+    groups = list(group_results(rows).values())
+    for axis, name in zip(axes.flat, names):
+        plotted = False
+        for index, group in enumerate(groups):
+            points = [(number(r, "h_max"), number(r, f"rate_{name}" if rates else ERROR[name])) for r in group]
+            points = [(x, y) for x, y in points if y is not None and (rates or y > 0)]
+            x, y = zip(*points) if points else ([], [])
+            plotted = plotted or bool(points)
+            axis.plot(x, y, color=COLORS[index % len(COLORS)],
+                      linestyle=STYLES[index % len(STYLES)], marker="o", markersize=4,
+                      markerfacecolor="white", label=series_description(group[0]))
+        axis.set_xscale("log")
+        axis.set_xlabel(r"$h_{\max}$")
+        if not rates and plotted:
+            axis.set_yscale("log")
+            axis.yaxis.set_major_locator(LogLocator(base=10))
+            axis.yaxis.set_major_formatter(LogFormatterMathtext())
+        elif not plotted:
+            axis.text(0.5, 0.5, "No positive data", ha="center", va="center",
+                      transform=axis.transAxes, color="0.45", fontsize=9)
+        label = LABELS[QUANTITIES.index(name)]
+        final_only = all(row.get("error_mode") == "final" for row in rows)
+        error_label = (rf"$\|{{{label}}}_h(T)-{label}(T)\|_{{L^2}}$" if final_only else
+                       rf"$\max_n\|{{{label}}}_h-{label}\|_{{L^2}}$")
+        axis.set_ylabel("Observed rate" if rates else error_label)
+        axis.set_title("$" + label + "$")
+        axis.grid(which="major", color="0.86", linewidth=0.5)
+        axis.tick_params(which="both", direction="in", top=True, right=True)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.02),
+               ncol=min(2, len(groups)), fontsize=8)
+    fig.tight_layout(rect=(0, 0, 1, max(0.60, 0.93 - 0.035 * math.ceil(len(groups) / 2))))
+    for extension in args.formats.split(","):
+        fig.savefig(output.with_suffix("." + extension.strip()), dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig)
 
 
-def positive(value: float) -> float:
-    return abs(value) if value != 0.0 else float("nan")
-
-
-def final_rate_label(result: Result, rate_name: str) -> str:
-    rate = result.optional_number(rate_name)
-    return "" if rate is None else f", final rate {rate:.2f}"
-
-
-def configure_log_axis(
-    axis: plt.Axes,
-    title: str,
-    ylabel: str,
-    mesh_sizes: list[float],
-) -> None:
-    axis.set_title(title)
-    axis.set_xlabel(r"Characteristic mesh size $h$")
-    axis.set_ylabel(ylabel)
-    axis.set_xscale("log")
-    axis.set_yscale("log")
-    axis.invert_xaxis()
-    axis.xaxis.set_major_locator(FixedLocator(mesh_sizes))
-    axis.xaxis.set_major_formatter(
-        FixedFormatter([f"{mesh_size:.3f}" for mesh_size in mesh_sizes])
-    )
-    axis.xaxis.set_minor_locator(NullLocator())
-    axis.grid(True, which="both", alpha=0.3)
-
-
-def plot_error_family(
-    groups: dict[int, list[Result]],
-    output_stem: Path,
-    formats: list[str],
-    dpi: int,
-    title: str,
-    prefix: str,
-    error_columns: tuple[str, str, str],
-    rate_columns: tuple[str, str, str] | None,
-) -> None:
-    labels = (
-        r"Electric-field error",
-        r"Magnetic-field error",
-        r"Combined-field error",
-    )
-    ylabels = (
-        r"$\|E-E_h\|$",
-        r"$\|H-H_h\|$",
-        r"$\|U-U_h\|$",
-    )
-    figure, axes = plt.subplots(
-        1,
-        3,
-        figsize=(16, 4.8),
-        constrained_layout=True,
-    )
-    mesh_sizes = sorted(
-        {
-            result.number("characteristic_h")
-            for results in groups.values()
-            for result in results
-        }
-    )
-
-    for axis, label, ylabel, error_name, rate_name in zip(
-        axes,
-        labels,
-        ylabels,
-        error_columns,
-        rate_columns or (None, None, None),
-    ):
-        for order, results in groups.items():
-            h_values = [
-                result.number("characteristic_h") for result in results
-            ]
-            errors = [positive(result.number(error_name)) for result in results]
-            suffix = (
-                final_rate_label(results[-1], rate_name)
-                if rate_name is not None
-                else ""
-            )
-            axis.plot(
-                h_values,
-                errors,
-                marker="o",
-                linewidth=1.8,
-                label=f"$N={order}$" + suffix,
-            )
-        configure_log_axis(axis, label, ylabel, mesh_sizes)
-        axis.legend(fontsize="small")
-
-    figure.suptitle(f"{title}: {prefix}")
-    save_figure(figure, output_stem, formats, dpi)
-
-
-def plot_observed_rates(
-    groups: dict[int, list[Result]],
-    output_stem: Path,
-    formats: list[str],
-    dpi: int,
-    title: str,
-) -> None:
-    figure, axes = plt.subplots(
-        1,
-        3,
-        figsize=(16, 4.8),
-        sharey=True,
-        constrained_layout=True,
-    )
-    specifications = (
-        ("rate_electric", "Electric-field L2 rate"),
-        ("rate_magnetic", "Magnetic-field L2 rate"),
-        ("rate_total", "Combined-field L2 rate"),
-    )
-
-    for axis, (rate_name, subtitle) in zip(axes, specifications):
-        mesh_levels = sorted(
-            {
-                result.integer("mesh_level")
-                for results in groups.values()
-                for result in results
-                if result.optional_number(rate_name) is not None
-            }
-        )
-        for order, results in groups.items():
-            rated = [
-                result
-                for result in results
-                if result.optional_number(rate_name) is not None
-            ]
-            levels = [
-                result.integer("mesh_level") for result in rated
-            ]
-            rates = [
-                result.number(rate_name) for result in rated
-            ]
-            axis.plot(
-                levels,
-                rates,
-                marker="o",
-                linewidth=1.8,
-                label=f"$N={order}$",
-            )
-            axis.axhline(
-                order + 1,
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.45,
-            )
-        axis.set_title(subtitle)
-        axis.set_xlabel("Fine-mesh level")
-        axis.set_xticks(mesh_levels)
-        axis.grid(True, alpha=0.3)
-        axis.legend(fontsize="small")
-
-    axes[0].set_ylabel("Observed convergence rate")
-    figure.suptitle(f"{title}: observed L2 rates")
-    save_figure(figure, output_stem, formats, dpi)
-
-
-def plot_conservation(
-    groups: dict[int, list[Result]],
-    output_stem: Path,
-    formats: list[str],
-    dpi: int,
-    title: str,
-) -> None:
-    figure, axes = plt.subplots(
-        2,
-        2,
-        figsize=(12, 9),
-        constrained_layout=True,
-    )
-    specifications = (
-        ("energy_error", "Absolute energy error", r"$|\Delta\mathcal{E}|$"),
-        (
-            "relative_energy_error",
-            "Relative energy drift",
-            r"$|\Delta\mathcal{E}|/\mathcal{E}_0$",
-        ),
-        ("electric_charge", "Electric charge", r"$|Q_E|$"),
-        ("magnetic_charge", "Magnetic charge", r"$|Q_H|$"),
-    )
-    mesh_sizes = sorted(
-        {
-            result.number("characteristic_h")
-            for results in groups.values()
-            for result in results
-        }
-    )
-
-    for axis, (column, subtitle, ylabel) in zip(
-        axes.flat,
-        specifications,
-    ):
-        for order, results in groups.items():
-            axis.plot(
-                [
-                    result.number("characteristic_h")
-                    for result in results
-                ],
-                [positive(result.number(column)) for result in results],
-                marker="o",
-                linewidth=1.8,
-                label=f"$N={order}$",
-            )
-        configure_log_axis(axis, subtitle, ylabel, mesh_sizes)
-        axis.legend(fontsize="small")
-
-    figure.suptitle(f"{title}: conservation diagnostics")
-    save_figure(figure, output_stem, formats, dpi)
-
-
-def plot_runtime(
-    groups: dict[int, list[Result]],
-    output_stem: Path,
-    formats: list[str],
-    dpi: int,
-    title: str,
-) -> None:
-    figure, axes = plt.subplots(
-        1,
-        2,
-        figsize=(11, 4.8),
-        constrained_layout=True,
-    )
-    runtime_axis, imbalance_axis = axes
-
-    for order, results in groups.items():
-        elements = [result.integer("nelements") for result in results]
-        runtime_axis.plot(
-            elements,
-            [result.number("elapsed_seconds") for result in results],
-            marker="o",
-            linewidth=1.8,
-            label=f"$N={order}$",
-        )
-        imbalance_axis.plot(
-            elements,
-            [
-                (
-                    result.integer("max_owned_elements")
-                    - result.integer("min_owned_elements")
-                )
-                / result.integer("max_owned_elements")
-                for result in results
-            ],
-            marker="o",
-            linewidth=1.8,
-            label=f"$N={order}$",
-        )
-
-    runtime_axis.set_xscale("log")
-    runtime_axis.set_yscale("log")
-    element_counts = sorted(
-        {
-            result.integer("nelements")
-            for results in groups.values()
-            for result in results
-        }
-    )
-
-    runtime_axis.set_title("Reported solve time (may include JIT effects)")
-    runtime_axis.set_xlabel("Number of tetrahedra")
-    runtime_axis.set_ylabel("Elapsed time [s]")
-    runtime_axis.xaxis.set_major_locator(FixedLocator(element_counts))
-    runtime_axis.xaxis.set_major_formatter(
-        FixedFormatter([str(count) for count in element_counts])
-    )
-    runtime_axis.xaxis.set_minor_locator(NullLocator())
-    runtime_axis.grid(True, which="both", alpha=0.3)
-    runtime_axis.legend(fontsize="small")
-
-    imbalance_axis.set_xscale("log")
-    imbalance_axis.set_title("Element-count partition imbalance")
-    imbalance_axis.set_xlabel("Number of tetrahedra")
-    imbalance_axis.set_ylabel(r"$(N_{\max}-N_{\min})/N_{\max}$")
-    imbalance_axis.xaxis.set_major_locator(FixedLocator(element_counts))
-    imbalance_axis.xaxis.set_major_formatter(
-        FixedFormatter([str(count) for count in element_counts])
-    )
-    imbalance_axis.xaxis.set_minor_locator(NullLocator())
-    imbalance_axis.grid(True, which="both", alpha=0.3)
-    imbalance_axis.legend(fontsize="small")
-
-    figure.suptitle(f"{title}: computational diagnostics")
-    save_figure(figure, output_stem, formats, dpi)
-
-
-def save_figure(
-    figure: plt.Figure,
-    output_stem: Path,
-    formats: list[str],
-    dpi: int,
-) -> None:
-    for file_format in formats:
-        figure.savefig(
-            output_stem.with_suffix(f".{file_format}"),
-            dpi=dpi,
-            bbox_inches="tight",
-        )
-    plt.close(figure)
-
-
-def parse_formats(text: str) -> list[str]:
-    formats = [
-        entry.strip().lower()
-        for entry in text.split(",")
-        if entry.strip()
-    ]
-    if not formats:
-        raise ValueError("At least one plot format is required.")
-    supported = set(plt.gcf().canvas.get_supported_filetypes())
-    plt.close()
-    unsupported = sorted(set(formats) - supported)
-    if unsupported:
-        raise ValueError(
-            "Unsupported plot formats: " + ", ".join(unsupported)
-        )
-    return formats
-
-
-def generated_paths(
-    output_dir: Path,
-    prefix: str,
-    formats: list[str],
-) -> list[Path]:
-    paths = [
-        output_dir / f"{prefix}_convergence_table.csv",
-        output_dir / f"{prefix}_convergence_table.tex",
-    ]
-    for plot_name in (
-        "l2_convergence",
-        "linf_convergence",
-        "observed_rates",
-        "conservation",
-        "runtime",
-    ):
-        paths.extend(
-            output_dir / f"{prefix}_{plot_name}.{file_format}"
-            for file_format in formats
-        )
-    return paths
-
-
-def main() -> None:
-    args = parse_args()
-    formats = parse_formats(args.formats)
-    results = read_results(args.csv_paths)
-    groups = group_results(results)
-    output_dir = (
-        args.output_dir
-        if args.output_dir is not None
-        else args.csv_paths[0].parent / "convergence_postprocessing"
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    write_table_csv(
-        output_dir / f"{args.prefix}_convergence_table.csv",
-        results,
-    )
-    write_latex_table(
-        output_dir / f"{args.prefix}_convergence_table.tex",
-        results,
-        args.title,
-    )
-    plot_error_family(
-        groups,
-        output_dir / f"{args.prefix}_l2_convergence",
-        formats,
-        args.dpi,
-        args.title,
-        r"$L^2$ errors",
-        (
-            "l2_electric_error",
-            "l2_magnetic_error",
-            "l2_total_error",
-        ),
-        ("rate_electric", "rate_magnetic", "rate_total"),
-    )
-    plot_error_family(
-        groups,
-        output_dir / f"{args.prefix}_linf_convergence",
-        formats,
-        args.dpi,
-        args.title,
-        r"$L^\infty$ errors",
-        (
-            "linf_electric_error",
-            "linf_magnetic_error",
-            "linf_total_error",
-        ),
-        None,
-    )
-    plot_observed_rates(
-        groups,
-        output_dir / f"{args.prefix}_observed_rates",
-        formats,
-        args.dpi,
-        args.title,
-    )
-    plot_conservation(
-        groups,
-        output_dir / f"{args.prefix}_conservation",
-        formats,
-        args.dpi,
-        args.title,
-    )
-    plot_runtime(
-        groups,
-        output_dir / f"{args.prefix}_runtime",
-        formats,
-        args.dpi,
-        args.title,
-    )
-
-    print(
-        f"Processed {len(results)} cases for DG orders "
-        f"{list(groups)} from {len(args.csv_paths)} input file(s)."
-    )
-    print(f"Generated files in: {output_dir.resolve()}")
-    for path in generated_paths(output_dir, args.prefix, formats):
-        print(f"  {path.resolve()}")
+def main(argv=None):
+    args = parse_args(argv)
+    rows = read_results(args.csv_paths)
+    if not rows:
+        raise ValueError("No convergence data.")
+    output = args.output_dir or args.csv_paths[0].parent / "convergence_postprocessing"
+    output.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update({"font.family": "serif", "font.size": 10, "text.usetex": args.usetex,
+                         "axes.linewidth": 0.8, "lines.linewidth": 1.6,
+                         "pdf.fonttype": 42, "ps.fonttype": 42})
+    write_table_csv(output / f"{args.prefix}_convergence_table.csv", rows)
+    write_latex_table(output / f"{args.prefix}_convergence_table.tex", rows, args.title)
+    plot_errors(rows, QUANTITIES[:3], output / f"{args.prefix}_l2_convergence", args)
+    plot_errors(rows, QUANTITIES[3:], output / f"{args.prefix}_component_convergence", args)
+    plot_errors(rows, QUANTITIES[:3], output / f"{args.prefix}_observed_rates", args, rates=True)
+    for group in group_results(rows).values():
+        print(series_description(group[0]), "finest pair:", group[-1]["rate_verdict"])
+    print(f"Wrote CSV, LaTeX tables, and plots to {output}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
