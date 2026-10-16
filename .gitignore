@@ -53,8 +53,8 @@ examples/__pycache__/
 examples/refined_meshes/*.vtk
 examples/meshes/tet_mesh*
 
-*.sh 
-*.slurm
+# *.sh 
+# *.slurm
 *.png
 *.pdf
 *.svg
