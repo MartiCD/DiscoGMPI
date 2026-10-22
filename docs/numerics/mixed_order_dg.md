@@ -102,12 +102,14 @@ The convergence driver supports `p=1:4`; requests outside that range fail instea
 of reducing the temporal order. The timestep estimate is
 
 ```
-dt = CFL * min_elements(h_min_altitude / ((p_H+1)^2 * wave_speed))
+dt = CFL * min_elements(h_min_altitude / (p_H * wave_speed))
 ```
 
-This is a conservative heuristic, not a universal stability theorem. The small
-matrix spectrum audit reports the semidiscrete and ESPRK amplification spectra.
-Actual convergence studies should also halve the timestep.
+The defaults are `CFL=0.1` and the linear `p_H` degree factor. The former
+quadratic factor remains available as `degree_rule=:quadratic`. This is a
+heuristic, not a universal stability theorem. The small matrix spectrum audit
+reports the semidiscrete and ESPRK amplification spectra. Actual convergence
+studies should also halve the timestep.
 
 `with_mixed_source(rhs!, dg, source)` evaluates both fields at common volume
 quadrature points and projects electric/magnetic source values into their own
@@ -142,6 +144,13 @@ Both degrees are stored as cell data. Integration-point CSV output likewise
 records both degrees and the physical quadrature weights.
 
 ## Convergence and verification
+
+For the full MN5 workflow matching the existing hp study (prepared Gmsh
+meshes, periodic and PEC cases, both nodal sets, per-case jobs and tables),
+see [the mixed hp-isoresolution campaign](mixed_hp_isoresolution_campaign.md).
+For the long-time six-quantity h/p experiments, see
+[the mixed invariant campaign](mixed_conserved_quantities_campaign.md).
+The simpler launchers below remain a separate structured plane-wave example.
 
 Spatial and temporal convergence validation is deferred to future MN5 runs.
 The opt-in temporal refinement test is `test/test_mixed_order_temporal.jl`;

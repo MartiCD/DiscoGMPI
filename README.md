@@ -11,6 +11,18 @@ Use `MixedDGDiscretization` or `build_distributed_mixed_dg_from_root` and
 `examples/convergence_mixed_order.jl`; the existing drivers retain their
 equal-order discretization.
 
+The [mixed-order MN5 hp campaign](docs/numerics/mixed_hp_isoresolution_campaign.md)
+mirrors the full hp-isoresolution workflow: mesh preparation, per-case Slurm
+jobs, periodic/PEC cases, both mesh families and nodal sets, initial/final/
+maximum-in-time errors, collection, and spatial/temporal LaTeX tables.
+Mixed hp runs also save two rotating checkpoints with the accumulated error
+maxima, resume automatically, and use a configurable progress watchdog on MN5.
+
+The [mixed-order invariant campaign](docs/numerics/mixed_conserved_quantities_campaign.md)
+provides long-time six-quantity h/p experiments with sampling every 100 steps,
+polynomial-aware MPI sizing, 112 ranks per full MN5 node, benchmark admission,
+automatic checkpoint/history continuation, chained allocations and signed/error plots.
+
 The package currently combines:
 
 - The serial and threaded DG/Maxwell solver inherited from DiscoG3D.

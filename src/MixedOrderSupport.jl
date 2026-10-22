@@ -1,26 +1,50 @@
-"""Quadrature diagnostics on the actual two spaces; errors are measured independently.
+"""Reusable quadrature and scratch storage for mixed-field diagnostics.
 
-Use higher quadrature for nonpolynomial exact solutions. Degree 4(p+1)+2
-also resolves polynomial energy-density products without aliasing.
+The default degree 4(p_H)+2 resolves polynomial energy-density products.
+Supplying points_weights and basis allows sharing an error-sampling cache.
 """
+function mixed_diagnostic_workspace(dg::MixedDGDiscretization;
+        degree=4dg.reference.ref_H.N+2, points_weights=nothing, basis=nothing)
+    points,w = points_weights===nothing ? mixed_tetrahedron_quadrature(degree) : points_weights
+    V = basis===nothing ? (mixed_basis(dg.reference.ref_E,points),mixed_basis(dg.reference.ref_H,points)) : basis
+    G = (mixed_basis_gradient(dg.reference.ref_E,points),mixed_basis_gradient(dg.reference.ref_H,points))
+    return (; points,w,V,G,values=zeros(length(w),6),
+        gradients=zeros(length(w),3,6),reference_gradients=zeros(length(w),3),
+        sums=zeros(24),global_sums=zeros(24))
+end
+
+# A workspace belongs to one discretization/quadrature and must not be shared
+# between concurrent calls. Returned sums alias it when explicitly supplied.
 function mixed_diagnostics(U,dg::MixedDGDiscretization;
         elements=axes(U.Ex,2),time=0.,exact_electric=nothing,exact_magnetic=nothing,
-        degree=4dg.reference.ref_H.N+2)
+        degree=4dg.reference.ref_H.N+2,workspace=nothing)
     validate_mixed_field(U,dg)
-    points,w = mixed_tetrahedron_quadrature(degree)
-    V = (mixed_basis(dg.reference.ref_E,points),mixed_basis(dg.reference.ref_H,points))
-    G = (mixed_basis_gradient(dg.reference.ref_E,points),mixed_basis_gradient(dg.reference.ref_H,points))
-    sums = zeros(24)
+    ws = workspace===nothing ? mixed_diagnostic_workspace(dg;degree) : workspace
+    points,w,V,G = ws.points,ws.w,ws.V,ws.G
+    values,gradients,sums = ws.values,ws.gradients,ws.sums
+    fill!(sums,0.)
+    fields = mixed_components(U)
     for e in elements
         jac = dg.mappings.tet_mappings[e]
-        fields = mixed_components(U)
-        values = [V[c<=3 ? 1 : 2]*view(fields[c],:,e) for c in 1:6]
-        gradients = [ntuple(a->sum(jac.invJ[b,a]*(G[c<=3 ? 1 : 2][b]*view(fields[c],:,e)) for b in 1:3),3) for c in 1:6]
+        for c in 1:6
+            space = c<=3 ? 1 : 2
+            coefficients = view(fields[c],:,e)
+            mul!(view(values,:,c),V[space],coefficients)
+            for b in 1:3
+                mul!(view(ws.reference_gradients,:,b),G[space][b],coefficients)
+            end
+            for a in 1:3, q in eachindex(w)
+                gradients[q,a,c] =
+                    jac.invJ[1,a]*ws.reference_gradients[q,1] +
+                    jac.invJ[2,a]*ws.reference_gradients[q,2] +
+                    jac.invJ[3,a]*ws.reference_gradients[q,3]
+            end
+        end
         eps,mu = dg.materials.epsilon[e],dg.materials.permeability[e]
         for q in eachindex(w)
             weight = w[q]*jac.absdetJ
             x = map_to_physical(dg.mesh.points,view(dg.mesh.tets,:,e),points[q,1],points[q,2],points[q,3])
-            E,H = ntuple(c->values[c][q],3),ntuple(c->values[c+3][q],3)
+            E,H = ntuple(c->values[q,c],3),ntuple(c->values[q,c+3],3)
             sums[1] += weight*eps*sum(abs2,E)/2
             sums[2] += weight*mu*sum(abs2,H)/2
             if exact_electric!==nothing
@@ -33,8 +57,8 @@ function mixed_diagnostics(U,dg::MixedDGDiscretization;
                 sums[4] += weight*sum(abs2(H[c]-ex[c]) for c in 1:3)
                 sums[6] += weight*sum(abs2,ex)
             end
-            divE = eps*sum(gradients[c][c][q] for c in 1:3)
-            divH = mu*sum(gradients[c+3][c][q] for c in 1:3)
+            divE = eps*sum(gradients[q,c,c] for c in 1:3)
+            divH = mu*sum(gradients[q,c,c+3] for c in 1:3)
             sums[7] += weight*divE
             sums[8] += weight*divH
             sums[9] += weight*divE^2
@@ -47,8 +71,8 @@ function mixed_diagnostics(U,dg::MixedDGDiscretization;
                 sums[16+c] += weight*momentum[c]
                 sums[19+c] += weight*angular[c]
             end
-            curlE = ntuple(c->gradients[mod1(c+2,3)][mod1(c+1,3)][q]-gradients[mod1(c+1,3)][mod1(c+2,3)][q],3)
-            curlH = ntuple(c->gradients[mod1(c+2,3)+3][mod1(c+1,3)][q]-gradients[mod1(c+1,3)+3][mod1(c+2,3)][q],3)
+            curlE = ntuple(c->gradients[q,mod1(c+1,3),mod1(c+2,3)]-gradients[q,mod1(c+2,3),mod1(c+1,3)],3)
+            curlH = ntuple(c->gradients[q,mod1(c+1,3),mod1(c+2,3)+3]-gradients[q,mod1(c+2,3),mod1(c+1,3)+3],3)
             sums[23] += weight*(eps*dot3(E,curlE)+mu*dot3(H,curlH))/2
             sums[24] += weight
         end
@@ -134,9 +158,11 @@ function mixed_rk_step!(U,work::MaxwellRKWorkspace,scheme::ExplicitRKScheme,
     return U
 end
 
-function mixed_diagnostics(U,ddg::DistributedMixedDG;kwargs...)
-    local_sums = mixed_diagnostics(U,ddg.dg;elements=ddg.owned,kwargs...)
-    return MPI.Allreduce(local_sums,+,ddg.comm)
+function mixed_diagnostics(U,ddg::DistributedMixedDG;workspace=nothing,kwargs...)
+    local_sums = mixed_diagnostics(U,ddg.dg;elements=ddg.owned,workspace,kwargs...)
+    result = workspace===nothing ? similar(local_sums) : workspace.global_sums
+    MPI.Allreduce!(local_sums,result,+,ddg.comm)
+    return result
 end
 
 function mixed_diagnostic_values(sums)
@@ -174,13 +200,17 @@ end
 project_maxwell_field(ddg::DistributedMixedDG,E,H;kwargs...) =
     project_maxwell_field(ddg.dg,E,H;elements=ddg.owned,kwargs...)
 
-"""Conservative geometry/degree estimate; CFL is a tunable safety factor.
+"""Geometry/degree timestep estimate; CFL is a tunable safety factor.
 
-h is the minimum altitude and degree factor is (p_H+1)^2. This is a
-heuristic, not a certified spectral bound for every ESPRK composition.
+h is the minimum altitude. The default linear degree factor is p_H; the
+compatibility degree_rule=:quadratic uses (p_H+1)^2. This is a heuristic,
+not a certified spectral bound for every ESPRK composition.
 """
-function mixed_cfl_dt(dg::MixedDGDiscretization;CFL=0.05,elements=axes(dg.mesh.tets,2))
+function mixed_cfl_dt(dg::MixedDGDiscretization;CFL=0.1,elements=axes(dg.mesh.tets,2),degree_rule=:linear)
     isfinite(CFL) && CFL>0 || throw(ArgumentError("CFL must be finite and positive"))
+    degree_rule in (:quadratic, :linear) || throw(ArgumentError("Unknown CFL degree rule"))
+    pH = dg.reference.ref_H.N
+    factor = degree_rule == :quadratic ? (pH+1)^2 : pH
     dt = Inf
     for e in elements
         volume = dg.mappings.tet_mappings[e].absdetJ*REF_TET_VOLUME
@@ -189,7 +219,7 @@ function mixed_cfl_dt(dg::MixedDGDiscretization;CFL=0.05,elements=axes(dg.mesh.t
             norm(cross(X[:,2]-X[:,1],X[:,3]-X[:,1]))/2
         end
         c = inv(sqrt(dg.materials.epsilon[e]*dg.materials.permeability[e]))
-        dt = min(dt,CFL*(3volume/area)/((dg.reference.ref_H.N+1)^2*c))
+        dt = min(dt,CFL*(3volume/area)/(factor*c))
     end
     return dt
 end

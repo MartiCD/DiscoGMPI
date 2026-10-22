@@ -1,6 +1,7 @@
 using Test
 include("test_mixed_order_reference.jl")
 include("test_mixed_order_solver.jl")
+include("test_mixed_diagnostic_workspace.jl")
 
 include("test_run_layout.jl")
 include("test_reference_tet_nodes.jl")

@@ -266,7 +266,8 @@ struct MixedTraceExchange
     send_buffers::Dict{Int,Matrix{Float64}}
     recv_buffers::Dict{Int,Matrix{Float64}}
     traces::Dict{Tuple{Int,Int},Matrix{Float64}}
-    requests::Vector{MPI.Request}
+    # Reused slots retain MPI buffers until Waitall completes each exchange.
+    requests::MPI.MultiRequest
 end
 
 struct DistributedMixedDG{B<:AbstractBackend}
@@ -334,7 +335,7 @@ function build_distributed_mixed_dg_from_root(mesh,parts,p::Int;
     sb = Dict(r=>zeros(nq,6length(sends[r])) for r in neighbors)
     rb = Dict(r=>zeros(nq,6length(receives[r])) for r in neighbors)
     traces = Dict(key=>zeros(nq,6) for r in neighbors for key in receives[r])
-    exchange = MixedTraceExchange(neighbors,sends,receives,sb,rb,traces,MPI.Request[])
+    exchange = MixedTraceExchange(neighbors,sends,receives,sb,rb,traces,MPI.MultiRequest(2length(neighbors)))
     return DistributedMixedDG(dg,owned,gids,exchange,comm)
 end
 
@@ -375,15 +376,14 @@ interpolate_maxwell_field(ddg::DistributedMixedDG,E,H) = interpolate_maxwell_fie
 
 function begin_mixed_trace_exchange!(U,ddg::DistributedMixedDG)
     ex = ddg.exchange
-    empty!(ex.requests)
     fields = mixed_components(U)
-    for r in ex.neighbors
+    for (j,r) in enumerate(ex.neighbors)
         sb = ex.send_buffers[r]
         for (i,f) in enumerate(ex.sends[r]), c in 1:6
             mul!(view(sb,:,6(i-1)+c),c<=3 ? f.E : f.H,view(fields[c],:,f.element))
         end
-        push!(ex.requests,MPI.Irecv!(ex.recv_buffers[r],ddg.comm;source=r,tag=29002))
-        push!(ex.requests,MPI.Isend(sb,ddg.comm;dest=r,tag=29002))
+        MPI.Irecv!(ex.recv_buffers[r],ddg.comm,ex.requests[2j-1];source=r,tag=29002)
+        MPI.Isend(sb,ddg.comm,ex.requests[2j];dest=r,tag=29002)
     end
     return nothing
 end

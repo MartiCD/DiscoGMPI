@@ -25,24 +25,44 @@ def has_initial_errors(row):
                for quantity in INITIAL_QUANTITIES)
 
 
-def main():
+def main(discretization='equal'):
+    mixed = discretization == 'mixed'
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('submit', 'collect'))
-    parser.add_argument('--root', type=Path, default=Path('output/hp_isoresolution'))
+    parser.add_argument('--root', type=Path, default=Path('output/mixed_hp_isoresolution' if mixed else 'output/hp_isoresolution'))
     parser.add_argument('--submit', action='store_true', help='Actually submit; otherwise preview commands.')
     parser.add_argument('--initial-only', action='store_true',
                         help='Submit one deduplicated t=0 interpolation job per physical discretization.')
     parser.add_argument('--match', action='append', default=[],
                         help='Require this substring in case names; repeat to combine filters.')
     parser.add_argument('--ranks-per-node', type=int, default=112)
+    parser.add_argument('--ntasks', type=int, default=None,
+                        help='Override MPI ranks for selected cases (use narrow --match filters).')
+    if mixed:
+        parser.add_argument('--checkpoint-every', type=int, default=1000,
+                            help='Checkpoint every N steps and at final time; 0 disables periodic/final writes.')
+        parser.add_argument('--restart', default='auto',
+                            help='auto, none, or an explicit slot directory (single case only).')
+        parser.add_argument('--watchdog-seconds', type=int, default=2700,
+                            help='Stop the MPI launcher after this long without progress; 0 disables.')
+        parser.add_argument('--startup-timeout', type=int, default=7200,
+                            help='Watchdog allowance before the first integration heartbeat.')
     args = parser.parse_args()
     if args.ranks_per_node < 1:
         parser.error('--ranks-per-node must be positive')
+    if args.ntasks is not None and args.ntasks < 1:
+        parser.error('--ntasks must be positive')
+    if mixed and (args.checkpoint_every<0 or args.watchdog_seconds<0 or args.startup_timeout<1):
+        parser.error('Invalid checkpoint/watchdog interval')
     manifest = json.loads((args.root/'manifest.json').read_text())
+    if manifest.get('discretization', 'equal') != discretization:
+        parser.error('Manifest discretization does not match this manager')
     cases = [c for c in manifest['cases']
              if all(pattern in c['name'] for pattern in args.match)]
     if not cases:
         parser.error('No cases matched')
+    if mixed and args.restart not in ('auto','none') and (len(cases)!=1 or args.initial_only):
+        parser.error('An explicit checkpoint requires one non-initial case')
     if args.action == 'submit':
         matched_cases = cases
         if args.initial_only:
@@ -60,6 +80,9 @@ def main():
         log_dir = (args.root/'slurm').resolve()
         log_dir.mkdir(parents=True, exist_ok=True)
         for case in cases:
+            ranks = case['ranks'] if args.ntasks is None else args.ntasks
+            if ranks > case['nelements']:
+                parser.error('Requested MPI ranks exceed element count for ' + case['name'])
             initial_path = (args.root/'initial_results'/
                             f"{case['mode']}_{case['nodal_set']}_"
                             f"{case.get('mesh_family', 'unstructured')}_"
@@ -81,17 +104,28 @@ def main():
                 if existing:
                     print(f'Skipping available initial result: {initial_path.name}', flush=True)
                     continue
+            exports = f'ALL,INITIAL_ONLY={1 if args.initial_only else 0}'
+            if mixed:
+                if ',' in args.restart:
+                    parser.error('Checkpoint paths cannot contain commas in Slurm exports')
+                exports += (f',MIXED_HP_CHECKPOINT_EVERY={args.checkpoint_every}'
+                            f',MIXED_HP_RESTART={args.restart}'
+                            f',MIXED_HP_WATCHDOG_SECONDS={args.watchdog_seconds}'
+                            f',MIXED_HP_STARTUP_TIMEOUT={args.startup_timeout}')
             command = [os.environ.get('SBATCH_COMMAND', 'sbatch'), '--parsable',
                        f'--account={os.environ.get("ACCOUNT", "bsc115")}',
                        f'--qos={os.environ.get("QOS", "gp_bsccase")}',
                        f'--time={os.environ.get("WALLTIME", "36:00:00")}',
-                       f'--nodes={math.ceil(case["ranks"]/args.ranks_per_node)}',
-                       f'--ntasks={case["ranks"]}', '--cpus-per-task=1',
+                       f'--nodes={math.ceil(ranks/args.ranks_per_node)}',
+                       f'--ntasks={ranks}',
+                       f'--ntasks-per-node={min(ranks, args.ranks_per_node)}',
+                       '--cpus-per-task=1',
                        f'--job-name={"hp_init_" if args.initial_only else "hp_"}{case["name"]}',
                        f'--output={log_dir}/%x_%j.out',
                        f'--error={log_dir}/%x_%j.err',
-                       f'--export=ALL,INITIAL_ONLY={1 if args.initial_only else 0}',
-                       'examples/run_mn5_hp_isoresolution.slurm', case['config']]
+                       f'--export={exports}',
+                       ('examples/run_mn5_mixed_hp_isoresolution.slurm' if mixed else
+                        'examples/run_mn5_hp_isoresolution.slurm'), case['config']]
             print(shlex.join(command), flush=True)
             if args.submit:
                 job_id = subprocess.check_output(command, text=True).strip()
@@ -143,6 +177,18 @@ def main():
         if len(data) != 1:
             raise ValueError(f'{path}: expected exactly one result, found {len(data)}')
         row = data[0]
+        if mixed:
+            for field in ('p_E', 'p_H', 'esprk_order', 'Np_E', 'Np_H',
+                          'electric_dofs', 'magnetic_dofs', 'field_dofs'):
+                if int(row[field]) != case[field]:
+                    raise ValueError(f'{path}: {field} differs from mixed manifest')
+            if row['mesh_sha256'] != case['mesh_sha256']:
+                raise ValueError(f'{path}: mesh hash differs from manifest')
+            for quantity in quantities:
+                for prefix in ('initial_l2_space', 'final_l2_space', 'linf_time_l2_space'):
+                    value = float(row[f'{prefix}_{quantity}_error'])
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError(f'{path}: invalid {prefix} {quantity} error')
         for key, expected in [('order', case['order']), ('nsteps', case['nsteps'])]:
             if int(row[key]) != expected:
                 raise ValueError(f'{path}: {key} differs from manifest')
@@ -163,10 +209,12 @@ def main():
                 row.setdefault(field, '')
         row.update(campaign_name=case['name'], resolution=case['resolution'],
                    campaign_level=case['level'],
-                   scalar_dofs=case['scalar_dofs'], field_dofs=case['field_dofs'],
+                   field_dofs=case['field_dofs'],
                    temporal_rule='dt_p=p*dt4/(4*time_factor)', campaign_mode=case['mode'],
                    campaign_mesh_family=case.get('mesh_family', 'unstructured'),
                    time_factor=case.get('time_factor', 1), h_eff=h_eff)
+        if not mixed:
+            row['scalar_dofs'] = case['scalar_dofs']
         key = (case['mode'], case['flux'], case['nodal_set'],
                case.get('mesh_family', 'unstructured'), case['order'],
                case.get('time_factor', 1))

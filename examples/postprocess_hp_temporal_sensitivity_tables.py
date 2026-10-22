@@ -5,6 +5,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
+from postprocess_convergence_csv_tables import is_mixed_csv
 
 
 ERROR_COLUMNS = {
@@ -37,7 +38,7 @@ def read_rows(path, case, flux, nodal_set, mesh_family, level):
     return selected
 
 
-def render(case, flux, mode, family, nodal, level, rows, source):
+def render(case, flux, mode, family, nodal, level, rows, source, mixed=False):
     ekey, hkey = ERROR_COLUMNS[mode]
     factors = (1, 2, 4)
     complete_orders = [p for p in sorted({key[0] for key in rows})
@@ -50,7 +51,8 @@ def render(case, flux, mode, family, nodal, level, rows, source):
         r"\begin{table}[p]", r"  \centering",
         (r"  \caption{Fixed-mesh temporal sensitivity for the " +
          case.replace("_", r"\_") + f", {flux} flux, {family} meshes, " +
-         f"{nodal} nodes, level M{level}, using {mode} spatial $L^2$ errors.}}"),
+         f"{nodal} nodes, level M{level}, using {mode} spatial $L^2$ errors." +
+         (r" Mixed spaces use $p_E=p$, $p_H=p+1$ and ESPRK order $p+2$." if mixed else "") + "}"),
         r"  \setlength{\tabcolsep}{5pt}",
         r"  \begin{tabular}{@{}rrccc@{}}", r"    \toprule",
         r"    $p$ & $\Delta t/\Delta t_0$ & $\Delta t$ & $\lVert e_E\rVert_2$ & $\lVert e_H\rVert_2$ \\",
@@ -88,6 +90,7 @@ def main():
     args = parser.parse_args()
     if not args.input.is_file():
         raise FileNotFoundError(args.input)
+    mixed = is_mixed_csv(args.input)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     outputs = []
     for case in args.cases:
@@ -98,7 +101,7 @@ def main():
                 output = args.output_dir / f"{case}_{flux}_{mode}_M{args.level}.tex"
                 output.write_text(render(case, flux, mode, args.mesh_family,
                                          args.nodal_set, args.level, rows,
-                                         args.input), encoding="utf-8")
+                                         args.input, mixed), encoding="utf-8")
                 outputs.append(output)
     print(f"Wrote {len(outputs)} temporal-sensitivity tables to {args.output_dir}")
 

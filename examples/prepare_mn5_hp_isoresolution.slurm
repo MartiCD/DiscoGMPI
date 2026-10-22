@@ -38,9 +38,17 @@ export OPENBLAS_NUM_THREADS=1
 
 "${PYTHON:-python3}" -c \
   'import gmsh, numpy; print("Gmsh", gmsh.__version__)'
-exec "${PYTHON:-python3}" examples/prepare_hp_isoresolution.py \
-    --output-dir "${OUTPUT_ROOT:-output/hp_isoresolution}" \
-    --levels "${LEVELS:-4}" --cfl "${CFL_EFFECTIVE:-0.2}" \
-    --periods "${PERIODS:-1}" --seed "${MESH_SEED:-1234}" \
-    --quality-min "${QUALITY_MIN:-0.1}" \
-    --elements-per-rank "${ELEMENTS_PER_RANK:-1000}" --max-ranks "${MAX_RANKS:-448}"
+prepare_args=(
+    --output-dir "${OUTPUT_ROOT:-output/hp_isoresolution}"
+    --levels "${LEVELS:-4}"
+    --cfl "${CFL_EFFECTIVE:-0.2}"
+    --periods "${PERIODS:-1}"
+    --seed "${MESH_SEED:-1234}"
+    --quality-min "${QUALITY_MIN:-0.1}"
+    --elements-per-rank "${ELEMENTS_PER_RANK:-1000}"
+)
+# Mixed campaigns are uncapped unless MAX_RANKS or --max-ranks is supplied.
+# The equal-order preparer retains its own parser default of 448 ranks.
+[[ -z "${MAX_RANKS:-}" ]] || prepare_args+=(--max-ranks "${MAX_RANKS}")
+exec "${PYTHON:-python3}" "${HP_PREPARE_DRIVER:-examples/prepare_hp_isoresolution.py}" \
+    "${prepare_args[@]}" "$@"

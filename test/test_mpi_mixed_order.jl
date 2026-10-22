@@ -14,6 +14,14 @@ rank,nranks = MPI.Comm_rank(comm),MPI.Comm_size(comm)
         R = DiscoGMPI.similar_maxwell_rhs(U)
         rhs! = DiscoGMPI.make_maxwell_rhs_function(ddg;flux_kind=flux)
         rhs!(R,U)
+        requests = ddg.exchange.requests
+        expected = map(copy,DiscoGMPI.mixed_components(R))
+        for _ in 1:5
+            rhs!(R,U)
+            @test ddg.exchange.requests === requests
+            @test all(MPI.isnull,requests)
+            @test all(a ≈ b for (a,b) in zip(DiscoGMPI.mixed_components(R),expected))
+        end
         refR = if rank==0
             dg = MixedDGDiscretization(mesh,2;periodic=specs)
             V = interpolate_maxwell_field(dg,E,H)
@@ -32,6 +40,8 @@ rank,nranks = MPI.Comm_rank(comm),MPI.Comm_size(comm)
             @test ddg.exchange.traces[key] == ddg.exchange.recv_buffers[r][:,6(i-1)+1:6i]
         end
         d = mixed_diagnostic_values(mixed_diagnostics(U,ddg))
+        diagnostic_ws = DiscoGMPI.mixed_diagnostic_workspace(ddg.dg)
+        @test mixed_diagnostics(U,ddg;workspace=diagnostic_ws) ≈ mixed_diagnostics(U,ddg)
         @test d.volume ≈ 1.
         @test d.energy > 0
         @test isfinite(mixed_cfl_dt(ddg))
