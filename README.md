@@ -37,6 +37,7 @@ The package currently combines:
 - PEC, PMC, first-order absorbing, and distributed periodic boundaries.
 - Six-field nonlinear PML damping without auxiliary variables.
 - Distributed energy, charge, linear-momentum, and angular-momentum diagnostics.
+- Solver-independent FFD v1.0 complex far-field interchange and opt-in RCS export.
 - Partition visualization utilities.
 
 ## Layout
@@ -70,6 +71,7 @@ divergence-based charges and do not replace the existing charge diagnostics.
 - `src/NonlinearPML.jl`: Abarbanel--Gottlieb--Hesthaven nonlinear PML
   profiles, source terms, and serial/distributed RK wrappers.
 - `src/MetisIO.jl`: METIS partition input/output helpers.
+- `src/FFDFormat.jl`: validated, streaming-capable FFD v1.0 text reader/writer.
 - `examples/solver/`: migrated DiscoG3D examples using `DiscoGMPI`.
 - `examples/meshes/`: sample VTK meshes, METIS partition files, and
   parameterized Gmsh geometries for structured/unstructured studies.
@@ -504,8 +506,9 @@ final PVD/PVTU paths and array checks.
 The next validation-sequence gate runs the coarse PEC-sphere RCS extraction
 and compares the angular samples against the exact PEC Mie series:
 
-The production workflow is documented in detail in
-`docs/numerics/rcs_metallic_sphere.md`. The implementation is centered on
+The production workflow is documented in detail in the
+[metallic-sphere RCS guide](docs/numerics/rcs_metallic_sphere.md).
+The implementation is centered on
 `examples/distributed_metallic_sphere_scattering.jl`, which solves for the
 scattered field of a PEC sphere under a `+z` propagating, `x` polarized
 incident plane wave. The physical field is reconstructed as
@@ -516,6 +519,24 @@ time-windowed Fourier extraction at the incident frequency, reconstructs the
 far field, and writes
 `sigma(theta,phi) = 4*pi*|E_infinity_scat|^2/|E_inc|^2` to
 `diagnostics/rcs.csv`.
+
+Add `--enable-ffd` alongside `--enable-rcs` to export both complex spherical
+far-field components to `diagnostics/far_field.ffd`. This opt-in FFD v1.0
+output uses the `exp(+i*omega*t)` convention and normalizes by the full complex
+incident amplitude, retaining the phase needed for coherent postprocessing.
+For example, append `--enable-ffd` to the coarse validation command below.
+`--disable-ffd` restores CSV-only output. The labels `--ffd-freq-unit=Hz` and
+`--ffd-field-unit=m` describe the supplied solver units and do not convert
+numerical values; exported angles use degrees. See the
+[FFD format and conventions guide](docs/numerics/ffd_format.md) for the Julia
+API, streaming behavior, polarization mapping, and unit interpretation.
+The codec supports either DG discretization, while the production near-to-far
+adapter currently uses the equal-order scattering driver.
+
+The standalone [FFD comparison tools](tools/ffd/README.md) read EMAGPIE, Mie,
+and DiscoGMPI data through the same codec, align complex fields in Cartesian
+space, and produce RCS plots, CSV reports, and quantitative regression gates.
+They include an EMAGPIE/Mie reference campaign and a reproducible sphere launcher.
 
 ```bash
 mpiexec -n 2 julia --project=. \

@@ -1,0 +1,60 @@
+# Supplied example: validate EMAGPIE versus Mie before running DiscoGMPI.
+# Edit these input paths on another machine. No files in the source tree are modified.
+[comparison]
+reference = "Mie"
+required_sources = ["Mie", "EMAGPIE"]
+output_dir = "../../output/ffd/emagpie_reference"
+radius_m = 1.0
+direction_atol = 2e-6
+frequency_rtol = 1e-6
+alignment = "exact"
+max_gap_rad = 0.02
+db_floor = -100.0
+null_relative_floor = 1e-6
+max_complex_l2 = 0.03
+max_rcs_l2 = 0.04
+max_cross_power_fraction = 1e-5
+
+[[cases]]
+name = "freq1"
+frequency_hz = 155979426.6389178
+
+[[cases]]
+name = "freq2"
+frequency_hz = 311958853.2778356
+
+[[cases]]
+name = "freq3"
+frequency_hz = 623917706.5556712
+
+[[sources]]
+name = "Mie"
+files = [
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq1/mie_phi.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq1/mie_theta.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq2/mie_phi.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq2/mie_theta.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq3/mie_phi.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq3/mie_theta.ffd",
+]
+legacy_polarization_column = true
+# sphere_comparison.jl: normalized i/k amplitude and sigma=4*pi*|F|^2.
+field_unit_override = "m"
+# Physical +z is minus the FFD V basis at emitter -x. Time convention unverified.
+field_scale = [-1.0, 0.0]
+expected_transform = "identity"
+
+[[sources]]
+name = "EMAGPIE"
+files = [
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq1/numeric_phi.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq1/numeric_theta.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq2/numeric_phi.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq2/numeric_theta.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq3/numeric_phi.ffd",
+    "/home/mcircuns/Desktop/N2/EMAGPIE/freq3/numeric_theta.ffd",
+]
+legacy_polarization_column = true
+field_unit_override = "m"
+field_scale = [-1.0, 0.0]
+expected_transform = "identity"

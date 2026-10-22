@@ -6,6 +6,10 @@ a time-dependent plane wave. It is a code-oriented companion to the user guide:
 it explains where the implementation lives, what is computed, how to run it,
 and how to interpret the generated Mie-comparison figures.
 
+Complex, unit-incident far fields can also be exported in FFD v1.0 with
+`--enable-ffd`. See the [FFD format guide](ffd_format.md) for the phasor,
+polarization, units, and streaming reader/writer conventions.
+
 ## Code Map
 
 The RCS path is intentionally split into three layers.
@@ -37,7 +41,12 @@ The RCS-specific structures and functions in that driver are:
 - `global_rcs_accumulator`: reduces the rank-local complex accumulators.
 - `far_field_from_surface_current`: converts the accumulated surface-current
   integral into the transverse far-field amplitude.
-- `write_rcs_results`: writes `diagnostics/rcs.csv`.
+- `finalize_rcs_results`: reconstructs spherical far-field components once
+  after the MPI reduction, independently of the output format.
+- `write_rcs_csv`: writes `diagnostics/rcs.csv`.
+- `rcs_ffd_samples` and `write_rcs_ffd`: normalize the incident phase and
+  polarization and write `diagnostics/far_field.ffd` when requested.
+- `write_rcs_results`: coordinates the shared reduction and rank-zero output.
 
 `examples/validate_coarse_sphere_rcs.jl` is a release-gate wrapper. It runs the
 scattering driver with RCS enabled, checks that `rcs.csv` contains finite,
@@ -65,6 +74,10 @@ The main supporting library code is:
 - `src/RunLayout.jl` and `src/DistributedIO.jl`: isolated run directories,
   diagnostics paths, metadata, manifests, and run status.
 - `src/MaxwellOutput.jl`: collective output helpers and ParaView PVD writing.
+- `src/FFDFormat.jl`: solver-independent FFD v1.0 validation, reading,
+  writing, and lazy sample expansion.
+- `src/FarFieldConventions.jl`: complex incident normalization and conversion
+  to FFD time, incidence, and polarization conventions.
 - `src/solver/kernels/*`: DG geometry, face maps, normals, face mass matrices,
   halo exchange, fluxes, and ESPRK integration.
 
@@ -147,6 +160,18 @@ where `a` is the sphere radius. Its error panel reports
 
 The comparison CSV also stores absolute error, dB error, and
 `|sigma_h-sigma_Mie|/(pi*a^2)`.
+
+When FFD output is requested, the completed internal phasor is divided by the
+signed complex incident amplitude and conjugated to the FFD
+`exp(+i*omega*t)` convention. Its exported unit-incident response `F` satisfies
+`sigma = 4*pi*(abs2(F_theta) + abs2(F_phi))`. The CSV keeps its historical
+internal complex field columns, so compare RCS values directly or apply the
+[FFD convention conversion](ffd_format.md#phasor-and-incident-field-conventions)
+before comparing complex fields.
+The CSV normalization divides the field by the nonzero incident amplitude
+before squaring, without an incident-intensity epsilon floor. Consequently
+small-amplitude runs retain the same linear scaling and RCS as their exported
+unit-incident FFD response, while avoiding unnecessary underflow in `abs2(A)`.
 
 ## Near-To-Far Surface-Current Extraction
 
@@ -236,6 +261,12 @@ The RCS options are:
 - `--enable-rcs`: enable RCS extraction. The production driver defaults to
   disabled; the coarse validation gate enables it by default.
 - `--disable-rcs`: explicitly disable RCS extraction.
+- `--enable-ffd`: also write the complex, unit-incident far field in FFD v1.0.
+  This is disabled by default and requires RCS extraction to be enabled.
+- `--disable-ffd`: explicitly disable FFD output.
+- `--ffd-freq-unit UNIT`, `--ffd-field-unit UNIT`: FFD unit labels, defaulting
+  to `Hz` and `m`; angles are always stored in degrees. These options label
+  numerical solver units and do not rescale the output.
 - `--rcs-start-time T`: start Fourier accumulation at time `T`. Use this to
   skip startup transients.
 - `--rcs-every N`: accumulate an RCS sample every `N` time steps, and always at
@@ -254,6 +285,19 @@ The RCS options are:
 - `--max-db-error V`: optional strict gate for maximum dB error.
 - `--mie-terms N`: Mie-series truncation order for the Julia validation gate.
   The default is automatic.
+
+For example, export a transient-windowed RCS run in both formats with:
+
+```bash
+mpiexec -n 2 julia --project=. \
+  examples/distributed_metallic_sphere_scattering.jl \
+  --enable-rcs --enable-ffd \
+  --rcs-start-time=5.0 --final-time=12.0 \
+  --rcs-theta-count=37 --rcs-phi-degrees=0
+```
+
+Choose a suitable mesh and verify convergence before interpreting these
+illustrative time-window settings quantitatively.
 
 The Mie postprocessor is:
 
@@ -402,6 +446,9 @@ The scattering driver writes:
 
 - `diagnostics/rcs.csv`: numerical far-field table with one row per
   observation direction.
+- `diagnostics/far_field.ffd`: optional complex, unit-incident far-field data,
+  written only with `--enable-ffd`. It contains one fully gridded block with
+  `phi_obs` outermost and `theta_obs` innermost among the observation axes.
 - `diagnostics/scattering_diagnostics.csv`: electromagnetic diagnostics of the
   scattered solution.
 - `diagnostics/pec_boundary_residual.csv`: `n x E_total` residual on the
@@ -424,6 +471,13 @@ The Python postprocessor adds:
 - `diagnostics/mie_rcs_comparison.csv`.
 - `tables/mie_rcs_comparison.tex`.
 - `plots/mie_rcs_comparison.pdf`, or the file selected with `--plot-output`.
+
+The CSV remains available because it records sample counts, Fourier-window
+information, magnitudes, and RCS diagnostics outside the FFD field model.
+Both outputs share the same accumulated far-field result. The FFD codec is
+independent of DG order, but this production near-to-far workflow currently
+uses equal-order DG; evaluating mixed-order magnetic traces at common face
+quadrature points is a separate integration step.
 
 ## Interpreting Plots
 

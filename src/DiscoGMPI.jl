@@ -421,6 +421,12 @@ include("PhysicalCoverage.jl")
 include("NonlinearPML.jl")
 include("DistributedIO.jl")
 include("MaxwellExactSolutions.jl")
+include("FFDFormat.jl")
+include("FarFieldConventions.jl")
+export FFDPolarization, FFD_V, FFD_H, FFDSample, FFDAxis, FFDHeader,
+       AbstractFFDBlock, FFDExplicitBlock, FFDGriddedBlock, FFDFile,
+       validate_ffd, write_ffd, read_ffd, each_ffd_row, each_ffd_point,
+       expand_block, canonical_ffd_field, ffd_incident_coordinates
 include("DiscoGChargeDiagnostics.jl")
 include("MaxwellDiagnostics.jl")
 include("MaxwellOutput.jl")

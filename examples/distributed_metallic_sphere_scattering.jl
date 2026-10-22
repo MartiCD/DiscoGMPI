@@ -2,6 +2,7 @@
 
 using MPI
 using Printf
+using Dates
 using LinearAlgebra
 using WriteVTK
 using VTKBase
@@ -48,6 +49,9 @@ Base.@kwdef struct MetallicSphereScatteringConfig
     rcs_theta_min_degrees::Float64 = 0.0
     rcs_theta_max_degrees::Float64 = 180.0
     rcs_phi_degrees::Vector{Float64} = [0.0]
+    ffd_enabled::Bool = false
+    ffd_freq_unit::String = "Hz"
+    ffd_field_unit::String = "m"
     output_dir::String = joinpath(
         normpath(joinpath(@__DIR__, "..")),
         "output",
@@ -110,6 +114,11 @@ Additional options:
   --rcs-theta-min-degrees A    Minimum theta angle. Default: 0
   --rcs-theta-max-degrees A    Maximum theta angle. Default: 180
   --rcs-phi-degrees LIST       Comma-separated azimuth angles. Default: 0
+  --enable-ffd                 Write diagnostics/far_field.ffd. Requires RCS.
+  --disable-ffd                Disable FFD output. Default
+  --ffd-freq-unit UNIT         Label for solver frequency values. Default: Hz
+  --ffd-field-unit UNIT        Label for normalized scattering amplitude.
+                               Default: m. Labels do not convert solver units.
   --help                       Show this message.
 
 The driver solves for the scattered field. The PEC scatterer surface enforces the
@@ -187,6 +196,8 @@ function parse_config(args::Vector{String})
         "--rcs-theta-min-degrees" => (:rcs_theta_min_degrees, Float64),
         "--rcs-theta-max-degrees" => (:rcs_theta_max_degrees, Float64),
         "--rcs-phi-degrees" => (:rcs_phi_degrees, :float_list),
+        "--ffd-freq-unit" => (:ffd_freq_unit, String),
+        "--ffd-field-unit" => (:ffd_field_unit, String),
         "--output-dir" => (:output_dir, String),
     )
 
@@ -202,6 +213,14 @@ function parse_config(args::Vector{String})
             continue
         elseif argument == "--disable-rcs"
             values[:rcs_enabled] = false
+            index += 1
+            continue
+        elseif argument == "--enable-ffd"
+            values[:ffd_enabled] = true
+            index += 1
+            continue
+        elseif argument == "--disable-ffd"
+            values[:ffd_enabled] = false
             index += 1
             continue
         end
@@ -235,7 +254,8 @@ function parse_config(args::Vector{String})
     config.pec_boundary_id > 0 || error("--pec-boundary-id must be positive.")
     config.wavelength > 0.0 || error("--wavelength must be positive.")
     config.frequency >= 0.0 || error("--frequency must be non-negative.")
-    config.amplitude != 0.0 || error("--amplitude must be non-zero.")
+    isfinite(config.amplitude) && config.amplitude != 0.0 ||
+        error("--amplitude must be finite and non-zero.")
     config.order >= 1 || error("--order must be positive.")
     1 <= config.esprk_order <= 6 ||
         error("--esprk-order must be in 1:6.")
@@ -267,7 +287,7 @@ function parse_config(args::Vector{String})
         error("--rcs-theta-min-degrees cannot exceed --rcs-theta-max-degrees.")
     isempty(config.rcs_phi_degrees) &&
         error("--rcs-phi-degrees requires at least one value.")
-    IncidentPlaneWaveParameters(
+    wave = IncidentPlaneWaveParameters(
         propagation_direction = config.incident_direction,
         polarization = config.incident_polarization,
         wavelength = config.wavelength,
@@ -275,7 +295,20 @@ function parse_config(args::Vector{String})
         epsilon = config.epsilon,
         mu = config.mu,
     )
+    validate_ffd_configuration(config, wave)
     return config
+end
+
+"""Validate optional FFD requests before starting a costly scattering run."""
+function validate_ffd_configuration(config::MetallicSphereScatteringConfig,
+                                    wave::IncidentPlaneWaveParameters)
+    config.ffd_enabled || return nothing
+    config.rcs_enabled || error("--enable-ffd requires --enable-rcs.")
+    # Header validation also prevents multiline/unit-token injection.
+    validate_ffd(FFDHeader(; freq_unit = config.ffd_freq_unit,
+                          angle_unit = "deg", field_unit = config.ffd_field_unit))
+    ffd_incident_coordinates(wave)
+    return nothing
 end
 
 function read_numbers!(io::IO, count::Int, type::Type{T}) where {T}
@@ -1198,90 +1231,185 @@ function far_field_from_surface_current(
     )
 end
 
-function write_rcs_results(
-    run_paths::RunPaths,
-    comm::MPI.Comm,
-    workspace::Union{Nothing, RCSWorkspace},
-)
-    workspace === nothing && return nothing
+"""Final spherical far-field amplitudes in the driver's exp(-i omega t) convention.
 
-    rank = MPI.Comm_rank(comm)
+These arrays contain no DG coefficients. CSV and FFD writers share this result;
+only the optional FFD adapter normalizes its phase and incident polarization.
+"""
+struct RCSFarFieldResults
+    observations::Vector{RCSObservationDirection}
+    Etheta::Vector{ComplexF64}
+    Ephi::Vector{ComplexF64}
+    sample_count::Int
+    window_sum::Float64
+    start_time::Float64
+    end_time::Float64
+    incident_amplitude::Float64
+end
+
+function validate_rcs_result(result::RCSFarFieldResults)
+    result.sample_count >= 0 || error("RCS sample count must be nonnegative.")
+    isfinite(result.window_sum) && result.window_sum >= 0.0 ||
+        error("RCS Fourier window sum must be finite and nonnegative.")
+    isfinite(result.incident_amplitude) && result.incident_amplitude > 0.0 ||
+        error("RCS incident amplitude must be finite and nonzero.")
+    all(isfinite, (result.start_time, result.end_time)) ||
+        error("RCS Fourier interval must be finite.")
+    expected = result.sample_count > 0 && result.window_sum > 0.0 ?
+               length(result.observations) : 0
+    length(result.Etheta) == length(result.Ephi) == expected ||
+        throw(DimensionMismatch("RCS spherical field components and observation count differ."))
+    all(isfinite, result.Etheta) && all(isfinite, result.Ephi) ||
+        error("RCS far-field components must be finite.")
+    return result
+end
+
+function validate_rcs_ffd_wave(result::RCSFarFieldResults,
+                               wave::IncidentPlaneWaveParameters, wave_values)
+    isapprox(result.incident_amplitude, abs(wave.amplitude); rtol = 1e-12, atol = 0.0) ||
+        error("FFD incident amplitude differs from the finalized RCS result.")
+    frequency = incident_plane_wave_angular_frequency(wave) / (2pi)
+    isfinite(wave_values.frequency) && wave_values.frequency > 0.0 &&
+        isapprox(wave_values.frequency, frequency; rtol = 1e-12, atol = 0.0) ||
+        error("FFD frequency metadata differs from the incident wave.")
+    return nothing
+end
+
+function finalize_rcs_results(workspace::RCSWorkspace, global_accum;
+                              sample_count = workspace.sample_count,
+                              window_sum = workspace.window_sum)
+    size(global_accum) == (3, length(workspace.observations)) ||
+        throw(DimensionMismatch("RCS accumulator and observation grid differ."))
+    Etheta = ComplexF64[]
+    Ephi = ComplexF64[]
+    if sample_count > 0 && window_sum > 0.0
+        isfinite(window_sum) || error("RCS Fourier window sum must be finite.")
+        for (i, observation) in enumerate(workspace.observations)
+            current = ntuple(c -> (2.0 * global_accum[c, i]) / window_sum, 3)
+            far_field = far_field_from_surface_current(current, observation, workspace)
+            push!(Etheta, dot3(observation.e_theta, far_field))
+            push!(Ephi, dot3(observation.e_phi, far_field))
+        end
+    end
+    return validate_rcs_result(RCSFarFieldResults(
+        workspace.observations, Etheta, Ephi, sample_count, window_sum,
+        workspace.start_time, workspace.end_time, workspace.incident_amplitude))
+end
+
+function write_rcs_csv(path::AbstractString, result::RCSFarFieldResults)
+    validate_rcs_result(result)
+    open(path, "w") do io
+        println(io, "theta_degrees,phi_degrees,dir_x,dir_y,dir_z," *
+                    "abs_E_infinity,abs_Etheta,abs_Ephi,rcs,rcs_db," *
+                    "real_Etheta,imag_Etheta,real_Ephi,imag_Ephi,samples," *
+                    "window_sum,rcs_start_time,rcs_end_time")
+        if isempty(result.Etheta)
+            @warn "RCS was enabled but no nonzero windowed samples were accumulated."
+            return nothing
+        end
+        A = result.incident_amplitude
+        isfinite(A) && A > 0.0 || error("RCS incident amplitude must be finite and nonzero.")
+        for (i, observation) in enumerate(result.observations)
+            Etheta, Ephi = result.Etheta[i], result.Ephi[i]
+            abs_E = hypot(abs(Etheta), abs(Ephi))
+            # Divide before squaring: arbitrary epsilon clipping would make
+            # small-amplitude runs disagree with the unit-incident FFD response.
+            rcs = 4.0 * pi * (abs2(Etheta / A) + abs2(Ephi / A))
+            values = (observation.theta_degrees, observation.phi_degrees,
+                      observation.direction..., abs_E, abs(Etheta), abs(Ephi),
+                      rcs, rcs > 0.0 ? 10.0 * log10(rcs) : -Inf,
+                      real(Etheta), imag(Etheta), real(Ephi), imag(Ephi))
+            columns = [@sprintf("%.16e", value) for value in values]
+            push!(columns, string(result.sample_count))
+            append!(columns, [@sprintf("%.16e", value) for value in
+                              (result.window_sum, result.start_time, result.end_time)])
+            println(io, join(columns, ','))
+        end
+    end
+    return path
+end
+
+"""Adapt physical far fields to unit-incident FFD samples, without copying rows."""
+function rcs_ffd_samples(result::RCSFarFieldResults,
+                         wave::IncidentPlaneWaveParameters, frequency::Real)
+    validate_rcs_result(result)
+    validate_rcs_ffd_wave(result, wave, (; frequency))
+    incidence = ffd_incident_coordinates(wave)
+    return (FFDSample(frequency, incidence.pol, incidence.theta_inc,
+                      incidence.phi_inc, observation.theta_degrees,
+                      observation.phi_degrees,
+                      canonical_ffd_field(result.Etheta[i], incidence.incident_amplitude),
+                      canonical_ffd_field(result.Ephi[i], incidence.incident_amplitude))
+            for (i, observation) in enumerate(result.observations))
+end
+
+function write_rcs_ffd(path::AbstractString, result::RCSFarFieldResults,
+                       config::MetallicSphereScatteringConfig,
+                       wave::IncidentPlaneWaveParameters, wave_values;
+                       date = Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS") * "Z")
+    validate_ffd_configuration(config, wave)
+    validate_rcs_result(result)
+    validate_rcs_ffd_wave(result, wave, wave_values)
+    isempty(result.Etheta) &&
+        error("FFD output requires at least one nonzero-window RCS sample.")
+    expected = rcs_observation_directions(config)
+    length(expected) == length(result.observations) ||
+        throw(DimensionMismatch("FFD result and configured observation grid differ."))
+    all(a.theta_degrees == b.theta_degrees && a.phi_degrees == b.phi_degrees
+        for (a, b) in zip(expected, result.observations)) ||
+        error("FFD result observation order differs from the configured phi/theta grid.")
+    incidence = ffd_incident_coordinates(wave)
+    theta_values = [o.theta_degrees for o in expected[1:config.rcs_theta_count]]
+    axes = [FFDAxis(:freq, [wave_values.frequency]), FFDAxis(:pol, [incidence.pol]),
+            FFDAxis(:theta_inc, [incidence.theta_inc]),
+            FFDAxis(:phi_inc, [incidence.phi_inc]),
+            FFDAxis(:phi_obs, config.rcs_phi_degrees), FFDAxis(:theta_obs, theta_values)]
+    samples = rcs_ffd_samples(result, wave, wave_values.frequency)
+    rows = ((real(s.Etheta), imag(s.Etheta), real(s.Ephi), imag(s.Ephi)) for s in samples)
+    block = FFDGriddedBlock(axes, rows; n_points = length(expected))
+    header = FFDHeader(; solver = "DiscoGMPI " * string(pkgversion(DiscoGMPI)),
+                       problem = config.scatterer_name, date = date,
+                       freq_unit = config.ffd_freq_unit, angle_unit = "deg",
+                       field_unit = config.ffd_field_unit,
+                       extras = Dict("time_convention" => "exp(+i omega t)",
+                                     "incident_normalization" => "unit complex spherical component"))
+    return write_ffd(path, header, [block])
+end
+
+function write_rcs_results(run_paths::RunPaths, comm::MPI.Comm,
+                           workspace::Union{Nothing, RCSWorkspace};
+                           config = nothing, wave = nothing, wave_values = nothing)
+    workspace === nothing && return nothing
     rcs_path = run_diagnostics_path(run_paths, "rcs.csv")
+    ffd_path = run_diagnostics_path(run_paths, "far_field.ffd")
     global_accum = global_rcs_accumulator(workspace, comm)
     sample_count = MPI.Allreduce(workspace.sample_count, max, comm)
     window_sum = MPI.Allreduce(workspace.window_sum, max, comm)
+    ffd_enabled = config !== nothing && config.ffd_enabled
 
-    collective_root_action(comm, "RCS diagnostics writing") do
-        open(rcs_path, "w") do io
-            println(
-                io,
-                "theta_degrees,phi_degrees,dir_x,dir_y,dir_z," *
-                "abs_E_infinity,abs_Etheta,abs_Ephi," *
-                "rcs,rcs_db,real_Etheta,imag_Etheta," *
-                "real_Ephi,imag_Ephi,samples,window_sum," *
-                "rcs_start_time,rcs_end_time",
-            )
-
-            if sample_count == 0 || window_sum <= 0.0
-                @warn(
-                    "RCS was enabled but no nonzero windowed samples were accumulated.",
-                )
-                return nothing
+    collective_root_action(comm, "RCS/FFD diagnostics writing") do
+        result = finalize_rcs_results(workspace, global_accum; sample_count, window_sum)
+        if ffd_enabled
+            wave !== nothing && wave_values !== nothing ||
+                error("FFD output requires incident wave and frequency metadata.")
+            for (actual, expected, name) in (
+                (workspace.omega, incident_plane_wave_angular_frequency(wave), "frequency"),
+                (workspace.wavenumber, incident_plane_wave_number(wave), "wavenumber"),
+                (workspace.impedance, incident_plane_wave_impedance(wave), "impedance"))
+                isapprox(actual, expected; rtol = 1e-12, atol = 0.0) ||
+                    error("FFD incident $name differs from the RCS accumulator metadata.")
             end
-
-            phasor_scale = 2.0 / window_sum
-            for (direction_id, observation) in
-                enumerate(workspace.observations)
-                current_integral = (
-                    phasor_scale * global_accum[1, direction_id],
-                    phasor_scale * global_accum[2, direction_id],
-                    phasor_scale * global_accum[3, direction_id],
-                )
-                far_field = far_field_from_surface_current(
-                    current_integral,
-                    observation,
-                    workspace,
-                )
-                Etheta = dot3(observation.e_theta, far_field)
-                Ephi = dot3(observation.e_phi, far_field)
-                abs_Etheta = abs(Etheta)
-                abs_Ephi = abs(Ephi)
-                abs_E = sqrt(abs2(Etheta) + abs2(Ephi))
-                rcs =
-                    4.0 * pi * abs2(abs_E) /
-                    max(workspace.incident_amplitude^2, eps(Float64))
-                rcs_db = rcs > 0.0 ? 10.0 * log10(rcs) : -Inf
-                direction = observation.direction
-                println(
-                    io,
-                    join(
-                        (
-                            @sprintf("%.16e", observation.theta_degrees),
-                            @sprintf("%.16e", observation.phi_degrees),
-                            @sprintf("%.16e", direction[1]),
-                            @sprintf("%.16e", direction[2]),
-                            @sprintf("%.16e", direction[3]),
-                            @sprintf("%.16e", abs_E),
-                            @sprintf("%.16e", abs_Etheta),
-                            @sprintf("%.16e", abs_Ephi),
-                            @sprintf("%.16e", rcs),
-                            @sprintf("%.16e", rcs_db),
-                            @sprintf("%.16e", real(Etheta)),
-                            @sprintf("%.16e", imag(Etheta)),
-                            @sprintf("%.16e", real(Ephi)),
-                            @sprintf("%.16e", imag(Ephi)),
-                            sample_count,
-                            @sprintf("%.16e", window_sum),
-                            @sprintf("%.16e", workspace.start_time),
-                            @sprintf("%.16e", workspace.end_time),
-                        ),
-                        ',',
-                    ),
-                )
-            end
+            validate_rcs_ffd_wave(result, wave, wave_values)
+        end
+        write_rcs_csv(rcs_path, result)
+        if ffd_enabled
+            write_rcs_ffd(ffd_path, result, config, wave, wave_values)
         end
     end
-    rank == 0 && println("  RCS diagnostics:          ", rcs_path)
+    if MPI.Comm_rank(comm) == 0
+        println("  RCS diagnostics:          ", rcs_path)
+        ffd_enabled && println("  FFD far field:            ", ffd_path)
+    end
     return rcs_path
 end
 
@@ -1386,6 +1514,12 @@ function config_dictionary(
         "rcs_theta_min_degrees" => config.rcs_theta_min_degrees,
         "rcs_theta_max_degrees" => config.rcs_theta_max_degrees,
         "rcs_phi_degrees" => config.rcs_phi_degrees,
+        "ffd_enabled" => config.ffd_enabled,
+        "ffd_freq_unit" => config.ffd_freq_unit,
+        "ffd_angle_unit" => "deg",
+        "ffd_field_unit" => config.ffd_field_unit,
+        "ffd_time_convention" => "exp(+i omega t)",
+        "ffd_incident_normalization" => "unit complex spherical component",
         "mpi_ranks" => nranks,
         "mesh_lower" => collect(mesh_lower),
         "mesh_upper" => collect(mesh_upper),
@@ -1399,6 +1533,8 @@ end
 function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
+    wave, wave_values = incident_wave(config)
+    validate_ffd_configuration(config, wave)
 
     root_mesh = nothing
     root_partition = nothing
@@ -1431,7 +1567,6 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     pml === nothing &&
         error("PML construction returned nothing; sigma_max and width must be positive.")
 
-    wave, wave_values = incident_wave(config)
     final_time = wave_values.final_time
     incident_electric = (x, y, z, t) ->
         incident_electric_plane_wave(x, y, z, t, wave)
@@ -1737,7 +1872,7 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
     end
 
     elapsed = MPI.Allreduce(local_elapsed, max, comm)
-    write_rcs_results(run_paths, comm, rcs_workspace)
+    write_rcs_results(run_paths, comm, rcs_workspace; config, wave, wave_values)
     write_distributed_run_metadata(
         run_paths.config_dir,
         distributed_dg;
@@ -1769,6 +1904,8 @@ function run_experiment(config::MetallicSphereScatteringConfig, comm::MPI.Comm)
             "final_angular_momentum" =>
                 collect(final_invariants.angular_momentum),
             "rcs_enabled" => config.rcs_enabled,
+            "ffd_enabled" => config.ffd_enabled,
+            "ffd_path" => config.ffd_enabled ? run_diagnostics_path(run_paths, "far_field.ffd") : "",
             "rcs_samples" =>
                 rcs_workspace === nothing ? 0 : rcs_workspace.sample_count,
             "rcs_window_sum" =>

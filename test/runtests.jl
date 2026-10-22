@@ -1,4 +1,9 @@
 using Test
+include("test_ffd_format.jl")
+include("test_ffd_conventions.jl")
+include("test_ffd_rcs.jl")
+include("test_ffd_comparison.jl")
+include("test_ffd_benchmark_launcher.jl")
 include("test_mixed_order_reference.jl")
 include("test_mixed_order_solver.jl")
 include("test_mixed_diagnostic_workspace.jl")
