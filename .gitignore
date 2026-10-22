@@ -50,11 +50,12 @@ examples/meshes/*.sh
 !examples/meshes/generate_pec_almond_scattering_mesh.sh
 examples/meshes/*.msh
 examples/__pycache__/
+test/__pycache__/
 examples/refined_meshes/*.vtk
 examples/meshes/tet_mesh*
 
-*.sh 
-*.slurm
+# *.sh 
+# *.slurm
 *.png
 *.pdf
 *.svg

@@ -178,26 +178,37 @@ def make_structured_family(gmsh, directory, mode, resolutions, threshold, seed):
     return result
 
 
-def main():
+def main(discretization='equal'):
+    mixed = discretization == 'mixed'
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output-dir', type=Path, default=Path('output/hp_isoresolution'))
+    parser.add_argument('--output-dir', type=Path, default=Path('output/mixed_hp_isoresolution' if mixed else 'output/hp_isoresolution'))
     parser.add_argument('--levels', type=int, default=4)
-    parser.add_argument('--cfl', type=float, default=.2, help='Effective CFL (0.8/4).')
+    parser.add_argument('--cfl', type=float, default=.1 if mixed else .2)
     parser.add_argument('--periods', type=float, default=1.)
     parser.add_argument('--quality-min', type=float, default=.1)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--elements-per-rank', type=int, default=1000)
-    parser.add_argument('--max-ranks', type=int, default=448)
+    parser.add_argument('--max-ranks', type=int, default=None if mixed else 448,
+                        help=('Maximum ranks per case. Mixed campaigns are uncapped by default; '
+                              'the scheduler may still impose site limits.'))
+    parser.add_argument('--cfl-degree-rule', choices=('quadratic', 'linear'),
+                        default='linear' if mixed else 'quadratic',
+                        help='Mixed only: linear (default) uses p_H; quadratic uses (p_H+1)^2.')
     parser.add_argument('--mesh-families', nargs='+', choices=('unstructured', 'structured'),
                         default=('unstructured', 'structured'))
     parser.add_argument('--time-factors', nargs='+', type=int, default=(1, 2, 4),
                         help='Step-count multipliers for the fixed-mesh time study.')
-    parser.add_argument('--temporal-levels', nargs='+', type=int, default=(4,),
+    parser.add_argument('--temporal-levels', nargs='+', type=int, default=None,
                         help='Mesh levels receiving factors greater than one.')
     args = parser.parse_args()
+    if not mixed and args.cfl_degree_rule != 'quadratic':
+        parser.error('--cfl-degree-rule applies only to mixed campaigns')
+    if args.temporal_levels is None:
+        args.temporal_levels = [args.levels]
     if (not 1 <= args.levels <= 4 or
             not all(math.isfinite(v) for v in (args.cfl, args.periods, args.quality_min)) or
-            min(args.cfl, args.periods, args.elements_per_rank, args.max_ranks) <= 0 or
+            min(args.cfl, args.periods, args.elements_per_rank) <= 0 or
+            (args.max_ranks is not None and args.max_ranks <= 0) or
             not 0 <= args.quality_min <= 1 or
             any(value < 1 for value in args.time_factors) or
             1 not in args.time_factors or
@@ -233,8 +244,12 @@ def main():
             final_time = args.periods * period
             for level in range(1, args.levels+1):
                 for family, meshes in families.items():
-                    # dt_p = p/4 * dt4, safe under every p-specific mesh.
-                    dt4 = min(4*args.cfl*meshes[12*2**(level-1)//p]['cfl_h_min']/p**2
+                    # dt_p = p/4 * dt4, bounded by each p-specific estimate.
+                    # Mixed: inradius <= minimum altitude, so this is conservative
+                    # relative to mixed_cfl_dt with the selected degree rule.
+                    # Keeping dt_p=p*dt4/4 requires dt4 <= 4*limit_p/p.
+                    dt4 = min(4*args.cfl*meshes[12*2**(level-1)//p]['cfl_h_min'] /
+                              (p*((p+2)**2 if args.cfl_degree_rule == 'quadratic' else p+1) if mixed else p**2)
                               for p in (1, 2, 3, 4))
                     n4 = 3 * math.ceil(final_time/dt4/3)
                     factors = args.time_factors if level in args.temporal_levels else (1,)
@@ -242,10 +257,14 @@ def main():
                             (1, 2, 3, 4), ('centered', 'alternating'),
                             ('equispaced', 'warp-blend'), factors):
                         mesh = meshes[12*2**(level-1)//p]
-                        ranks = min(args.max_ranks, max(1, math.ceil(
-                            mesh['nelements']/args.elements_per_rank)))
+                        target_ranks = max(1, math.ceil(
+                            mesh['nelements']/args.elements_per_rank))
+                        ranks = (target_ranks if args.max_ranks is None else
+                                 min(args.max_ranks, target_ranks))
                         name = (f'{mode}_{flux}_{nodal}_{family}_p{p}_m{level}'
                                 f'_dt{time_factor}')
+                        if mixed:
+                            name = 'mixed_' + name
                         case = dict(mesh, name=name, mode=mode, order=p, level=level,
                                     flux=flux, nodal_set=nodal, mesh_family=family,
                                     time_factor=time_factor,
@@ -255,6 +274,18 @@ def main():
                                     scalar_dofs=mesh['nelements']*math.comb(p+3, 3),
                                     field_dofs=6*mesh['nelements']*math.comb(p+3, 3),
                                     effective_resolution=12*2**(level-1), seed=args.seed)
+                        if mixed:
+                            ne = mesh['nelements']
+                            case.update(discretization='mixed', p_E=p, p_H=p+1,
+                                        cfl_degree_rule=args.cfl_degree_rule,
+                                        esprk_order=p+2, Np_E=math.comb(p+3, 3),
+                                        Np_H=math.comb(p+4, 3),
+                                        electric_dofs=3*ne*math.comb(p+3, 3),
+                                        magnetic_dofs=3*ne*math.comb(p+4, 3),
+                                        field_dofs=3*ne*(math.comb(p+3, 3)+math.comb(p+4, 3)),
+                                        effective_resolution_H=(p+1)*mesh['resolution'],
+                                        cubature_degree=4*(p+1)+2)
+                            del case['scalar_dofs']
                         casefile = root / 'cases' / f'{name}.toml'
                         # Flat scalar manifest: JSON string quoting is valid TOML here.
                         with casefile.open('w') as stream:
@@ -264,7 +295,8 @@ def main():
     finally:
         gmsh.finalize()
     (root/'manifest.json').write_text(json.dumps(dict(
-        gmsh_version=gmsh.__version__, time_factors=args.time_factors,
+        discretization=discretization, gmsh_version=gmsh.__version__, time_factors=args.time_factors,
+        elements_per_rank=args.elements_per_rank, max_ranks=args.max_ranks,
         temporal_levels=args.temporal_levels, mesh_families=args.mesh_families,
         cases=cases), indent=2)+'\n')
     print(f'Prepared {len(cases)} cases in {root}; no jobs submitted.')

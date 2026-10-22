@@ -435,5 +435,13 @@ include("RunLayout.jl")
 include("MaxwellDriverSupport.jl")
 include("MaxwellConvergence.jl")
 include("MaxwellInvariantAudit.jl")
+include("MixedOrderDG.jl")
+export MixedReferenceTet, build_mixed_reference_tet
+export MixedDGDiscretization, mixed_esprk_scheme
+export DistributedMixedDG, build_distributed_mixed_dg_from_root
+include("MixedOrderSupport.jl")
+export mixed_diagnostics, mixed_diagnostic_values, mixed_cfl_dt
+export with_mixed_source, with_mixed_nonlinear_pml, mixed_rk_step!
+export project_maxwell_field
 
 end # module DiscoGMPI

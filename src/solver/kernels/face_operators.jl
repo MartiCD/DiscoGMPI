@@ -231,7 +231,7 @@ function eval_nodal_basis_at_points(
             mono[j] = eval_monomial(rq[q], sq[q], tq[q], basis.exponents[j])
         end
 
-        Vq[q, :] .= (mono' * basis.modal_coeffs)
+        Vq[q, :] .= transpose(basis.modal_coeffs) * mono
     end
 
     # Nodal basis matrix:
