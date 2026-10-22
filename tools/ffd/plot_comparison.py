@@ -32,6 +32,7 @@ from matplotlib.ticker import AutoMinorLocator
 # Okabe-Ito colors remain distinguishable in the three-frequency benchmark.
 CASE_COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9")
 SOURCE_STYLES = ("-", "--", ":", "-.")
+SOURCE_MARKERS = (None, "o", "s", "^")
 SAMPLE_NUMBERS = (
     "freq_hz", "angle_rad", "theta_rad", "phi_rad", "rx", "ry", "rz",
     "Etheta_re", "Etheta_im", "Ephi_re", "Ephi_im", "Eco_re", "Eco_im",
@@ -169,14 +170,42 @@ def make_styles(samples: list[dict]):
     for case in cases:
         frequencies = {row["freq_hz"] for row in samples if row["case"] == case}
         frequency = min(frequencies)
-        labels[case] = f"{case}: {frequency / 1e6:.6g} MHz"
+        labels[case] = f"Frequency: {case} ({frequency / 1e6:.6g} MHz)"
     return sources, cases, colors, styles, labels
 
 
+def source_plot_kwargs(source: str, style: str, point_count: int) -> dict:
+    """Keep numerical traces legible when they nearly coincide with the reference."""
+    rank = source_rank(source)[0]
+    marker = SOURCE_MARKERS[rank if rank < 3 else 3]
+    kwargs = {
+        "linestyle": style,
+        "linewidth": 1.05 if rank == 0 else 1.75,
+        "alpha": 0.78 if rank == 0 else 1.0,
+        "zorder": 1 if rank == 0 else rank + 2,
+    }
+    if marker is not None:
+        kwargs.update({
+            "marker": marker,
+            "markersize": 3.6,
+            "markerfacecolor": "white",
+            "markeredgewidth": 0.8,
+            "markevery": max(1, point_count // 20),
+        })
+    return kwargs
+
+
 def legend_handles(sources, cases, colors, styles, labels):
-    return ([Line2D([], [], color=colors[case], label=labels[case]) for case in cases] +
-            [Line2D([], [], color="0.25", linestyle=styles[source], label=source)
-             for source in sources])
+    case_handles = [Line2D([], [], color=colors[case], linewidth=2.5,
+                           label=labels[case]) for case in cases]
+    source_handles = []
+    for source in sources:
+        kwargs = source_plot_kwargs(source, styles[source], 100)
+        kwargs.pop("zorder")
+        kwargs.pop("markevery", None)
+        source_handles.append(Line2D([], [], color="0.25", label=f"Source: {source}",
+                                     **kwargs))
+    return case_handles + source_handles
 
 
 def add_legend(fig, handles, *, bottom: float = -0.01) -> None:
@@ -217,7 +246,8 @@ def render_comparison(samples: list[dict], pairs: list[dict], output_dir: Path,
                 if rows:
                     ax.plot([math.degrees(row["angle_rad"]) for row in rows],
                             [rcs_db(row["sigma_total_m2"], db_floor) for row in rows],
-                            color=colors[case], linestyle=styles[source])
+                            color=colors[case],
+                            **source_plot_kwargs(source, styles[source], len(rows)))
         ax.set_title(cut_title(cut))
         decorate(ax, cut, r"Total RCS (dBsm)")
     add_legend(fig, handles)
@@ -237,7 +267,8 @@ def render_comparison(samples: list[dict], pairs: list[dict], output_dir: Path,
                     if rows:
                         ax.plot([math.degrees(row["angle_rad"]) for row in rows],
                                 [rcs_db(row[column], db_floor) for row in rows],
-                                color=colors[case], linestyle=styles[source])
+                                color=colors[case],
+                                **source_plot_kwargs(source, styles[source], len(rows)))
             ax.set_title(title)
             decorate(ax, cut, "RCS (dBsm)")
         fig.suptitle(cut_title(cut), y=0.99)
@@ -265,12 +296,19 @@ def render_comparison(samples: list[dict], pairs: list[dict], output_dir: Path,
                     else:
                         values = [row[column] for row in rows]
                     ax.plot([math.degrees(row["angle_rad"]) for row in rows], values,
-                            color=colors[case], linestyle=styles[source])
+                            color=colors[case],
+                            **source_plot_kwargs(source, styles[source], len(rows)))
                 decorate(ax, cut, ylabel)
                 ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 3), useMathText=True)
             fig.suptitle(f"{labels[case]} — {cut_title(cut)}", y=0.99)
-            add_legend(fig, [Line2D([], [], color=colors[case], linestyle=styles[source],
-                                   label=source) for source in present])
+            complex_handles = []
+            for source in present:
+                kwargs = source_plot_kwargs(source, styles[source], 100)
+                kwargs.pop("zorder")
+                kwargs.pop("markevery", None)
+                complex_handles.append(Line2D([], [], color=colors[case], label=source,
+                                              **kwargs))
+            add_legend(fig, complex_handles)
             fig.tight_layout(rect=(0, 0.065, 1, 0.96))
             paths += save_figure(fig, output_dir, f"complex_fields_{slug(case)}_{slug(cut)}")
 
@@ -297,12 +335,16 @@ def render_comparison(samples: list[dict], pairs: list[dict], output_dir: Path,
                 if logarithmic:
                     values = [max(value, ERROR_DISPLAY_FLOOR) for value in values]
                 ax.plot([math.degrees(row["angle_rad"]) for row in rows], values,
-                        color=color, linestyle=linestyle)
+                        color=color,
+                        **source_plot_kwargs(source, linestyle, len(rows)))
                 pair = (source, reference)
                 if pair not in seen_pairs:
                     seen_pairs.add(pair)
-                    pair_handles.append(Line2D([], [], color="0.25", linestyle=linestyle,
-                                               label=f"{source} − {reference}"))
+                    kwargs = source_plot_kwargs(source, linestyle, 100)
+                    kwargs.pop("zorder")
+                    kwargs.pop("markevery", None)
+                    pair_handles.append(Line2D([], [], color="0.25",
+                                               label=f"{source} − {reference}", **kwargs))
             if row_index == 0:
                 ax.set_title(cut_title(cut))
             if logarithmic:
